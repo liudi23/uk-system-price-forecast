@@ -1,0 +1,12 @@
+pandas
+numpy
+requests
+scikit-learn
+lightgbm
+matplotlib
+plotly
+fastapi
+uvicorn
+streamlit
+pyyaml
+python-dotenv
