@@ -283,36 +283,38 @@ st.plotly_chart(fig_profile, use_container_width=True)
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
 st.caption(
-    "**P** = Replacement Price methodology (SSP = SBP = replacement price)  |  "
-    "**N** = Normal bid-offer stack"
+    "**N (Normal)** — SSP/SBP set from the accepted bid-offer stack: the actual marginal cost of balancing.  "
+    "**P (Replacement Price)** — bid-offer stack too thin to price fairly; ESO substitutes a reference price, "
+    "making SSP = SBP by definition. ~50% of periods trigger P-code."
 )
 
-col_pdc_left, col_pdc_right = st.columns([3, 2])
+# Full-width: daily P/N period counts over time
+daily_pdc = (
+    dff.groupby(["settlement_date", "price_derivation_code"])
+    .size()
+    .reset_index(name="count")
+)
+fig_pdc = px.bar(
+    daily_pdc,
+    x="settlement_date",
+    y="count",
+    color="price_derivation_code",
+    color_discrete_map={"P": "#e377c2", "N": "#17becf"},
+    labels={"settlement_date": "Date", "count": "Periods", "price_derivation_code": "Code"},
+    barmode="stack",
+)
+fig_pdc.update_layout(
+    height=300,
+    margin=dict(t=10, b=40),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+)
+st.plotly_chart(fig_pdc, use_container_width=True)
 
-with col_pdc_left:
-    daily_pdc = (
-        dff.groupby(["settlement_date", "price_derivation_code"])
-        .size()
-        .reset_index(name="count")
-    )
-    fig_pdc = px.bar(
-        daily_pdc,
-        x="settlement_date",
-        y="count",
-        color="price_derivation_code",
-        color_discrete_map={"P": "#e377c2", "N": "#17becf"},
-        labels={"settlement_date": "Date", "count": "Periods", "price_derivation_code": "Code"},
-        barmode="stack",
-    )
-    fig_pdc.update_layout(
-        height=320,
-        margin=dict(t=10, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig_pdc, use_container_width=True)
+# Box plot + stats table side by side at equal width
+col_pdc_box, col_pdc_tbl = st.columns(2)
 
-with col_pdc_right:
-    # SSP distribution by code
+with col_pdc_box:
+    st.markdown("**SSP Distribution by Code**")
     fig_box = px.box(
         dff,
         x="price_derivation_code",
@@ -323,15 +325,14 @@ with col_pdc_right:
         points=False,
     )
     fig_box.update_layout(
-        height=320,
+        height=340,
         margin=dict(t=10, b=40),
         showlegend=False,
-        title_text="SSP Distribution by Code",
-        title_x=0,
     )
     st.plotly_chart(fig_box, use_container_width=True)
 
-    # Summary stats table
+with col_pdc_tbl:
+    st.markdown("**Summary statistics by code**")
     stats = (
         dff.groupby("price_derivation_code")["ssp"]
         .agg(Count="count", Mean="mean", Median="median", Std="std", Min="min", Max="max")
@@ -340,6 +341,10 @@ with col_pdc_right:
         .rename(columns={"price_derivation_code": "Code"})
     )
     st.dataframe(stats, use_container_width=True, hide_index=True)
+    st.caption(
+        "P-code prices cluster tighter around the replacement reference value. "
+        "N-code periods show wider spread — driven by the actual market stack."
+    )
 
 # ── Actual vs Predicted ───────────────────────────────────────────────────────
 st.divider()
