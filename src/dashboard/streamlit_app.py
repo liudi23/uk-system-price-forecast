@@ -19,9 +19,10 @@ PRED_PATH     = ROOT / "model_assets" / "test_predictions.csv"
 FORECAST_PATH = ROOT / "model_assets" / "next_day_forecast.csv"
 FI_PATH       = ROOT / "model_assets" / "hgbr_feature_importance.csv"
 
-FETCH_ELEXON  = ROOT / "src" / "data"   / "fetch_elexon.py"
-FETCH_WEATHER = ROOT / "src" / "data"   / "fetch_weather.py"
+FETCH_ELEXON    = ROOT / "src" / "data"   / "fetch_elexon.py"
+FETCH_WEATHER   = ROOT / "src" / "data"   / "fetch_weather.py"
 FORECAST_SCRIPT = ROOT / "src" / "models" / "forecast.py"
+FORECASTS_DIR   = ROOT / "model_assets"   / "forecasts"
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -158,6 +159,135 @@ else:
         "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
         "or run `python src/models/forecast.py`."
     )
+
+st.divider()
+
+# ── Live Forecast Verification ────────────────────────────────────────────────
+st.subheader("Live Forecast Verification")
+st.caption(
+    "Compares each archived day-ahead forecast against the Elexon actuals once they are available. "
+    "Click **Refresh Data & Run Forecast** in the sidebar to pull the latest prices."
+)
+
+archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []
+
+if not archived:
+    st.info("No archived forecasts yet. Run the forecast once to start tracking.")
+else:
+    # Find which archived dates also have actuals in the loaded data
+    actual_dates = set(df["settlement_date"].dt.strftime("%Y-%m-%d").unique())
+    verified_dates = [
+        f.stem.replace("forecast_", "")
+        for f in archived
+        if f.stem.replace("forecast_", "") in actual_dates
+    ]
+    pending_dates = [
+        f.stem.replace("forecast_", "")
+        for f in archived
+        if f.stem.replace("forecast_", "") not in actual_dates
+    ]
+
+    if pending_dates:
+        st.info(
+            f"Forecast for **{', '.join(pending_dates)}** is waiting for actuals — "
+            "refresh tomorrow once Elexon publishes the settlement prices."
+        )
+
+    if not verified_dates:
+        st.warning("No forecast dates have actuals available yet for comparison.")
+    else:
+        sel_date = st.selectbox(
+            "Select date to verify",
+            options=sorted(verified_dates, reverse=True),
+            format_func=lambda d: f"{d}  (actuals available)",
+        )
+
+        fc_v = pd.read_csv(
+            FORECASTS_DIR / f"forecast_{sel_date}.csv",
+            parse_dates=["settlement_datetime"],
+        )
+        act_v = (
+            df[df["settlement_date"].dt.strftime("%Y-%m-%d") == sel_date]
+            [["settlement_period", "ssp"]]
+            .rename(columns={"ssp": "ssp_actual"})
+        )
+        merged = fc_v.merge(act_v, on="settlement_period", how="inner")
+        merged["error"]     = merged["ssp_predicted"] - merged["ssp_actual"]
+        merged["abs_error"] = merged["error"].abs()
+
+        # Metrics
+        v_mae   = merged["abs_error"].mean()
+        v_rmse  = (merged["error"] ** 2).mean() ** 0.5
+        v_max   = merged["abs_error"].max()
+        worst_sp = int(merged.loc[merged["abs_error"].idxmax(), "settlement_period"])
+        denom   = (merged["ssp_actual"].abs() + merged["ssp_predicted"].abs()) / 2
+        v_smape = (merged["abs_error"] / denom.replace(0, float("nan"))).mean() * 100
+
+        vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+        vc1.metric("Date verified", sel_date)
+        vc2.metric("MAE", f"£{v_mae:.2f}/MWh")
+        vc3.metric("RMSE", f"£{v_rmse:.2f}/MWh")
+        vc4.metric("sMAPE", f"{v_smape:.1f}%")
+        vc5.metric("Worst SP", f"SP {worst_sp}  (£{v_max:.1f} off)")
+
+        # Actual vs predicted time series
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Scatter(
+            x=merged["settlement_datetime"], y=merged["ssp_actual"],
+            name="Actual SSP", line=dict(color="#1f77b4", width=2),
+            hovertemplate="SP %{customdata}<br>Actual £%{y:.2f}<extra></extra>",
+            customdata=merged["settlement_period"],
+        ))
+        fig_v.add_trace(go.Scatter(
+            x=merged["settlement_datetime"], y=merged["ssp_predicted"],
+            name="Forecast SSP", line=dict(color="#ff7f0e", width=2, dash="dot"),
+            hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}<extra></extra>",
+            customdata=merged["settlement_period"],
+        ))
+        fig_v.update_layout(
+            xaxis_title="Datetime", yaxis_title="£/MWh",
+            height=340, margin=dict(t=10, b=40), hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_v, use_container_width=True)
+
+        # Error by settlement period + error histogram side by side
+        col_ep, col_eh = st.columns(2)
+
+        with col_ep:
+            fig_ep = go.Figure(go.Bar(
+                x=merged["settlement_period"],
+                y=merged["abs_error"],
+                marker_color=merged["abs_error"].apply(
+                    lambda e: "#d62728" if e > v_mae * 2 else "#1f77b4"
+                ),
+                hovertemplate="SP %{x}<br>Error £%{y:.2f}<extra></extra>",
+            ))
+            fig_ep.add_hline(
+                y=v_mae, line_dash="dash", line_color="orange",
+                annotation_text=f"MAE £{v_mae:.1f}",
+                annotation_position="top left",
+            )
+            fig_ep.update_layout(
+                xaxis_title="Settlement Period", yaxis_title="Absolute Error (£/MWh)",
+                height=300, margin=dict(t=30, b=40),
+                title_text="Error by Settlement Period", title_x=0,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_ep, use_container_width=True)
+
+        with col_eh:
+            fig_eh = px.histogram(
+                merged, x="error", nbins=24,
+                color_discrete_sequence=["#ff7f0e"],
+                labels={"error": "Forecast Error (£/MWh)", "count": "Periods"},
+            )
+            fig_eh.add_vline(x=0, line_dash="dash", line_color="black")
+            fig_eh.update_layout(
+                height=300, margin=dict(t=30, b=40),
+                title_text="Error Distribution (Predicted − Actual)", title_x=0,
+            )
+            st.plotly_chart(fig_eh, use_container_width=True)
 
 st.divider()
 

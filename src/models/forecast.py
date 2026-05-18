@@ -258,7 +258,15 @@ def run_forecast(target_date: date = None, features_file: Path = FEATURES_FILE) 
     result = pd.DataFrame(records)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(OUTPUT_FILE, index=False)
-    log.info("Forecast saved → %s  (MAE vs. perfect: n/a — no actuals yet)", OUTPUT_FILE)
+    log.info("Forecast saved → %s", OUTPUT_FILE)
+
+    # Archive by date so each day's forecast is preserved for later verification
+    archive_dir = OUTPUT_FILE.parent / "forecasts"
+    archive_dir.mkdir(exist_ok=True)
+    archive_path = archive_dir / f"forecast_{target_date}.csv"
+    result.to_csv(archive_path, index=False)
+    log.info("Archived → %s", archive_path)
+
     return result
 
 
