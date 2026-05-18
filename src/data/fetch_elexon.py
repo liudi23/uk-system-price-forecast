@@ -16,6 +16,7 @@ import logging
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import requests
@@ -29,10 +30,11 @@ COLUMN_MAP = {
     "settlementDate": "settlement_date",
     "settlementPeriod": "settlement_period",
     "systemSellPrice": "ssp",
-    "systemBuyPrice": "sbp",
     "netImbalanceVolume": "net_imbalance_volume",
     "sellPriceAdjustment": "sell_price_adjustment",
     "buyPriceAdjustment": "buy_price_adjustment",
+    "priceDerivationCode": "price_derivation_code",
+    "replacementPrice": "replacement_price",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -114,24 +116,44 @@ def save(df: pd.DataFrame, path: Path, append: bool = False) -> None:
     log.info("Saved %d rows → %s", len(df), path)
 
 
+def _last_date_in_csv(path: Path) -> Optional[date]:
+    """Return the latest settlement_date in an existing CSV, or None if absent."""
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, usecols=["settlement_date"])
+    if df.empty:
+        return None
+    return date.fromisoformat(df["settlement_date"].max())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch Elexon system prices (SSP/SBP)")
     default_end = date.today() - timedelta(days=1)
-    default_start = default_end - timedelta(days=29)
-    parser.add_argument("--start", default=str(default_start), help="Start date YYYY-MM-DD (default: 30 days ago)")
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD (default: day after last date in CSV, or 30 days ago)")
     parser.add_argument("--end", default=str(default_end), help="End date YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--output", default=str(OUTPUT_FILE), help="Output CSV path")
     parser.add_argument("--append", action="store_true", help="Append to existing CSV, deduplicating on (date, period)")
     args = parser.parse_args()
 
-    start = date.fromisoformat(args.start)
+    output_path = Path(args.output)
     end = date.fromisoformat(args.end)
 
-    if start > end:
-        parser.error(f"--start ({start}) must be <= --end ({end})")
+    if args.start is None:
+        last = _last_date_in_csv(output_path)
+        start = (last + timedelta(days=1)) if last else (end - timedelta(days=29))
+        # auto-enable append when picking up from an existing file
+        if last:
+            args.append = True
+    else:
+        start = date.fromisoformat(args.start)
 
+    if start > end:
+        log.info("Data already up to date (last date: %s, end: %s). Nothing to fetch.", start - timedelta(days=1), end)
+        return
+
+    log.info("Fetching %s → %s", start, end)
     df = fetch_range(start, end)
-    save(df, Path(args.output), append=args.append)
+    save(df, output_path, append=args.append)
 
 
 if __name__ == "__main__":

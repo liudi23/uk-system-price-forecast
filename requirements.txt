@@ -10,3 +10,4 @@ uvicorn
 streamlit
 pyyaml
 python-dotenv
+holidays
