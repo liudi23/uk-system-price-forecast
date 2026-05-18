@@ -71,6 +71,8 @@ model_assets/
     hgbr_metrics.json           # Test-set evaluation metrics
     test_predictions.csv        # Actuals vs predictions (May 11–17)
     next_day_forecast.csv       # Latest day-ahead forecast (48 SPs)
+    forecasts/
+        forecast_YYYY-MM-DD.csv # Archived daily forecasts for verification
 
 reports/
     annual_modulation_analysis.md  # Statistical analysis of annual price seasonality
@@ -157,6 +159,7 @@ The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 autom
 | Settlement Period Profile | Average 30-minute price profile across selected date range |
 | Price Derivation Code | P vs N code breakdown — how often replacement price methodology triggers |
 | Model Forecast vs Actual | Test-week time series, scatter, error histogram, daily error bars |
+| Live Forecast Verification | Compares each archived day-ahead forecast against Elexon actuals once published — MAE, RMSE, sMAPE, error by settlement period, error histogram |
 | Feature Importance | Top-20 features by permutation MAE reduction with uncertainty bars |
 | Raw data | Filterable table with CSV download |
 
@@ -166,11 +169,13 @@ The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 autom
 
 **Leakage prevention** — three contemporaneous columns excluded from features: `replacement_price` (corr = 0.9999 with SSP), `price_derivation_code_P` (corr = 0.69), `abs_imbalance_volume`. Failure to exclude these produced MAE = 0.72 — a near-perfect but fully leakage-driven result.
 
-**SSP = SBP** — confirmed by design, not a data error. ~50% of settlement periods use "P" (replacement price) methodology where SSP = SBP by definition. SBP removed as redundant.
+**SSP = SBP** — confirmed by design, not a data error. ~50% of settlement periods use "P" (replacement price) methodology where SSP = SBP by definition. SBP is removed as redundant.
 
 **Annual modulation** — statistically confirmed (p = 5.4 × 10⁻¹¹) but explains only R² = 2.9% of variance. Short-range autocorrelation (`ssp_lag_1`) dominates. Annual harmonic features are included but contribute marginal lift.
 
 **Recursive forecasting** — SSP lags ≥ 48 always reference actual history (forecast horizon is 48 periods). Only lags 1 and 2 are filled recursively. NIV within the forecast window is proxied by the same settlement period on the previous day.
+
+**Live verification loop** — every time `forecast.py` runs it archives the forecast to `model_assets/forecasts/forecast_YYYY-MM-DD.csv`. The dashboard's verification panel automatically detects which archived dates have Elexon actuals available and surfaces MAE, RMSE, sMAPE, and per-settlement-period errors for each verified day. Pending dates show a prompt to refresh once Elexon publishes the prices (typically next-day).
 
 **Model choice** — `HistGradientBoostingRegressor` (sklearn) used in place of LightGBM; same histogram-based algorithm, no external OpenMP dependency. Swap back with `brew install libomp` + LightGBM as noted in `train_lgbm.py`.
 
