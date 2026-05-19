@@ -39,6 +39,7 @@ Usage:
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -102,14 +103,11 @@ SHAPE_ALWAYS_EXCLUDE = {
     "ssp_daily_mean",
 }
 
-# All columns whose name contains these substrings are rolling features —
-# contaminated by within-day prices for SPs 2–48.
-SHAPE_EXCLUDE_SUBSTRINGS = (
-    "_roll_6", "_roll_48", "_roll_336",
-    "spike_count_roll_",
-    "neg_count_roll_",
-    "abs_niv_roll_",
-)
+# SP-level rolling features use shift(1).rolling(w), which contaminates SPs 2-48
+# with within-day actual prices. The pattern to detect them: contains "_roll_" but
+# NOT "_daily_roll_" (daily aggregates are safe) and NOT a "_roll_Nd" day-suffix
+# (e.g. spike_count_roll_7d is safe, ssp_roll_mean_6 is not).
+_SP_ROLL_RE = re.compile(r"_roll_\d+d$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -217,7 +215,11 @@ def get_shape_feature_cols(sp: pd.DataFrame) -> list:
     def _excluded(col: str) -> bool:
         if col in SHAPE_ALWAYS_EXCLUDE:
             return True
-        return any(sub in col for sub in SHAPE_EXCLUDE_SUBSTRINGS)
+        # Exclude SP-level rolling features; keep daily-level rolls
+        # ("_daily_roll_" prefix) and day-suffixed rolls ("_roll_7d" etc.)
+        if "_roll_" in col and "_daily_roll_" not in col and not _SP_ROLL_RE.search(col):
+            return True
+        return False
     return [c for c in sp.columns if not _excluded(c)]
 
 

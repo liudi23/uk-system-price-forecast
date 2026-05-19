@@ -238,13 +238,18 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
                     ssp_hist: np.ndarray, ssp_raw_hist: np.ndarray,
                     is_spike_hist: np.ndarray, niv_hist: np.ndarray,
                     weather_hist: dict,
-                    daily_mean_lag1d: float, daily_mean_lag7d: float) -> dict:
+                    daily_mean_lag1d: float, daily_mean_lag7d: float,
+                    daily_stats: dict = None) -> dict:
     """
     Build shape feature vector for one SP (h_idx = 0-based index within
     the forecast day, so lag_48 references the same SP of yesterday).
 
     All features use fixed lags ≥ 48 SPs — guaranteed leakage-free for
     every SP in the 48-period forecast window.
+
+    daily_stats : optional dict of daily-aggregated features (ssp_raw_daily_max_lag1d,
+                  niv_daily_mean_lag1d, spike_count_lag1d, etc.) computed from
+                  daily_hist in run_forecast() and merged here for each SP.
     """
     HIST = len(ssp_hist)  # must be ≥ 336 (7 days of actual history)
     row = _calendar(dt)
@@ -283,6 +288,10 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
     row["ssp_daily_mean_lag7d"]    = daily_mean_lag7d
     row["ssp_lag48_deviation"]     = row["ssp_lag_48"]  - daily_mean_lag1d
     row["ssp_lag336_deviation"]    = row["ssp_lag_336"] - daily_mean_lag7d
+
+    # ── Additional daily-aggregated shape features ────────────────────────
+    if daily_stats:
+        row.update(daily_stats)
 
     return row
 
@@ -371,6 +380,21 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     daily_mean_lag1d = float(daily_hist["ssp_daily_mean"].values[-1])
     daily_mean_lag7d = float(daily_hist["ssp_daily_mean"].values[-7]) if len(daily_hist) >= 7 else daily_mean_lag1d
 
+    # Daily stats passed to build_shape_row() for the 8 daily-aggregated shape features
+    _tail7 = daily_hist["ssp_daily_mean"].values[-7:]
+    daily_stats: dict = {
+        "ssp_raw_daily_max_lag1d": float(daily_hist["ssp_raw_daily_max"].values[-1]),
+        "niv_daily_mean_lag1d":    float(daily_hist["niv_daily_mean"].values[-1]),
+        "spike_count_lag1d":       float(daily_hist["is_spike_count"].values[-1]),
+        "spike_count_roll_7d":     float(daily_hist["is_spike_count"].values[-7:].sum()),
+        "ssp_daily_roll_mean_7d":  float(_tail7.mean()),
+        "ssp_daily_roll_std_7d":   float(_tail7.std(ddof=1)) if len(_tail7) > 1 else 0.0,
+    }
+    for _wv in ("temp_c", "wind_ms", "solar_wm2"):
+        _col = f"{_wv}_daily_mean"
+        if _col in daily_hist.columns:
+            daily_stats[f"{_wv}_daily_mean_lag1d"] = float(daily_hist[_col].values[-1])
+
     # ── Stage 1: predict daily level ─────────────────────────────────────
     lf = build_level_features(daily_hist, target_date, target_weather)
     x_lvl = np.array([[lf.get(c, 0.0) for c in level_feat_cols]])
@@ -422,6 +446,7 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
             weather_hist=weather_hist,
             daily_mean_lag1d=daily_mean_lag1d,
             daily_mean_lag7d=daily_mean_lag7d,
+            daily_stats=daily_stats,
         )
         shape_rows.append(row)
 

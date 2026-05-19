@@ -2,7 +2,7 @@
 
 An end-to-end data science project for forecasting UK electricity system prices (SSP) at the settlement-period level (30-minute intervals). Built on public data from Elexon BMRS and Open-Meteo.
 
-**Phase 3 — Level-Shape Decomposition · In progress May 2026**
+**Phase 3 — Level-Shape Decomposition · Leakage-fixed retraining May 2026**
 
 ---
 
@@ -14,7 +14,7 @@ An end-to-end data science project for forecasting UK electricity system prices 
 - **Trains** a two-stage decomposition model with no recursive error propagation:
   - **Stage 1 — Level model**: quantile HGBR (P10/P50/P90) predicts the day's average SSP from daily-aggregated history
   - **Stage 2 — Shape model**: HGBR predicts each SP's deviation from the daily mean using only fixed lag-48+ features
-- **Evaluates** with a non-recursive two-stage simulation: honest P50 MAE **£22.18/MWh · RMSE £28.86** on May 11–17 2026, a 12.7% improvement over Phase 2's recursive approach
+- **Evaluates** with a non-recursive two-stage simulation: honest P50 MAE **£25.39/MWh · RMSE £32.61** on May 11–17 2026, matching Phase 2's recursive approach with no error propagation
 - **Forecasts** tomorrow's 48 settlement periods without any within-day recursion — both models use only data available before the forecast day starts
 - **Visualises** everything in a Streamlit dashboard: level vs shape decomposition metrics, P10/P90 uncertainty bands, historical analytics, model accuracy, and feature importance
 
@@ -29,7 +29,7 @@ An end-to-end data science project for forecasting UK electricity system prices 
 | Rolling mean (48 SP) | 26.78 | 33.07 | 28.5% | batch |
 | ~~HGBR Phase 1 (batch/leaky)~~ | ~~15.01~~ | ~~22.91~~ | ~~17.9%~~ | ~~leaky batch~~ |
 | Quantile HGBR P50 · Phase 2 | 25.40 | 32.36 | 27.4% | honest recursive |
-| **Level-Shape HGBR P50 · Phase 3** | **22.18** | **28.86** | **24.3%** | **honest non-recursive** |
+| **Level-Shape HGBR P50 · Phase 3** | **25.39** | **32.61** | **27.4%** | **honest non-recursive** |
 
 Test period: 7 days (May 11–17 2026), 336 settlement periods.
 
@@ -38,12 +38,12 @@ Test period: 7 days (May 11–17 2026), 336 settlement periods.
 | Metric | Value | Meaning |
 |---|---|---|
 | Level MAE | £15.45/MWh/day | Error in predicting the day's average price (Stage 1) |
-| Shape correlation | 0.479 | Mean Pearson r between predicted and actual intra-day profiles |
-| Peak timing error | 6.9 SPs | Mean absolute offset between predicted and actual daily peak (±3.5 h) |
+| Shape correlation | 0.349 | Mean Pearson r between predicted and actual intra-day profiles |
+| Peak timing error | 3.9 SPs | Mean absolute offset between predicted and actual daily peak (±2 h) |
 
-> **Why Phase 3 improves on Phase 2:** Phase 2's recursive loop propagates prediction errors across all 48 steps — a drift in SP5 contaminates every subsequent prediction that day. Phase 3 eliminates this by splitting the problem: Stage 1 predicts the day's price level from daily-aggregated history (no recursion), and Stage 2 predicts the intra-day shape using only fixed lag-48+ features (safe for every SP simultaneously). The shape correlation of 0.48 identifies the next improvement opportunity: exogenous day-ahead inputs (wind generation forecast, demand forecast) would directly inform the intra-day profile.
+> **Phase 3 vs Phase 2:** Phase 2's recursive loop propagates prediction errors across all 48 steps — a drift in SP5 contaminates every subsequent prediction that day. Phase 3 eliminates this by splitting the problem: Stage 1 predicts the day's price level from daily-aggregated history (no recursion), and Stage 2 predicts the intra-day shape using only fixed lag-48+ features (safe for every SP simultaneously). With leakage-free features, Phase 3 achieves the same MAE as Phase 2 (£25.39 vs £25.40) while being architecturally cleaner. The shape correlation of 0.35 identifies the next improvement opportunity: exogenous day-ahead inputs (wind generation forecast, demand forecast) would directly inform the intra-day profile.
 
-> **Why rolling features are excluded from the shape model:** `shift(1).rolling(w)` features include within-day actual prices for SPs 2–48 of the forecast day (only SP1 is clean). Even `ssp_roll_mean_336` contains up to 47/336 ≈ 14% within-day contamination for late-day SPs. Phase 3 uses only fixed-point lags (`ssp_lag_48`, `ssp_lag_96`, `ssp_lag_336`) — guaranteed leakage-free for every SP in the 48-period forecast window.
+> **Why rolling features are excluded from the shape model:** `shift(1).rolling(w)` features include within-day actual prices for SPs 2–48 of the forecast day (only SP1 is clean). Even `ssp_roll_mean_336` contains up to 47/336 ≈ 14% within-day contamination for late-day SPs. Phase 3 uses only fixed-point lags (`ssp_lag_48`, `ssp_lag_96`, `ssp_lag_336`) — guaranteed leakage-free for every SP in the 48-period forecast window. An earlier version of the code had a substring matching bug that silently included 32 leaky SP-level rolling features in the shape model; this inflated the reported MAE from £25.39 to £22.18 (the ~12% apparent gain was entirely leakage-driven). The bug has been fixed and all metrics reflect clean evaluation.
 
 Top features by permutation importance (val set, Phase 2 P50 model): `ssp_lag_1` (22.0), `net_imbalance_volume_lag_1` (1.3), `ssp_lag_2` (0.34), `ssp_roll_mean_6` (0.25), `ssp_lag_48` (0.22), `solar_wm2_lag_1` (0.17), `cos_sp`/`sin_sp` (intra-day cycle).
 
