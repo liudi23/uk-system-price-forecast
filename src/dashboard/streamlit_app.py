@@ -110,50 +110,107 @@ st.caption(
 
 # ── Production model banner ───────────────────────────────────────────────────
 st.info(
-    "**Production model:** HistGradientBoosting (HGBR) · "
-    "Trained on 5 years of Elexon BMRS data (May 2021 – May 2026) · "
-    "Features: price lags, rolling statistics, calendar/annual harmonics, "
-    "UK weather (temperature, wind speed, solar irradiance, precipitation) · "
-    "Test MAE: £15.01/MWh · sMAPE: 17.9%"
+    "**Phase 2 model — Quantile HGBR (P10 / P50 / P90) + Spike Classifier** · "
+    "Trained on `ssp_raw` (unclipped prices) so the model can predict spike-level values · "
+    "New features: raw-price spike memory, NIV extremes, crash-risk indicators · "
+    "Test MAE (P50): £14.84/MWh · Confidence band: P10 (downside) – P90 (spike risk)"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
-st.subheader("Day-Ahead Forecast (HGBR · 48 Settlement Periods)")
+st.subheader("Day-Ahead Forecast (Quantile HGBR · P10 / P50 / P90 · 48 Settlement Periods)")
 
 if FORECAST_PATH.exists():
     fc = pd.read_csv(FORECAST_PATH, parse_dates=["settlement_datetime"])
-    fc_date = fc["settlement_date"].iloc[0]
+    fc_date  = fc["settlement_date"].iloc[0]
     fc_label = f"{fc_date}  ·  SP 1–48 (midnight → 23:30)"
 
-    fm1, fm2, fm3, fm4 = st.columns(4)
+    has_quantiles = "ssp_q50" in fc.columns
+    p50_col = "ssp_q50" if has_quantiles else "ssp_predicted"
+
+    fm1, fm2, fm3, fm4, fm5 = st.columns(5)
     fm1.metric("Forecast date", fc_date)
-    fm2.metric("Min predicted SSP", f"£{fc['ssp_predicted'].min():.2f}")
-    fm3.metric("Avg predicted SSP", f"£{fc['ssp_predicted'].mean():.2f}")
-    fm4.metric("Max predicted SSP", f"£{fc['ssp_predicted'].max():.2f}")
+    fm2.metric("Min P50", f"£{fc[p50_col].min():.1f}")
+    fm3.metric("Avg P50", f"£{fc[p50_col].mean():.1f}")
+    fm4.metric("Max P50", f"£{fc[p50_col].max():.1f}")
+    if has_quantiles and "spike_prob" in fc.columns:
+        peak_sp = int(fc.loc[fc["ssp_q90"].idxmax(), "settlement_period"])
+        peak_q90 = fc["ssp_q90"].max()
+        fm5.metric("Peak P90 risk", f"£{peak_q90:.0f}  SP {peak_sp}")
+    else:
+        fm5.metric("Max P50", f"£{fc[p50_col].max():.1f}")
 
     fig_fc = go.Figure()
+
+    if has_quantiles:
+        # P10–P90 confidence band
+        fig_fc.add_trace(go.Scatter(
+            x=pd.concat([fc["settlement_datetime"], fc["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc["ssp_q90"], fc["ssp_q10"].iloc[::-1]]),
+            fill="toself",
+            fillcolor="rgba(255,127,14,0.15)",
+            line=dict(color="rgba(255,127,14,0)"),
+            hoverinfo="skip",
+            name="P10–P90 band",
+            showlegend=True,
+        ))
+        fig_fc.add_trace(go.Scatter(
+            x=fc["settlement_datetime"], y=fc["ssp_q90"],
+            name="P90 (spike risk)", line=dict(color="#ff7f0e", width=1, dash="dot"),
+            hovertemplate="SP %{customdata}<br>P90 £%{y:.2f}<extra></extra>",
+            customdata=fc["settlement_period"],
+        ))
+        fig_fc.add_trace(go.Scatter(
+            x=fc["settlement_datetime"], y=fc["ssp_q10"],
+            name="P10 (downside)", line=dict(color="#ff7f0e", width=1, dash="dot"),
+            hovertemplate="SP %{customdata}<br>P10 £%{y:.2f}<extra></extra>",
+            customdata=fc["settlement_period"],
+        ))
+
     fig_fc.add_trace(go.Scatter(
-        x=fc["settlement_datetime"], y=fc["ssp_predicted"],
-        name="Predicted SSP", fill="tozeroy",
-        line=dict(color="#ff7f0e", width=2),
-        hovertemplate="SP %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
+        x=fc["settlement_datetime"], y=fc[p50_col],
+        name="P50 forecast", fill="tozeroy" if not has_quantiles else None,
+        line=dict(color="#ff7f0e", width=2.5),
+        hovertemplate="SP %{customdata}<br>P50 £%{y:.2f}<extra></extra>",
         customdata=fc["settlement_period"],
     ))
+
     fig_fc.update_layout(
-        xaxis_title="Datetime",
-        yaxis_title="£/MWh",
-        height=320,
-        margin=dict(t=10, b=40),
-        hovermode="x unified",
-        showlegend=False,
+        xaxis_title="Datetime", yaxis_title="£/MWh",
+        height=340, margin=dict(t=10, b=40), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         annotations=[dict(
-            text=f"Forecast generated: {fc_label}",
+            text=f"Forecast: {fc_label}",
             xref="paper", yref="paper",
-            x=0, y=1.02, showarrow=False,
+            x=0, y=1.08, showarrow=False,
             font=dict(size=11, color="grey"),
         )],
     )
     st.plotly_chart(fig_fc, use_container_width=True)
+
+    # ── Spike probability bar chart ───────────────────────────────────────────
+    if has_quantiles and "spike_prob" in fc.columns:
+        st.markdown("**Spike Probability by Settlement Period**")
+        st.caption(
+            "Probability assigned by the binary spike classifier (trained on 5 years of Tukey-fence "
+            "exceedance events). High values signal periods where the model expects elevated risk of "
+            "prices exceeding the £354/MWh historical outer fence."
+        )
+        bar_colors = fc["spike_prob"].apply(
+            lambda p: "#d62728" if p > 0.3 else ("#ff7f0e" if p > 0.1 else "#aec7e8")
+        )
+        fig_spike = go.Figure(go.Bar(
+            x=fc["settlement_period"], y=fc["spike_prob"] * 100,
+            marker_color=bar_colors,
+            hovertemplate="SP %{x}<br>Spike prob: %{y:.1f}%<extra></extra>",
+        ))
+        fig_spike.add_hline(y=10, line_dash="dash", line_color="orange",
+                            annotation_text="10% threshold", annotation_position="top right")
+        fig_spike.update_layout(
+            xaxis_title="Settlement Period", yaxis_title="Spike probability (%)",
+            height=220, margin=dict(t=10, b=40), showlegend=False,
+        )
+        st.plotly_chart(fig_spike, use_container_width=True)
+
 else:
     st.info(
         "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
@@ -211,9 +268,8 @@ def live_comparison_panel():
     # Metrics row (only shown when actuals are available)
     if n_settled > 0:
         merged_live = fc_today.merge(actuals_today, on="settlement_period", how="inner")
-        merged_live["abs_error"] = (
-            merged_live["ssp_predicted"] - merged_live["ssp_actual"]
-        ).abs()
+        _p50 = "ssp_q50" if "ssp_q50" in merged_live.columns else "ssp_predicted"
+        merged_live["abs_error"] = (merged_live[_p50] - merged_live["ssp_actual"]).abs()
         running_mae = merged_live["abs_error"].mean()
         max_err     = merged_live["abs_error"].max()
         worst_sp    = int(merged_live.loc[merged_live["abs_error"].idxmax(), "settlement_period"])
@@ -227,10 +283,23 @@ def live_comparison_panel():
     # Chart
     fig_live = go.Figure()
 
+    # P10–P90 confidence band (if quantile forecast available)
+    has_q = "ssp_q50" in fc_today.columns
+    if has_q:
+        fig_live.add_trace(go.Scatter(
+            x=pd.concat([fc_today["settlement_datetime"],
+                          fc_today["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc_today["ssp_q90"], fc_today["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(255,127,14,0.12)",
+            line=dict(color="rgba(255,127,14,0)"),
+            hoverinfo="skip", name="P10–P90", showlegend=True,
+        ))
+
     # Full forecast curve (dotted orange)
+    p50_col_live = "ssp_q50" if has_q else "ssp_predicted"
     fig_live.add_trace(go.Scatter(
-        x=fc_today["settlement_datetime"], y=fc_today["ssp_predicted"],
-        name="Forecast", line=dict(color="#ff7f0e", width=2, dash="dot"),
+        x=fc_today["settlement_datetime"], y=fc_today[p50_col_live],
+        name="Forecast (P50)", line=dict(color="#ff7f0e", width=2, dash="dot"),
         hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}/MWh<extra></extra>",
         customdata=fc_today["settlement_period"],
     ))
@@ -596,28 +665,45 @@ st.subheader("Model Forecast vs Actual (HGBR — 5-year + Weather · Test: May 1
 
 if PRED_PATH.exists():
     pred = pd.read_csv(PRED_PATH, parse_dates=["settlement_datetime"])
+    has_q_pred = "ssp_q50" in pred.columns
 
     # ── Metrics row ───────────────────────────────────────────────────────────
-    mae_val  = pred["abs_error"].mean()
-    rmse_val = (pred["error"] ** 2).mean() ** 0.5
-    denom    = (pred["ssp_actual"].abs() + pred["ssp_predicted"].abs()) / 2
+    mae_val   = pred["abs_error"].mean()
+    rmse_val  = (pred["error"] ** 2).mean() ** 0.5
+    denom     = (pred["ssp_actual"].abs() + pred["ssp_predicted"].abs()) / 2
     smape_val = (pred["abs_error"] / denom.replace(0, float("nan"))).mean() * 100
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("MAE", f"£{mae_val:.2f}/MWh")
+    # Spike-period analysis: rows where actual > 200 (elevated price)
+    elevated = pred[pred["ssp_actual"] > 200]
+    elev_mae = elevated["abs_error"].mean() if len(elevated) > 0 else float("nan")
+
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("MAE (all periods)", f"£{mae_val:.2f}/MWh")
     mc2.metric("RMSE", f"£{rmse_val:.2f}/MWh")
     mc3.metric("sMAPE", f"{smape_val:.1f}%")
     mc4.metric("Test periods", len(pred))
+    mc5.metric("MAE (SSP > £200)", f"£{elev_mae:.1f}" if not pd.isna(elev_mae) else "n/a",
+               help="Error on elevated-price periods (>£200/MWh). Lower is better peak prediction.")
 
-    # ── Time series: actual vs predicted ─────────────────────────────────────
+    # ── Time series: actual vs predicted with quantile band ───────────────────
     fig_pred = go.Figure()
+
+    if has_q_pred:
+        fig_pred.add_trace(go.Scatter(
+            x=pd.concat([pred["settlement_datetime"], pred["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([pred["ssp_q90"], pred["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(255,127,14,0.12)",
+            line=dict(color="rgba(255,127,14,0)"),
+            hoverinfo="skip", name="P10–P90",
+        ))
+
     fig_pred.add_trace(go.Scatter(
         x=pred["settlement_datetime"], y=pred["ssp_actual"],
         name="Actual SSP", line=dict(color="#1f77b4", width=1.5),
     ))
     fig_pred.add_trace(go.Scatter(
         x=pred["settlement_datetime"], y=pred["ssp_predicted"],
-        name="Predicted SSP", line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+        name="P50 Forecast", line=dict(color="#ff7f0e", width=1.5, dash="dot"),
     ))
     fig_pred.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",

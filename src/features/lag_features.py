@@ -16,9 +16,11 @@ Rolling windows:
   48 SP (1 day) — daily seasonal context
   336 SP (1 week) — weekly seasonal context
 
-All lags and rolling features are computed on `ssp` (the denoised price)
-so that spike contamination does not propagate into features.  The raw
-price `ssp_raw` remains available as the modelling target.
+SSP lag features use the winsorised `ssp` column so spike contamination
+does not propagate into the autoregressive features.  Additional raw-price
+and spike-history features (lag ≥ 48 only) are appended separately; these
+lags are always available at day-ahead inference time because they reference
+actual history that predates the 48-period forecast horizon.
 
 References:
   Lago, J., et al. (2021). Forecasting day-ahead electricity prices:
@@ -28,6 +30,7 @@ References:
     International Journal of Forecasting, 30(4), 1030–1081.
 """
 
+import numpy as np
 import pandas as pd
 
 # Lag periods (in units of settlement periods, 1 SP = 30 min)
@@ -53,7 +56,7 @@ def add_lag_features(
     """
     df = df.copy()
 
-    # ── SSP lags ───────────────────────────────────────────────────────────────
+    # ── SSP lags (winsorised — clean autoregressive signal) ────────────────────
     for lag in SSP_LAGS:
         df[f"{ssp_col}_lag_{lag}"] = df[ssp_col].shift(lag)
 
@@ -62,25 +65,59 @@ def add_lag_features(
         df[f"{niv_col}_lag_{lag}"] = df[niv_col].shift(lag)
 
     # ── Rolling statistics on SSP ──────────────────────────────────────────────
-    # min_periods=1 avoids NaN for the very first rows but note that early
-    # rolling values (window not yet full) are less reliable.
     for w in ROLLING_WINDOWS:
         roll = df[ssp_col].shift(1).rolling(window=w, min_periods=1)
         df[f"{ssp_col}_roll_mean_{w}"] = roll.mean()
-        df[f"{ssp_col}_roll_std_{w}"] = roll.std()
-        df[f"{ssp_col}_roll_min_{w}"] = roll.min()
-        df[f"{ssp_col}_roll_max_{w}"] = roll.max()
+        df[f"{ssp_col}_roll_std_{w}"]  = roll.std()
+        df[f"{ssp_col}_roll_min_{w}"]  = roll.min()
+        df[f"{ssp_col}_roll_max_{w}"]  = roll.max()
 
     # ── Rolling statistics on NIV ──────────────────────────────────────────────
     for w in [6, 48]:
         roll_niv = df[niv_col].shift(1).rolling(window=w, min_periods=1)
         df[f"{niv_col}_roll_mean_{w}"] = roll_niv.mean()
-        df[f"{niv_col}_roll_std_{w}"] = roll_niv.std()
+        df[f"{niv_col}_roll_std_{w}"]  = roll_niv.std()
+        df[f"{niv_col}_roll_min_{w}"]  = roll_niv.min()
+        df[f"{niv_col}_roll_max_{w}"]  = roll_niv.max()
 
     # ── Price-spread momentum ──────────────────────────────────────────────────
-    # Difference between current lag-1 and lag-48 captures within-day trend
-    df[f"{ssp_col}_diff_1_48"] = df[f"{ssp_col}_lag_1"] - df[f"{ssp_col}_lag_48"]
-    # Difference between lag-48 and lag-336 captures day-on-day change vs last week
+    df[f"{ssp_col}_diff_1_48"]   = df[f"{ssp_col}_lag_1"]  - df[f"{ssp_col}_lag_48"]
     df[f"{ssp_col}_diff_48_336"] = df[f"{ssp_col}_lag_48"] - df[f"{ssp_col}_lag_336"]
+
+    # ── Raw-price spike-memory features (lag ≥ 48, always in actual history) ───
+    # These carry the unclipped price signal, letting the model learn that a
+    # spike yesterday/last week raises the probability of another spike today.
+    if "ssp_raw" in df.columns:
+        for lag in [48, 96, 336]:
+            df[f"ssp_raw_lag_{lag}"] = df["ssp_raw"].shift(lag)
+
+    # ── Spike / negative-price history flags ───────────────────────────────────
+    # is_spike marks rows where ssp_raw exceeded the Tukey outer fence.
+    # is_negative marks negative-price periods (renewable oversupply, low demand).
+    # Both use lag ≥ 48 so they always reference settled actual data at inference.
+    if "is_spike" in df.columns:
+        spike_f = df["is_spike"].astype(float)
+        for lag in [48, 336]:
+            df[f"is_spike_lag_{lag}"] = spike_f.shift(lag)
+        # Rolling count of spike periods in the previous 24 h (48 SPs)
+        df["spike_count_roll_48"] = spike_f.shift(1).rolling(48, min_periods=1).sum()
+
+    if "ssp_raw" in df.columns:
+        neg_f = (df["ssp_raw"] < 0).astype(float)
+        for lag in [48, 336]:
+            df[f"is_negative_lag_{lag}"] = neg_f.shift(lag)
+        df["neg_count_roll_48"] = neg_f.shift(1).rolling(48, min_periods=1).sum()
+
+    # ── NIV extreme features (system stress / shortage / surplus indicators) ───
+    # Rolling min/max on NIV reveal how short (negative) or long (positive)
+    # the system has been, which is a direct antecedent of price spikes/crashes.
+    if niv_col in df.columns:
+        for w in [6, 48]:
+            roll_niv2 = df[niv_col].shift(1).rolling(window=w, min_periods=1)
+            # min/max already added above; keep only if not duplicate
+        # Absolute NIV rolling mean — how stressed the system has been regardless of direction
+        for w in [6, 48]:
+            abs_niv = df[niv_col].abs().shift(1).rolling(window=w, min_periods=1)
+            df[f"abs_niv_roll_mean_{w}"] = abs_niv.mean()
 
     return df
