@@ -114,7 +114,8 @@ st.info(
     "Trained on 5 years of Elexon BMRS data (May 2021 – May 2026) · "
     "Features: price lags, rolling statistics, calendar/annual harmonics, "
     "UK weather (temperature, wind speed, solar irradiance, precipitation) · "
-    "Test MAE: £15.01/MWh · sMAPE: 17.9%"
+    "**Honest day-ahead MAE: £25.9/MWh · sMAPE: 28.0%** "
+    "(recursive simulation — previously reported £15.0 was inflated by ssp_lag_1 leakage)"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────

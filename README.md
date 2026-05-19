@@ -11,7 +11,7 @@ An end-to-end data science project for forecasting UK electricity system prices 
 - **Ingests** 5 years of Elexon BMRS settlement data (May 2021 – May 2026) with smart incremental updates
 - **Fetches** UK weather history and day-ahead forecasts from Open-Meteo (temperature, wind speed, solar irradiance, precipitation) across three representative UK locations
 - **Engineers** 76 features covering price lags/rolling statistics, calendar/annual harmonics, and weather-driven supply-demand signals
-- **Trains** a HistGradientBoosting (HGBR) model achieving **MAE £15.01/MWh · sMAPE 17.9%** on the May 11–17 2026 test week
+- **Trains** a HistGradientBoosting (HGBR) model achieving **MAE £25.9/MWh · sMAPE 28.0%** on the May 11–17 2026 test week (honest recursive day-ahead evaluation)
 - **Forecasts** tomorrow's 48 settlement periods (00:00–23:30) using recursive multi-step inference with live weather
 - **Visualises** everything in a Streamlit dashboard: historical analytics, model accuracy, day-ahead forecast curve, and feature importance
 
@@ -19,14 +19,17 @@ An end-to-end data science project for forecasting UK electricity system prices 
 
 ## Results
 
-| Model | MAE (£/MWh) | RMSE | sMAPE |
-|---|---|---|---|
-| Naive (lag-48) | 36.34 | — | — |
-| Seasonal naive (lag-336) | 29.40 | — | — |
-| Rolling mean (48 SP) | 26.78 | — | — |
-| **HGBR · 5yr + weather (production)** | **15.01** | **22.91** | **17.9%** |
+| Model | MAE (£/MWh) | RMSE | sMAPE | Evaluation method |
+|---|---|---|---|---|
+| Naive (lag-48) | 36.34 | — | — | Direct |
+| Seasonal naive (lag-336) | 29.40 | — | — | Direct |
+| Rolling mean (48 SP) | 26.78 | — | — | Direct |
+| **HGBR · 5yr + weather (production)** | **25.9** | **33.0** | **28.0%** | **Recursive day-ahead** |
+| ~~HGBR (batch eval, leaky)~~ | ~~15.0~~ | — | — | Batch — inflated by `ssp_lag_1` |
 
 Test period: 7 days (May 11–17 2026), 336 settlement periods.
+
+> **Evaluation note:** batch prediction on pre-computed features is misleading for day-ahead forecasting because `ssp_lag_1` (the single most important feature, importance = 22.0) references the actual price from the previous 30-minute period — information that does not exist when the forecast is generated. The correct evaluation simulates the deployment loop: for each test day, short-lag features (`ssp_lag_1/2`, `ssp_roll_*_6`, `niv_lag_1`) are filled recursively from running model predictions, matching exactly how `forecast.py` runs. This reduces the apparent MAE gap between test and live performance.
 
 Top features by permutation importance: `ssp_lag_1` (21.9), `net_imbalance_volume_lag_1` (1.7), `ssp_lag_2` (0.33), `sin_sp`/`cos_sp` (intra-day cycle), `solar_wm2_lag_1`, `wind_ms_lag_1`.
 
@@ -167,7 +170,9 @@ The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 autom
 
 ## Technical notes
 
-**Leakage prevention** — three contemporaneous columns excluded from features: `replacement_price` (corr = 0.9999 with SSP), `price_derivation_code_P` (corr = 0.69), `abs_imbalance_volume`. Failure to exclude these produced MAE = 0.72 — a near-perfect but fully leakage-driven result.
+**Leakage prevention (features)** — three contemporaneous columns excluded from features: `replacement_price` (corr = 0.9999 with SSP), `price_derivation_code_P` (corr = 0.69), `abs_imbalance_volume`. Failure to exclude these produced MAE = 0.72 — a near-perfect but fully leakage-driven result.
+
+**Leakage prevention (evaluation)** — batch prediction on pre-computed test features inflates the reported MAE by ~£11/MWh because `ssp_lag_1` (importance = 22.0) uses the actual previous price from within the forecast window. The training script (`train_lgbm.py`) uses `evaluate_dayahead_recursive()`: for each test day it builds a running prediction buffer and overrides all short-lag features with model predictions, reproducing the true day-ahead information set.
 
 **SSP = SBP** — confirmed by design, not a data error. ~50% of settlement periods use "P" (replacement price) methodology where SSP = SBP by definition. SBP is removed as redundant.
 

@@ -144,6 +144,94 @@ def compute_feature_importance(model, X_val, y_val, feature_cols, n_repeats=10):
     return fi
 
 
+def evaluate_dayahead_recursive(model, df, test_df, feature_cols):
+    """
+    Honest day-ahead evaluation: simulate the recursive multi-step forecast for
+    each test day using only information genuinely available at forecast time.
+
+    Batch prediction on pre-computed features is misleading because ssp_lag_1,
+    ssp_lag_2, ssp_roll_*_6, ssp_diff_1_48, and niv_lag_1 all reference prices
+    or volumes from within the forecast window — information unavailable when
+    the day-ahead forecast is generated. This function overrides those features
+    with recursively computed values (running prediction buffer), matching
+    exactly what forecast.py does at deployment time.
+    """
+    HISTORY = 400
+
+    leaky_names = {
+        "ssp_lag_1", "ssp_lag_2",
+        "ssp_roll_mean_6", "ssp_roll_std_6", "ssp_roll_min_6", "ssp_roll_max_6",
+        "ssp_diff_1_48",
+        "net_imbalance_volume_lag_1",
+        "net_imbalance_volume_roll_mean_6", "net_imbalance_volume_roll_std_6",
+    }
+    col_idx  = {f: i for i, f in enumerate(feature_cols)}
+    leaky_idx = {f: col_idx[f] for f in leaky_names if f in col_idx}
+    lag48_idx = col_idx.get("ssp_lag_48")
+
+    test_dates = sorted(test_df["settlement_datetime"].dt.date.unique())
+    y_true_all, y_pred_all = [], []
+
+    for target_date in test_dates:
+        hist = df[df["settlement_datetime"].dt.date < target_date].tail(HISTORY).reset_index(drop=True)
+        if len(hist) < HISTORY:
+            log.warning("Skipping %s — only %d history rows", target_date, len(hist))
+            continue
+
+        ssp_buf     = list(hist["ssp"].values)
+        niv_actual  = hist["net_imbalance_volume"].values
+        niv_virtual = np.concatenate([niv_actual, niv_actual[-48:]])
+
+        day_rows = (
+            test_df[test_df["settlement_datetime"].dt.date == target_date]
+            .sort_values("settlement_datetime")
+        )
+
+        for h_idx, (_, row_s) in enumerate(day_rows.iterrows()):
+            idx = HISTORY + h_idx
+
+            x = np.array([row_s.get(f, 0.0) for f in feature_cols], dtype=float)
+
+            ssp_arr = np.array(ssp_buf)
+
+            if "ssp_lag_1" in leaky_idx:
+                x[leaky_idx["ssp_lag_1"]] = float(ssp_arr[-1])
+            if "ssp_lag_2" in leaky_idx:
+                x[leaky_idx["ssp_lag_2"]] = float(ssp_arr[-2])
+
+            win6 = ssp_arr[-6:]
+            for k, fn in [
+                ("mean", np.mean),
+                ("std",  lambda a: float(np.std(a, ddof=1)) if len(a) > 1 else 0.0),
+                ("min",  np.min),
+                ("max",  np.max),
+            ]:
+                key = f"ssp_roll_{k}_6"
+                if key in leaky_idx:
+                    x[leaky_idx[key]] = float(fn(win6))
+
+            if "ssp_diff_1_48" in leaky_idx:
+                lag48 = x[lag48_idx] if lag48_idx is not None else float(ssp_arr[-48])
+                x[leaky_idx["ssp_diff_1_48"]] = float(ssp_arr[-1]) - lag48
+
+            niv6 = niv_virtual[idx - 6 : idx]
+            if "net_imbalance_volume_lag_1" in leaky_idx:
+                x[leaky_idx["net_imbalance_volume_lag_1"]] = float(niv_virtual[idx - 1])
+            if "net_imbalance_volume_roll_mean_6" in leaky_idx:
+                x[leaky_idx["net_imbalance_volume_roll_mean_6"]] = float(niv6.mean())
+            if "net_imbalance_volume_roll_std_6" in leaky_idx:
+                x[leaky_idx["net_imbalance_volume_roll_std_6"]] = (
+                    float(np.std(niv6, ddof=1)) if len(niv6) > 1 else 0.0
+                )
+
+            pred = float(model.predict(x.reshape(1, -1))[0])
+            ssp_buf.append(pred)
+            y_pred_all.append(pred)
+            y_true_all.append(float(row_s["ssp"]))
+
+    return np.array(y_true_all), np.array(y_pred_all)
+
+
 def save_predictions(test_df, y_pred, assets_dir):
     pred_path = assets_dir / "test_predictions.csv"
     out = test_df[["settlement_datetime", "settlement_date", "settlement_period", "ssp"]].copy()
@@ -191,11 +279,26 @@ def main():
     log.info("Training HGBR…")
     model = train_model(train_df, val_df, feature_cols)
 
-    y_true = test_df["ssp"].values
-    y_pred = model.predict(test_df[feature_cols].values)
+    # ── Recursive day-ahead evaluation (honest) ───────────────────────────────
+    # Batch predict(test_df) is misleading: ssp_lag_1 uses actual within-day
+    # prices (future info unavailable at forecast time). The recursive eval
+    # overrides short-lag features with running model predictions, matching
+    # exactly what forecast.py does at deployment.
+    log.info("Running recursive day-ahead evaluation on test set…")
+    y_true, y_pred = evaluate_dayahead_recursive(model, df, test_df, feature_cols)
 
     m = metrics(y_true, y_pred)
-    print_report("HistGradientBoosting (HGBR)", m)
+    print_report("HistGradientBoosting (HGBR) — recursive day-ahead (honest)", m)
+
+    # Log the inflated batch metric so the gap is visible
+    y_pred_batch = model.predict(test_df[feature_cols].values)
+    m_batch = metrics(test_df["ssp"].values, y_pred_batch)
+    log.info(
+        "Reference batch eval (leaky): MAE=%.2f  |  "
+        "Honest recursive MAE=%.2f  |  gap=%.2f (ssp_lag_1 contamination)",
+        m_batch["MAE"], m["MAE"], m["MAE"] - m_batch["MAE"],
+    )
+
     save_metrics({"HGBR": m}, ASSETS_DIR / "hgbr_metrics.json")
 
     log.info("Computing permutation importance on val set…")
