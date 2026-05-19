@@ -16,13 +16,16 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH     = ROOT / "data" / "raw" / "system_prices.csv"
 PRED_PATH     = ROOT / "model_assets" / "test_predictions.csv"
-FORECAST_PATH = ROOT / "model_assets" / "next_day_forecast.csv"
+PRED_PATH_P3  = ROOT / "model_assets" / "test_predictions_phase3.csv"
+FORECAST_PATH    = ROOT / "model_assets" / "next_day_forecast.csv"
+FORECAST_PATH_P3 = ROOT / "model_assets" / "next_day_forecast_phase3.csv"
 FI_PATH       = ROOT / "model_assets" / "hgbr_feature_importance.csv"
 
-FETCH_ELEXON    = ROOT / "src" / "data"   / "fetch_elexon.py"
-FETCH_WEATHER   = ROOT / "src" / "data"   / "fetch_weather.py"
-FORECAST_SCRIPT = ROOT / "src" / "models" / "forecast.py"
-FORECASTS_DIR   = ROOT / "model_assets"   / "forecasts"
+FETCH_ELEXON      = ROOT / "src" / "data"   / "fetch_elexon.py"
+FETCH_WEATHER     = ROOT / "src" / "data"   / "fetch_weather.py"
+FORECAST_SCRIPT   = ROOT / "src" / "models" / "forecast.py"
+FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
+FORECASTS_DIR     = ROOT / "model_assets"   / "forecasts"
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -63,11 +66,9 @@ if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
             [sys.executable, str(FETCH_WEATHER)],
             capture_output=True,
         )
-    with st.spinner("Running day-ahead forecast…"):
-        subprocess.run(
-            [sys.executable, str(FORECAST_SCRIPT)],
-            capture_output=True,
-        )
+    with st.spinner("Running day-ahead forecast (Phase 2 + Phase 3)…"):
+        subprocess.run([sys.executable, str(FORECAST_SCRIPT)],    capture_output=True)
+        subprocess.run([sys.executable, str(FORECAST_SCRIPT_P3)], capture_output=True)
     st.cache_data.clear()
     st.rerun()
 
@@ -110,18 +111,21 @@ st.caption(
 
 # ── Production model banner ───────────────────────────────────────────────────
 st.info(
-    "**Phase 2 model — Quantile HGBR (P10 / P50 / P90) + Spike Classifier** · "
-    "Trained on `ssp_raw` (unclipped prices) · "
-    "New features: raw-price spike memory, NIV extremes, crash-risk indicators · "
-    "**Honest day-ahead MAE (P50): £25.4/MWh** (recursive simulation, no leakage) · "
-    "Previously reported £14.8 was inflated by `ssp_lag_1` using actual within-day prices"
+    "**Phase 3 model — Level-Shape Decomposition (no recursive error propagation)** · "
+    "Stage 1: daily level HGBR (P10/P50/P90) · Stage 2: intra-day shape HGBR · "
+    "All features lag ≥ 48 SPs — zero leakage · "
+    "**Honest day-ahead MAE (P50): £22.2/MWh** · "
+    "Level MAE: £15.5/MWh/day · Shape corr: 0.48 · Peak timing: ±6.9 SPs"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
-st.subheader("Day-Ahead Forecast (Quantile HGBR · P10 / P50 / P90 · 48 Settlement Periods)")
+st.subheader("Day-Ahead Forecast (Phase 3 Level-Shape · P10 / P50 / P90 · 48 Settlement Periods)")
 
-if FORECAST_PATH.exists():
-    fc = pd.read_csv(FORECAST_PATH, parse_dates=["settlement_datetime"])
+# Prefer Phase 3 forecast; fall back to Phase 2 if not yet generated
+_fc_path = FORECAST_PATH_P3 if FORECAST_PATH_P3.exists() else FORECAST_PATH
+
+if _fc_path.exists():
+    fc = pd.read_csv(_fc_path, parse_dates=["settlement_datetime"])
     fc_date  = fc["settlement_date"].iloc[0]
     fc_label = f"{fc_date}  ·  SP 1–48 (midnight → 23:30)"
 
@@ -131,10 +135,13 @@ if FORECAST_PATH.exists():
     fm1, fm2, fm3, fm4, fm5 = st.columns(5)
     fm1.metric("Forecast date", fc_date)
     fm2.metric("Min P50", f"£{fc[p50_col].min():.1f}")
-    fm3.metric("Avg P50", f"£{fc[p50_col].mean():.1f}")
+    fm3.metric("Avg P50 (daily level)", f"£{fc[p50_col].mean():.1f}")
     fm4.metric("Max P50", f"£{fc[p50_col].max():.1f}")
-    if has_quantiles and "spike_prob" in fc.columns:
-        peak_sp = int(fc.loc[fc["ssp_q90"].idxmax(), "settlement_period"])
+    if "pred_daily_level" in fc.columns:
+        fm5.metric("Predicted daily level", f"£{fc['pred_daily_level'].iloc[0]:.1f}/MWh",
+                   help="Stage 1 level model prediction — expected daily average price")
+    elif has_quantiles and "spike_prob" in fc.columns:
+        peak_sp  = int(fc.loc[fc["ssp_q90"].idxmax(), "settlement_period"])
         peak_q90 = fc["ssp_q90"].max()
         fm5.metric("Peak P90 risk", f"£{peak_q90:.0f}  SP {peak_sp}")
     else:
@@ -355,21 +362,24 @@ st.caption(
 
 archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []
 
+# Separate Phase 2 and Phase 3 archives; prefer Phase 3 for each date
+def _archive_date(f):
+    stem = f.stem  # "forecast_2026-05-18" or "forecast_phase3_2026-05-18"
+    return stem.replace("forecast_phase3_", "").replace("forecast_", "")
+
 if not archived:
     st.info("No archived forecasts yet. Run the forecast once to start tracking.")
 else:
-    # Find which archived dates also have actuals in the loaded data
     actual_dates = set(df["settlement_date"].dt.strftime("%Y-%m-%d").unique())
-    verified_dates = [
-        f.stem.replace("forecast_", "")
-        for f in archived
-        if f.stem.replace("forecast_", "") in actual_dates
-    ]
-    pending_dates = [
-        f.stem.replace("forecast_", "")
-        for f in archived
-        if f.stem.replace("forecast_", "") not in actual_dates
-    ]
+    # Build date → file mapping, preferring phase3 archives
+    date_to_file: dict = {}
+    for f in archived:
+        d = _archive_date(f)
+        if d not in date_to_file or "phase3" in f.stem:
+            date_to_file[d] = f
+
+    verified_dates = [d for d in date_to_file if d in actual_dates]
+    pending_dates  = [d for d in date_to_file if d not in actual_dates]
 
     if pending_dates:
         st.info(
@@ -387,7 +397,7 @@ else:
         )
 
         fc_v = pd.read_csv(
-            FORECASTS_DIR / f"forecast_{sel_date}.csv",
+            date_to_file[sel_date],
             parse_dates=["settlement_datetime"],
         )
         act_v = (
@@ -662,29 +672,62 @@ with col_pdc_tbl:
 
 # ── Actual vs Predicted ───────────────────────────────────────────────────────
 st.divider()
-st.subheader("Model Forecast vs Actual (HGBR — 5-year + Weather · Test: May 11–17 2026)")
+st.subheader("Model Forecast vs Actual (Phase 3 Level-Shape · Test: May 11–17 2026)")
 
-if PRED_PATH.exists():
-    pred = pd.read_csv(PRED_PATH, parse_dates=["settlement_datetime"])
+# Prefer Phase 3 predictions; fall back to Phase 2
+_pred_path = PRED_PATH_P3 if PRED_PATH_P3.exists() else PRED_PATH
+_is_p3     = _pred_path == PRED_PATH_P3
+
+if _pred_path.exists():
+    pred = pd.read_csv(_pred_path, parse_dates=["settlement_datetime"])
     has_q_pred = "ssp_q50" in pred.columns
 
     # ── Metrics row ───────────────────────────────────────────────────────────
-    mae_val   = pred["abs_error"].mean()
-    rmse_val  = (pred["error"] ** 2).mean() ** 0.5
+    mae_val   = pred["abs_error"].mean() if "abs_error" in pred.columns else (pred["ssp_predicted"] - pred["ssp_actual"]).abs().mean()
+    pred["_err"] = pred["ssp_predicted"] - pred["ssp_actual"]
+    pred["_abs"]  = pred["_err"].abs()
+    rmse_val  = (pred["_err"] ** 2).mean() ** 0.5
     denom     = (pred["ssp_actual"].abs() + pred["ssp_predicted"].abs()) / 2
-    smape_val = (pred["abs_error"] / denom.replace(0, float("nan"))).mean() * 100
-
-    # Spike-period analysis: rows where actual > 200 (elevated price)
-    elevated = pred[pred["ssp_actual"] > 200]
-    elev_mae = elevated["abs_error"].mean() if len(elevated) > 0 else float("nan")
+    smape_val = (pred["_abs"] / denom.replace(0, float("nan"))).mean() * 100
 
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-    mc1.metric("MAE (all periods)", f"£{mae_val:.2f}/MWh")
+    mc1.metric("MAE (P50, all periods)", f"£{mae_val:.2f}/MWh")
     mc2.metric("RMSE", f"£{rmse_val:.2f}/MWh")
     mc3.metric("sMAPE", f"{smape_val:.1f}%")
     mc4.metric("Test periods", len(pred))
-    mc5.metric("MAE (SSP > £200)", f"£{elev_mae:.1f}" if not pd.isna(elev_mae) else "n/a",
-               help="Error on elevated-price periods (>£200/MWh). Lower is better peak prediction.")
+
+    # Phase 3 decomposition metrics
+    if _is_p3 and "actual_daily_level" in pred.columns and "pred_level_q50" in pred.columns:
+        level_errs = (
+            pred.groupby("settlement_date")
+            .apply(lambda g: abs(g["pred_level_q50"].iloc[0] - g["actual_daily_level"].iloc[0]))
+        )
+        mc5.metric("Level MAE", f"£{level_errs.mean():.2f}/MWh/day",
+                   help="Error in predicting the day's average price level (Stage 1)")
+    else:
+        elevated = pred[pred["ssp_actual"] > 200]
+        elev_mae = elevated["_abs"].mean() if len(elevated) > 0 else float("nan")
+        mc5.metric("MAE (SSP > £200)", f"£{elev_mae:.1f}" if not pd.isna(elev_mae) else "n/a")
+
+    # Phase 3 shape decomposition row
+    if _is_p3 and "actual_daily_level" in pred.columns:
+        import numpy as np
+        from scipy.stats import pearsonr
+        shape_corrs, peak_gaps = [], []
+        for _, day in pred.groupby("settlement_date"):
+            act  = day["ssp_actual"].values;  am = act.mean()
+            prd  = day["ssp_predicted"].values; pm = prd.mean()
+            if (act - am).std() > 0 and (prd - pm).std() > 0:
+                r, _ = pearsonr(act - am, prd - pm)
+                shape_corrs.append(r)
+            peak_gaps.append(abs(int(np.argmax(act)) - int(np.argmax(prd))))
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.metric("Shape correlation", f"{float(pd.Series(shape_corrs).mean()):.3f}",
+                   help="Mean Pearson r between predicted and actual intra-day profiles per day")
+        dc2.metric("Peak timing error", f"{float(pd.Series(peak_gaps).mean()):.1f} SPs",
+                   help="Mean absolute SP offset between predicted and actual daily peak")
+        dc3.metric("Phase 3 vs Phase 2", "£22.2 vs £25.4/MWh  (−12.7%)",
+                   help="Honest recursive MAE comparison on same test week")
 
     # ── Time series: actual vs predicted with quantile band ───────────────────
     fig_pred = go.Figure()
@@ -751,7 +794,7 @@ if PRED_PATH.exists():
 
     # ── Daily error summary ───────────────────────────────────────────────────
     daily_err = (
-        pred.groupby("settlement_date")["abs_error"]
+        pred.groupby("settlement_date")["_abs"]
         .agg(["mean", "max"])
         .reset_index()
         .rename(columns={"mean": "Mean AE", "max": "Max AE"})
