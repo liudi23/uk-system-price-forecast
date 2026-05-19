@@ -195,8 +195,119 @@ def compute_feature_importance(model, X_val, y_val, feature_cols, n_repeats=10):
     }).sort_values("importance_mean", ascending=False)
 
 
+def evaluate_dayahead_recursive(models_dict, clf, df, test_df, feature_cols, tukey_upper_fence):
+    """
+    Honest day-ahead evaluation: simulate the recursive multi-step forecast for
+    each test day using only information genuinely available at forecast time.
+
+    Short-lag features that are leaky in batch evaluation — ssp_lag_1, ssp_lag_2,
+    ssp_roll_*_6, ssp_diff_1_48, net_imbalance_volume_lag_1, niv_roll_*_6 — are
+    recomputed from the running prediction buffer, exactly as forecast.py does.
+
+    All features with lag >= 48 (calendar, weather, price lags, spike history) are
+    taken from the pre-computed features file; they reference actual history that
+    predates the forecast day and contain no leakage.
+    """
+    HISTORY = 400
+
+    # Map feature name → column index for fast override
+    leaky_names = {
+        "ssp_lag_1", "ssp_lag_2",
+        "ssp_roll_mean_6", "ssp_roll_std_6", "ssp_roll_min_6", "ssp_roll_max_6",
+        "ssp_diff_1_48",
+        "net_imbalance_volume_lag_1",
+        "net_imbalance_volume_roll_mean_6", "net_imbalance_volume_roll_std_6",
+        "net_imbalance_volume_roll_min_6",  "net_imbalance_volume_roll_max_6",
+        "abs_niv_roll_mean_6",
+    }
+    col_idx = {f: i for i, f in enumerate(feature_cols)}
+    leaky_idx = {f: col_idx[f] for f in leaky_names if f in col_idx}
+    lag48_idx = col_idx.get("ssp_lag_48")
+
+    test_dates = sorted(test_df["settlement_datetime"].dt.date.unique())
+    true_vals, q10_preds, q50_preds, q90_preds, spike_probs = [], [], [], [], []
+
+    for target_date in test_dates:
+        # History: all usable rows strictly before this test day
+        hist = df[df["settlement_datetime"].dt.date < target_date].tail(HISTORY).reset_index(drop=True)
+        if len(hist) < HISTORY:
+            log.warning("Skipping %s — only %d history rows", target_date, len(hist))
+            continue
+
+        # ssp_buf: winsorised prices fed back as lag features (matches training distribution)
+        ssp_buf    = list(hist["ssp"].values)
+        niv_actual = hist["net_imbalance_volume"].values
+        # NIV proxy: within-day periods are unknown at day-ahead time;
+        # proxy with yesterday's same settlement period (identical to forecast.py)
+        niv_virtual = np.concatenate([niv_actual, niv_actual[-48:]])
+
+        day_rows = (
+            test_df[test_df["settlement_datetime"].dt.date == target_date]
+            .sort_values("settlement_datetime")
+        )
+
+        for h_idx, (_, row_s) in enumerate(day_rows.iterrows()):
+            idx = HISTORY + h_idx   # position in niv_virtual
+
+            # Base feature vector from pre-computed row (non-leaky features intact)
+            x = np.array([row_s.get(f, 0.0) for f in feature_cols], dtype=float)
+
+            # ── Override leaky short-lag features ─────────────────────────────
+            ssp_arr = np.array(ssp_buf)
+
+            if "ssp_lag_1" in leaky_idx:
+                x[leaky_idx["ssp_lag_1"]] = float(ssp_arr[-1])
+            if "ssp_lag_2" in leaky_idx:
+                x[leaky_idx["ssp_lag_2"]] = float(ssp_arr[-2])
+
+            win6 = ssp_arr[-6:]
+            for k, fn in [("mean", np.mean), ("std", lambda a: np.std(a, ddof=1) if len(a) > 1 else 0.0),
+                          ("min",  np.min),  ("max",  np.max)]:
+                key = f"ssp_roll_{k}_6"
+                if key in leaky_idx:
+                    x[leaky_idx[key]] = float(fn(win6))
+
+            if "ssp_diff_1_48" in leaky_idx:
+                lag48 = x[lag48_idx] if lag48_idx is not None else float(ssp_arr[-48])
+                x[leaky_idx["ssp_diff_1_48"]] = float(ssp_arr[-1]) - lag48
+
+            # NIV: proxy from yesterday for within-day periods
+            niv6 = niv_virtual[idx - 6 : idx]
+            if "net_imbalance_volume_lag_1" in leaky_idx:
+                x[leaky_idx["net_imbalance_volume_lag_1"]] = float(niv_virtual[idx - 1])
+            for k, fn in [("mean", np.mean), ("std", lambda a: np.std(a, ddof=1) if len(a) > 1 else 0.0),
+                          ("min",  np.min),  ("max",  np.max)]:
+                key = f"net_imbalance_volume_roll_{k}_6"
+                if key in leaky_idx:
+                    x[leaky_idx[key]] = float(fn(niv6))
+            if "abs_niv_roll_mean_6" in leaky_idx:
+                x[leaky_idx["abs_niv_roll_mean_6"]] = float(np.abs(niv6).mean())
+
+            # ── Predict ───────────────────────────────────────────────────────
+            X = x.reshape(1, -1)
+            pred_q50 = float(models_dict[0.50].predict(X)[0])
+            pred_q10 = float(models_dict[0.10].predict(X)[0])
+            pred_q90 = float(models_dict[0.90].predict(X)[0])
+            spike_p  = float(clf.predict_proba(X)[0, 1])
+
+            # Feed back clipped q50 so ssp_lag_1/2 stay in training distribution
+            ssp_buf.append(float(np.clip(pred_q50, -500, tukey_upper_fence)))
+
+            q50_preds.append(pred_q50)
+            q10_preds.append(pred_q10)
+            q90_preds.append(pred_q90)
+            spike_probs.append(spike_p)
+            true_vals.append(float(row_s["ssp_raw"]))
+
+    return (
+        np.array(true_vals),
+        {"q10": np.array(q10_preds), "q50": np.array(q50_preds), "q90": np.array(q90_preds)},
+        np.array(spike_probs),
+    )
+
+
 def save_predictions(test_df, preds_dict, assets_dir):
-    """Save test-set predictions for all quantiles."""
+    """Save test-set predictions (recursive day-ahead evaluation)."""
     pred_path = assets_dir / "test_predictions.csv"
     out = test_df[["settlement_datetime", "settlement_date", "settlement_period",
                    "ssp", "ssp_raw"]].copy()
@@ -271,26 +382,36 @@ def main():
     log.info("Training spike classifier…")
     clf = train_spike_classifier(train_df, val_df, feature_cols)
 
-    # ── Evaluate on test set ──────────────────────────────────────────────────
-    X_test  = test_df[feature_cols].values
-    y_true  = test_df["ssp_raw"].values
+    # ── Evaluate: recursive day-ahead simulation (honest) ────────────────────
+    # Batch prediction on the pre-computed feature matrix is misleading because
+    # ssp_lag_1/lag_2/roll_6 use actual prices from within the forecast window
+    # (future information). The recursive evaluation replicates forecast.py's
+    # loop, overriding those features with running model predictions.
+    log.info("Running recursive day-ahead evaluation on test set…")
+    y_true_rec, preds_rec, spike_prob_rec = evaluate_dayahead_recursive(
+        models, clf, df, test_df, feature_cols, tukey_fence["upper"]
+    )
 
-    preds = {}
     all_metrics = {}
-    for q, model in models.items():
-        name   = QUANTILE_NAMES[q]
-        y_pred = model.predict(X_test)
-        preds[name] = y_pred
-        m = metrics(y_true, y_pred)
+    for name in ["q10", "q50", "q90"]:
+        m = metrics(y_true_rec, preds_rec[name])
         all_metrics[f"HGBR_{name}"] = m
-        print_report(f"HGBR quantile={q:.2f} (on ssp_raw)", m)
+        print_report(f"HGBR {name} — recursive day-ahead (honest)", m)
 
-    # Spike classification report
+    # For reference: show the inflated batch metric so the gap is visible
+    log.info("Reference batch eval (leaky — shows how much ssp_lag_1 inflates score):")
+    y_batch = models[0.50].predict(test_df[feature_cols].values)
+    m_batch = metrics(test_df["ssp_raw"].values, y_batch)
+    log.info("  Batch P50 MAE=%.2f  (recursive honest MAE=%.2f  — gap=%.2f)",
+             m_batch["MAE"], all_metrics["HGBR_q50"]["MAE"],
+             all_metrics["HGBR_q50"]["MAE"] - m_batch["MAE"])
+
+    # Spike classifier recall on test set (batch OK here — classifier doesn't self-feed)
+    X_test     = test_df[feature_cols].values
     spike_true = test_df["is_spike"].astype(int).values
-    spike_prob = clf.predict_proba(X_test)[:, 1]
-    spike_pred = (spike_prob >= 0.5).astype(int)
+    spike_pred_batch = (clf.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
     n_actual   = spike_true.sum()
-    n_caught   = (spike_pred & spike_true).sum()
+    n_caught   = (spike_pred_batch & spike_true).sum()
     log.info("Spike classifier: %d actual spikes, %d caught (recall=%.1f%%)",
              n_actual, n_caught, 100 * n_caught / max(n_actual, 1))
 
@@ -303,7 +424,8 @@ def main():
     )
 
     # ── Save everything ───────────────────────────────────────────────────────
-    save_predictions(test_df, preds, ASSETS_DIR)
+    # test_predictions.csv uses the RECURSIVE (honest) predictions
+    save_predictions(test_df, preds_rec, ASSETS_DIR)
     save_outputs(models, clf, fi, all_metrics.get("HGBR_q50", {}),
                  ASSETS_DIR, feature_cols, tukey_fence)
 

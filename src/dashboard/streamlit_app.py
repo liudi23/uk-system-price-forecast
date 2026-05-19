@@ -111,9 +111,10 @@ st.caption(
 # ── Production model banner ───────────────────────────────────────────────────
 st.info(
     "**Phase 2 model — Quantile HGBR (P10 / P50 / P90) + Spike Classifier** · "
-    "Trained on `ssp_raw` (unclipped prices) so the model can predict spike-level values · "
+    "Trained on `ssp_raw` (unclipped prices) · "
     "New features: raw-price spike memory, NIV extremes, crash-risk indicators · "
-    "Test MAE (P50): £14.84/MWh · Confidence band: P10 (downside) – P90 (spike risk)"
+    "**Honest day-ahead MAE (P50): £25.4/MWh** (recursive simulation, no leakage) · "
+    "Previously reported £14.8 was inflated by `ssp_lag_1` using actual within-day prices"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
