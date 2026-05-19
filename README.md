@@ -2,7 +2,7 @@
 
 An end-to-end data science project for forecasting UK electricity system prices (SSP) at the settlement-period level (30-minute intervals). Built on public data from Elexon BMRS and Open-Meteo.
 
-**Phase 2 — Quantile forecasting + spike detection · In progress May 2026**
+**Phase 3 — Level-Shape Decomposition · In progress May 2026**
 
 ---
 
@@ -10,11 +10,13 @@ An end-to-end data science project for forecasting UK electricity system prices 
 
 - **Ingests** 5 years of Elexon BMRS settlement data (May 2021 – May 2026) with smart incremental updates
 - **Fetches** UK weather history and day-ahead forecasts from Open-Meteo (temperature, wind speed, solar irradiance, precipitation) across three representative UK locations
-- **Engineers** 91 features covering price lags/rolling statistics, spike memory, NIV stress indicators, calendar/annual harmonics, and weather-driven supply-demand signals
-- **Trains** three quantile HGBR models (P10/P50/P90) on raw (un-winsorised) prices, plus a binary spike classifier — enabling calibrated uncertainty bands and explicit peak-risk signals
-- **Evaluates** with a correct recursive day-ahead simulation that mirrors the deployment loop: honest P50 MAE **£25.40/MWh · RMSE £32.36** on May 11–17 2026 (gap of ~£11 vs prior leaky batch metric)
-- **Forecasts** tomorrow's 48 settlement periods (00:00–23:30) using recursive multi-step inference with live weather
-- **Visualises** everything in a Streamlit dashboard: P10/P90 uncertainty bands, spike probability chart, historical analytics, model accuracy, and feature importance
+- **Engineers** features at two resolutions: 91 SP-level features (lag-48+ only for the shape model) and 73 daily-level features for the level model
+- **Trains** a two-stage decomposition model with no recursive error propagation:
+  - **Stage 1 — Level model**: quantile HGBR (P10/P50/P90) predicts the day's average SSP from daily-aggregated history
+  - **Stage 2 — Shape model**: HGBR predicts each SP's deviation from the daily mean using only fixed lag-48+ features
+- **Evaluates** with a non-recursive two-stage simulation: honest P50 MAE **£22.18/MWh · RMSE £28.86** on May 11–17 2026, a 12.7% improvement over Phase 2's recursive approach
+- **Forecasts** tomorrow's 48 settlement periods without any within-day recursion — both models use only data available before the forecast day starts
+- **Visualises** everything in a Streamlit dashboard: level vs shape decomposition metrics, P10/P90 uncertainty bands, historical analytics, model accuracy, and feature importance
 
 ---
 
@@ -26,13 +28,24 @@ An end-to-end data science project for forecasting UK electricity system prices 
 | Seasonal naive (lag-336) | 29.40 | 38.29 | 34.7% | batch |
 | Rolling mean (48 SP) | 26.78 | 33.07 | 28.5% | batch |
 | ~~HGBR Phase 1 (batch/leaky)~~ | ~~15.01~~ | ~~22.91~~ | ~~17.9%~~ | ~~leaky batch~~ |
-| **Quantile HGBR P50 · Phase 2** | **25.40** | **32.36** | **27.4%** | **honest recursive** |
+| Quantile HGBR P50 · Phase 2 | 25.40 | 32.36 | 27.4% | honest recursive |
+| **Level-Shape HGBR P50 · Phase 3** | **22.18** | **28.86** | **24.3%** | **honest non-recursive** |
 
 Test period: 7 days (May 11–17 2026), 336 settlement periods.
 
-> **Why the gap?** The Phase 1 batch metric used pre-computed features where `ssp_lag_1` captured actual within-day prices — contaminating 47 of 48 settlement periods per test day. Phase 2 evaluation uses `evaluate_dayahead_recursive()`, which overrides all short-lag features with running model predictions, exactly matching the deployment loop. The honest MAE is £25.40/MWh — still 30% better than the seasonal-naive baseline.
+**Phase 3 decomposition diagnostics:**
 
-Top features by permutation importance (val set): `ssp_lag_1` (22.0), `net_imbalance_volume_lag_1` (1.3), `ssp_lag_2` (0.34), `ssp_roll_mean_6` (0.25), `ssp_lag_48` (0.22), `solar_wm2_lag_1` (0.17), `cos_sp`/`sin_sp` (intra-day cycle).
+| Metric | Value | Meaning |
+|---|---|---|
+| Level MAE | £15.45/MWh/day | Error in predicting the day's average price (Stage 1) |
+| Shape correlation | 0.479 | Mean Pearson r between predicted and actual intra-day profiles |
+| Peak timing error | 6.9 SPs | Mean absolute offset between predicted and actual daily peak (±3.5 h) |
+
+> **Why Phase 3 improves on Phase 2:** Phase 2's recursive loop propagates prediction errors across all 48 steps — a drift in SP5 contaminates every subsequent prediction that day. Phase 3 eliminates this by splitting the problem: Stage 1 predicts the day's price level from daily-aggregated history (no recursion), and Stage 2 predicts the intra-day shape using only fixed lag-48+ features (safe for every SP simultaneously). The shape correlation of 0.48 identifies the next improvement opportunity: exogenous day-ahead inputs (wind generation forecast, demand forecast) would directly inform the intra-day profile.
+
+> **Why rolling features are excluded from the shape model:** `shift(1).rolling(w)` features include within-day actual prices for SPs 2–48 of the forecast day (only SP1 is clean). Even `ssp_roll_mean_336` contains up to 47/336 ≈ 14% within-day contamination for late-day SPs. Phase 3 uses only fixed-point lags (`ssp_lag_48`, `ssp_lag_96`, `ssp_lag_336`) — guaranteed leakage-free for every SP in the 48-period forecast window.
+
+Top features by permutation importance (val set, Phase 2 P50 model): `ssp_lag_1` (22.0), `net_imbalance_volume_lag_1` (1.3), `ssp_lag_2` (0.34), `ssp_roll_mean_6` (0.25), `ssp_lag_48` (0.22), `solar_wm2_lag_1` (0.17), `cos_sp`/`sin_sp` (intra-day cycle).
 
 Annual modulation confirmed statistically (Kruskal-Wallis p = 5.4 × 10⁻¹¹): prices peak in December/January, trough in May, with a secondary summer peak — driven by heating demand seasonality. The 2022 Russia-Ukraine energy crisis is visible as a structural outlier.
 
@@ -43,45 +56,60 @@ Annual modulation confirmed statistically (Kruskal-Wallis p = 5.4 × 10⁻¹¹):
 ```
 data/
     raw/
-        system_prices.csv       # Elexon BMRS — SSP, NIV, price derivation code
-        weather_uk.csv          # Open-Meteo — 30-min UK weather (3 locations, weighted)
+        system_prices.csv         # Elexon BMRS — SSP, NIV, price derivation code
+        weather_uk.csv            # Open-Meteo — 30-min UK weather (3 locations, weighted)
     processed/
-        dataset_5yr.csv         # Cleaned + denoised (Tukey outer-fence winsorisation)
-        features_5yr.csv        # 87,686 rows × 108 columns — full feature matrix
+        dataset_5yr.csv           # Cleaned + denoised (Tukey outer-fence winsorisation)
+        features_5yr.csv          # 87,686 rows × 108 columns — full SP-level feature matrix
 
 src/
     data/
-        fetch_elexon.py         # Smart incremental Elexon ingest (concurrent, day-level)
-        fetch_historical.py     # One-shot 5-year bulk fetch (ThreadPoolExecutor)
-        fetch_weather.py        # Open-Meteo historical archive fetch
-        build_dataset.py        # Cleaning, denoising, derived columns
+        fetch_elexon.py           # Smart incremental Elexon ingest (concurrent, day-level)
+        fetch_historical.py       # One-shot 5-year bulk fetch (ThreadPoolExecutor)
+        fetch_weather.py          # Open-Meteo historical archive fetch
+        build_dataset.py          # Cleaning, denoising, derived columns
     features/
-        calendar_features.py    # Temporal + cyclic + annual harmonic features
-        lag_features.py         # SSP/NIV lags, rolling stats, spike memory, NIV extremes
-        weather_features.py     # Weather lags, rolling stats, degree/ramp features
-        build_features.py       # Full feature engineering pipeline
+        calendar_features.py      # Temporal + cyclic + annual harmonic features
+        lag_features.py           # SSP/NIV lags, rolling stats, spike memory, NIV extremes
+        weather_features.py       # Weather lags, rolling stats, degree/ramp features
+        build_features.py         # Full SP-level feature engineering pipeline
+        level_features.py         # Daily-level aggregation for Stage 1 level model
     models/
-        evaluate.py             # MAE, RMSE, sMAPE, metrics reporting
-        train_baseline.py       # Three lag-based baselines
-        train_lgbm.py           # Quantile HGBR + spike classifier training; honest recursive eval
-        forecast.py             # Day-ahead recursive 48-period inference (P10/P50/P90 + spike prob)
+        evaluate.py               # MAE, RMSE, sMAPE + decomposition metrics
+        train_baseline.py         # Three lag-based baselines
+        train_lgbm.py             # Phase 2: quantile HGBR + spike classifier (recursive)
+        train_phase3.py           # Phase 3: two-stage level-shape training + evaluation
+        forecast.py               # Phase 2: recursive day-ahead inference (P10/P50/P90)
+        forecast_phase3.py        # Phase 3: non-recursive two-stage inference
     dashboard/
-        streamlit_app.py        # Streamlit analytics + forecast dashboard
+        streamlit_app.py          # Streamlit analytics + forecast dashboard
 
 model_assets/
-    hgbr_q10.pkl                # Quantile HGBR — P10 model
-    hgbr_q50.pkl                # Quantile HGBR — P50 model (point forecast)
-    hgbr_q90.pkl                # Quantile HGBR — P90 model
-    spike_classifier.pkl        # Binary HGBR classifier (class_weight="balanced")
-    tukey_fence.json            # Winsorisation bounds {"lower": -156.6, "upper": 353.7}
-    feature_cols.json           # Exact 91-feature list used in training
-    hgbr_feature_importance.csv # Permutation importance (val set)
-    hgbr_metrics.json           # Honest recursive test-set evaluation metrics
-    baseline_metrics.json       # Three baseline model metrics
-    test_predictions.csv        # Actuals vs P10/P50/P90 predictions (May 11–17)
-    next_day_forecast.csv       # Latest day-ahead forecast (48 SPs)
+    # Phase 3 models
+    level_q10.pkl                 # Stage 1 level model — P10
+    level_q50.pkl                 # Stage 1 level model — P50 (daily mean point forecast)
+    level_q90.pkl                 # Stage 1 level model — P90
+    shape_q50.pkl                 # Stage 2 shape model — P50 deviation forecast
+    level_feature_cols.json       # 73 daily-level features for Stage 1
+    shape_feature_cols.json       # 90 SP-level lag-48+ features for Stage 2
+    phase3_metrics.json           # Phase 3 test-set metrics + decomposition diagnostics
+    test_predictions_phase3.csv   # Actuals vs Phase 3 predictions (May 11–17)
+    next_day_forecast_phase3.csv  # Latest Phase 3 day-ahead forecast (48 SPs)
+    # Phase 2 models (retained for comparison)
+    hgbr_q10.pkl                  # Phase 2 quantile HGBR — P10
+    hgbr_q50.pkl                  # Phase 2 quantile HGBR — P50
+    hgbr_q90.pkl                  # Phase 2 quantile HGBR — P90
+    spike_classifier.pkl          # Binary HGBR classifier (class_weight="balanced")
+    tukey_fence.json              # Winsorisation bounds {"lower": -156.6, "upper": 353.7}
+    feature_cols.json             # 91 SP-level features for Phase 2 models
+    hgbr_feature_importance.csv   # Permutation importance (val set)
+    hgbr_metrics.json             # Phase 2 honest recursive test-set metrics
+    baseline_metrics.json         # Three baseline model metrics
+    test_predictions.csv          # Phase 2 actuals vs predictions (May 11–17)
+    next_day_forecast.csv         # Latest Phase 2 day-ahead forecast (48 SPs)
     forecasts/
-        forecast_YYYY-MM-DD.csv # Archived daily forecasts for live verification
+        forecast_YYYY-MM-DD.csv         # Phase 2 archived daily forecasts
+        forecast_phase3_YYYY-MM-DD.csv  # Phase 3 archived daily forecasts
 
 reports/
     annual_modulation_analysis.md  # Statistical analysis of annual price seasonality
@@ -128,28 +156,30 @@ python src/features/build_features.py --input  data/processed/dataset_5yr.csv \
 
 ### 3 — Train models
 
+**Phase 3 (recommended):**
+```bash
+python src/models/train_phase3.py
+```
+Trains a two-stage level-shape decomposition model. Outputs `level_q10/q50/q90.pkl`, `shape_q50.pkl`, `level_feature_cols.json`, `shape_feature_cols.json`, `phase3_metrics.json`, `test_predictions_phase3.csv`.
+
+**Phase 2 (retained for comparison):**
 ```bash
 python src/models/train_lgbm.py
 ```
-
-Trains three quantile HGBR models (P10/P50/P90) on raw prices plus a binary spike classifier. Outputs:
-- `model_assets/hgbr_q10.pkl`, `hgbr_q50.pkl`, `hgbr_q90.pkl`
-- `model_assets/spike_classifier.pkl`
-- `model_assets/tukey_fence.json`
-- `model_assets/feature_cols.json`
-- `model_assets/hgbr_feature_importance.csv`
-- `model_assets/hgbr_metrics.json` (honest recursive MAE)
-- `model_assets/test_predictions.csv`
+Trains quantile HGBR P10/P50/P90 + spike classifier with recursive evaluation. Outputs `hgbr_q10/q50/q90.pkl`, `spike_classifier.pkl`, `hgbr_metrics.json`, `test_predictions.csv`.
 
 ### 4 — Generate day-ahead forecast
 
 ```bash
+# Phase 3 (non-recursive, recommended)
+python src/models/forecast_phase3.py
+python src/models/forecast_phase3.py --date 2026-05-20
+
+# Phase 2 (recursive, for comparison)
 python src/models/forecast.py
-# Or for a specific date:
-python src/models/forecast.py --date 2026-05-20
 ```
 
-Fetches live weather from Open-Meteo and runs recursive 48-step inference, outputting P10/P50/P90 quantile bands and per-period spike probability. Saves `model_assets/next_day_forecast.csv`.
+Phase 3 fetches live weather from Open-Meteo, predicts the daily level, then predicts 48 SP deviations — no recursive loop. Saves `model_assets/next_day_forecast_phase3.csv`.
 
 ### 5 — Launch the dashboard
 
@@ -159,7 +189,7 @@ streamlit run src/dashboard/streamlit_app.py
 
 Open [http://localhost:8501](http://localhost:8501)
 
-The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 automatically and refreshes the display.
+The **Refresh Data & Run Forecast** button in the sidebar runs data fetch + both Phase 2 and Phase 3 forecasts automatically.
 
 ---
 
@@ -167,16 +197,15 @@ The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 autom
 
 | Section | What it shows |
 |---|---|
-| Day-Ahead Forecast | 48-period P50 price curve with P10/P90 uncertainty band; Min/Avg/Max/Peak-P90-risk metrics |
-| Spike Probability | Per-settlement-period spike probability bars (red >30%, orange >10%) |
+| Day-Ahead Forecast | 48-period P50 curve with P10/P90 band; predicted daily level from Stage 1 |
 | KPI row | Latest SSP, average, min, max, spike count for the selected date range |
 | SSP Time Series | Daily average SSP with configurable spike threshold overlay |
 | Daily Heatmap | Settlement-period × date heat map — reveals intra-day and weekly patterns |
 | Net Imbalance Volume | Daily average NIV bar chart (green = long, red = short) |
 | Settlement Period Profile | Average 30-minute price profile across selected date range |
 | Price Derivation Code | P vs N code breakdown — how often replacement price methodology triggers |
-| Model Forecast vs Actual | Test-week time series with P10/P90 band, scatter, error histogram, daily error bars; high-price MAE separate metric |
-| Live Forecast Verification | Compares each archived day-ahead forecast against Elexon actuals — MAE, RMSE, sMAPE, error by settlement period, error histogram |
+| Model Forecast vs Actual | Phase 3 test-week series, scatter, error histogram, daily error bars; decomposition metrics: level MAE, shape correlation, peak timing |
+| Live Forecast Verification | Compares archived Phase 3 forecasts against Elexon actuals — MAE, RMSE, sMAPE, error by SP |
 | Feature Importance | Top-20 features by permutation MAE reduction with uncertainty bars |
 | Raw data | Filterable table with CSV download |
 
@@ -184,30 +213,32 @@ The **Refresh Data & Run Forecast** button in the sidebar runs steps 1 + 4 autom
 
 ## Technical notes
 
-**Leakage prevention (features)** — three contemporaneous columns excluded from features: `replacement_price` (corr = 0.9999 with SSP), `price_derivation_code_P` (corr = 0.69), `abs_imbalance_volume`. Contemporaneous `net_imbalance_volume` is also excluded; only lag-1 (30-min-old) and lag-48 are used. Failure to exclude these produced MAE ≈ 0.72 — a near-perfect but fully leakage-driven result.
+**Level-shape decomposition** — the key Phase 3 innovation. Electricity prices on any given day can be decomposed into (1) a daily level (how expensive the day is on average) and (2) an intra-day shape (how prices vary across the 48 SPs relative to the level). Both are predictable from different information sets: level from daily-aggregated history, shape from yesterday's same-SP prices and calendar features. Separating them eliminates recursive error propagation entirely.
 
-**Leakage prevention (evaluation)** — batch evaluation with pre-computed feature tables is leaky: `ssp_lag_1` records the actual price 30 minutes ago, which is unavailable at day-ahead dispatch. `evaluate_dayahead_recursive()` replays each test day end-to-end, overriding `ssp_lag_1/2` and all 6-period rolling SSP/NIV features with running model predictions — matching `forecast.py`'s deployment loop exactly. The honest P50 MAE is £25.40/MWh, approximately £11 worse than the leaky batch figure.
+**Leakage prevention (shape features)** — rolling window features (`shift(1).rolling(w)`) include within-day actual prices for SPs 2–48 of the forecast day. Only `ssp_roll_mean_w` for SP1 is clean; for SP48 the window is 98% within-day contaminated. Phase 3 therefore uses only fixed-point lags (`ssp_lag_48`, `ssp_lag_96`, `ssp_lag_336`, `weather_lag_48`, `niv_lag_48`) — safe for every SP in the 48-period window simultaneously.
 
-**Training target** — Phase 2 trains on `ssp_raw` (un-winsorised actual prices, max ~£4038) rather than the Tukey-clipped `ssp`. This removes the artificial £354 ceiling on predictions, allowing the model to forecast genuine spikes. The Tukey outer fence (`lower=-156.60`, `upper=353.70`) is still used to clip the `ssp` column used as autoregressive lag features, preventing spike contamination from propagating into the smooth price signal.
+**Leakage prevention (evaluation)** — batch evaluation with pre-computed feature tables is leaky: `ssp_lag_1` contains actual within-day prices. Phase 2 fixed this with `evaluate_dayahead_recursive()`. Phase 3 eliminates the problem structurally: neither model stage uses any feature with lag < 48 SPs, so no feature overriding is needed during evaluation.
 
-**Spike classifier** — `HistGradientBoostingClassifier` with `class_weight="balanced"` addresses the ~2.4% spike rate. Outputs per-period probability that `ssp_raw` exceeds the Tukey upper fence (£353.70). Used in the dashboard for risk visualisation; does not alter the P50 point forecast.
+**Leakage prevention (features)** — contemporaneous columns excluded: `replacement_price` (corr = 0.9999 with SSP), `price_derivation_code_P` (corr = 0.69), `abs_imbalance_volume`, and contemporaneous `net_imbalance_volume`. Failure to exclude these produced MAE ≈ 0.72 — a near-perfect but fully leakage-driven result.
 
-**Spike memory features** — `ssp_raw_lag_{48,96,336}`, `is_spike_lag_{48,336}`, `spike_count_roll_48`, `is_negative_lag_{48,336}`, `neg_count_roll_48`: all use lags ≥ 48 SPs so they always reference settled actual data at day-ahead inference time (beyond the 48-period forecast horizon).
+**Level model features (73)** — daily-aggregated lags of SSP/NIV/spike counts (shift ≥ 1 day), rolling 7/14/28-day stats, calendar (day-of-week, month, annual harmonics), and daily-average weather for the forecast day (from Open-Meteo day-ahead forecast). All reference data before the forecast day begins.
 
-**NIV extreme features** — `niv_roll_min/max_{6,48}`, `abs_niv_roll_mean_{6,48}`: capture how short or long the system has been in recent hours — direct antecedents of price spikes and crashes. Used with lag-1 shift so no contemporaneous leakage.
+**Shape model features (90)** — fixed-point lag-48+ SP-level features: `ssp_lag_48/96/336`, `ssp_raw_lag_48/96/336`, `is_spike_lag_48/336`, `niv_lag_48/336`, `weather_lag_48`, `heating_degree`, `cooling_degree`, calendar (SP position, day-of-week, month, annual harmonics), and daily-level lag features merged from Stage 1 (`ssp_daily_mean_lag1d`, `ssp_lag48_deviation`). Rolling features entirely excluded.
+
+**Shape target** — `ssp_raw_h − actual_daily_mean_D`. The actual daily mean is used only as the supervised learning target during training; it is never a feature. At inference time, the Stage 1 predicted level is added to the Stage 2 predicted deviation.
+
+**Training target** — both stages train on `ssp_raw` (un-winsorised actual prices). The Tukey outer fence (`lower=-156.60`, `upper=353.70`) is retained for the Phase 2 recursive lag features (`ssp` column), not for the Phase 3 models.
 
 **SSP = SBP** — confirmed by design, not a data error. ~50% of settlement periods use "P" (replacement price) methodology where SSP = SBP by definition. SBP is removed as redundant.
 
-**Recursive forecasting** — `ssp_lag_1` and `ssp_lag_2` are filled from the model's own running predictions. Lags ≥ 48 always reference actual history. NIV within the forecast window is proxied by yesterday's same settlement period. Quantile ordering is enforced post-prediction: `pred_q10 = min(q10, q50)`, `pred_q90 = max(q90, q50)`.
+**Annual modulation** — statistically confirmed (p = 5.4 × 10⁻¹¹) but explains only R² = 2.9% of variance. Short-range autocorrelation (`ssp_lag_1`) dominates at SP level; at daily level, weekly and monthly harmonics contribute more meaningfully to the level model.
 
-**Annual modulation** — statistically confirmed (p = 5.4 × 10⁻¹¹) but explains only R² = 2.9% of variance. Short-range autocorrelation (`ssp_lag_1`) dominates. Annual harmonic features are included but contribute marginal lift.
+**Live verification loop** — every time `forecast_phase3.py` runs it archives the forecast to `model_assets/forecasts/forecast_phase3_YYYY-MM-DD.csv`. The dashboard's verification panel prefers Phase 3 archives and falls back to Phase 2 archives for dates not yet re-forecast.
 
-**Live verification loop** — every time `forecast.py` runs it archives the forecast to `model_assets/forecasts/forecast_YYYY-MM-DD.csv`. The dashboard's verification panel automatically detects which archived dates have Elexon actuals available and surfaces MAE, RMSE, sMAPE, and per-settlement-period errors for each verified day.
-
-**Model choice** — `HistGradientBoostingRegressor` / `Classifier` (sklearn) used in place of LightGBM; same histogram-based algorithm, no external OpenMP dependency. Swap back with `brew install libomp` + LightGBM as noted in `train_lgbm.py`.
+**Model choice** — `HistGradientBoostingRegressor` (sklearn) used in place of LightGBM; same histogram-based algorithm, no external OpenMP dependency. Swap back with `brew install libomp` + LightGBM if needed.
 
 ---
 
 ## Motivation
 
-UK electricity markets exhibit strong 30-minute periodicity, renewable intermittency, annual demand seasonality, and occasional extreme price spikes — a challenging forecasting environment that benefits from careful feature engineering over model complexity. This project demonstrates a realistic DS workflow: automated ingestion, denoising, systematic feature construction, leakage-aware model training and evaluation, recursive inference with calibrated uncertainty, and interactive visualisation.
+UK electricity markets exhibit strong 30-minute periodicity, renewable intermittency, annual demand seasonality, and occasional extreme price spikes — a challenging forecasting environment that benefits from careful feature engineering over model complexity. This project demonstrates a realistic DS workflow: automated ingestion, denoising, systematic feature construction, leakage-aware model training and evaluation, decomposition-based inference without recursive error propagation, and interactive visualisation. The progression from Phase 1 (leaky batch, MAE £15.0) → Phase 2 (honest recursive, £25.4) → Phase 3 (non-recursive decomposition, £22.2) illustrates both the pitfalls of naive evaluation and the gains from architectural choices grounded in the causal structure of the problem.
