@@ -84,3 +84,48 @@ def compare_table(all_metrics: Dict[str, Dict]) -> pd.DataFrame:
         rows.append({"Model": name, **{k: v for k, v in m.items() if k != "n"}})
     df = pd.DataFrame(rows).set_index("Model")
     return df.sort_values("MAE")
+
+
+# ── Phase 3 decomposition metrics ────────────────────────────────────────────
+
+def level_mae(pred_df: pd.DataFrame) -> float:
+    """Mean absolute error of predicted daily level vs actual daily level."""
+    daily = (
+        pred_df.groupby("settlement_date")
+        .agg(actual_level=("actual_daily_level", "first"),
+             pred_level=("pred_level_q50", "first"))
+        .dropna()
+    )
+    return float(np.mean(np.abs(daily["pred_level"] - daily["actual_level"])))
+
+
+def shape_corr(pred_df: pd.DataFrame) -> float:
+    """Mean Pearson r between predicted and actual intra-day profiles per day."""
+    from scipy.stats import pearsonr
+    corrs = []
+    for _, day in pred_df.groupby("settlement_date"):
+        act  = day["ssp_actual"].values - day["ssp_actual"].values.mean()
+        pred = day["ssp_predicted"].values - day["ssp_predicted"].values.mean()
+        if act.std() > 0 and pred.std() > 0 and len(act) > 1:
+            r, _ = pearsonr(act, pred)
+            corrs.append(r)
+    return float(np.mean(corrs)) if corrs else float("nan")
+
+
+def peak_timing_mae(pred_df: pd.DataFrame) -> float:
+    """Mean absolute SP offset between predicted and actual daily peak."""
+    gaps = []
+    for _, day in pred_df.groupby("settlement_date"):
+        gaps.append(abs(int(np.argmax(day["ssp_actual"].values)) -
+                        int(np.argmax(day["ssp_predicted"].values))))
+    return float(np.mean(gaps)) if gaps else float("nan")
+
+
+def decomposition_report(pred_df: pd.DataFrame) -> Dict[str, float]:
+    """Full decomposition metrics dict for Phase 3 evaluation."""
+    return {
+        "level_mae":       round(level_mae(pred_df),       2),
+        "shape_corr_mean": round(shape_corr(pred_df),      4),
+        "peak_timing_mae": round(peak_timing_mae(pred_df), 2),
+        "n_days":          int(pred_df["settlement_date"].nunique()),
+    }

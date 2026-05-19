@@ -1,0 +1,472 @@
+"""
+Phase 3 day-ahead SSP forecast: two-stage level-shape inference.
+
+No recursive loop — both stages use only data settled before the forecast day:
+
+  Stage 1 — Daily level model
+      Inputs  : rolling daily SSP/NIV stats from history + day-ahead weather
+      Output  : predicted daily mean SSP for target date (P10 / P50 / P90)
+
+  Stage 2 — Intra-day shape model
+      Inputs  : fixed-point lag-48+ features for each of the 48 SPs
+                (ssp_lag_48/96/336, weather_lag_48, niv_lag_48, calendar)
+      Output  : predicted deviation from daily mean per SP (P50)
+
+  Final forecast per SP : level_P50 + deviation_P50
+  Uncertainty band      : [level_P10 + deviation, level_P90 + deviation]
+
+Output: model_assets/next_day_forecast_phase3.csv
+Columns: settlement_datetime, settlement_date, settlement_period,
+         ssp_predicted, ssp_q10, ssp_q50, ssp_q90
+
+Usage:
+    python src/models/forecast_phase3.py
+    python src/models/forecast_phase3.py --date 2026-05-20
+"""
+
+import argparse
+import json
+import logging
+from datetime import date, timedelta
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+ASSETS_DIR      = Path(__file__).resolve().parents[2] / "model_assets"
+FEATURES_FILE   = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
+RAW_PRICES_FILE = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
+OUTPUT_FILE     = ASSETS_DIR / "next_day_forecast_phase3.csv"
+
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+UK_LOCATIONS = [
+    {"lat": 52.5, "lon": -1.5, "weight": 0.6},
+    {"lat": 56.5, "lon": -4.0, "weight": 0.2},
+    {"lat": 52.3, "lon": -3.7, "weight": 0.2},
+]
+WEATHER_VARS   = ["temperature_2m", "wind_speed_10m", "shortwave_radiation", "precipitation"]
+WEATHER_RENAME = {
+    "temperature_2m":      "temp_c",
+    "wind_speed_10m":      "wind_ms",
+    "shortwave_radiation": "solar_wm2",
+    "precipitation":       "precip_mm",
+}
+HEATING_BASE = 15.5
+COOLING_BASE = 22.0
+HISTORY_DAYS = 40   # rolling window for daily features (28-day max lag + buffer)
+
+
+# ── Weather ───────────────────────────────────────────────────────────────────
+
+def fetch_forecast_weather(target_date: date) -> pd.DataFrame:
+    start = str(target_date - timedelta(days=2))
+    end   = str(target_date)
+    frames = []
+    for loc in UK_LOCATIONS:
+        params = {
+            "latitude": loc["lat"], "longitude": loc["lon"],
+            "hourly": ",".join(WEATHER_VARS),
+            "start_date": start, "end_date": end,
+            "timezone": "UTC", "wind_speed_unit": "ms",
+        }
+        r = requests.get(FORECAST_URL, params=params, timeout=30)
+        r.raise_for_status()
+        hourly = r.json()["hourly"]
+        df = pd.DataFrame(hourly)
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        for v in WEATHER_VARS:
+            df[v] = df[v] * loc["weight"]
+        frames.append(df[["time"] + WEATHER_VARS])
+    combined = frames[0].copy()
+    for v in WEATHER_VARS:
+        combined[v] = sum(f[v] for f in frames)
+    combined = (
+        combined.set_index("time").resample("30min").ffill().reset_index()
+        .rename(columns={**WEATHER_RENAME, "time": "dt"})
+    )
+    return combined
+
+
+def _day_weather(weather_df: pd.DataFrame, d: date) -> dict:
+    """Extract 48-SP weather arrays for a given date."""
+    start = pd.Timestamp(d)
+    end   = start + pd.Timedelta(hours=23, minutes=30)
+    day   = weather_df[(weather_df["dt"] >= start) & (weather_df["dt"] <= end)].reset_index(drop=True)
+    while len(day) < 48:
+        day = pd.concat([day, day.iloc[[-1]]], ignore_index=True)
+    return {col: day[col].values[:48] for col in ["temp_c", "wind_ms", "solar_wm2", "precip_mm"]}
+
+
+# ── Calendar ──────────────────────────────────────────────────────────────────
+
+def _calendar(dt: pd.Timestamp) -> dict:
+    sp  = dt.hour * 2 + dt.minute // 30 + 1
+    doy = dt.day_of_year
+    return {
+        "hour":            dt.hour,
+        "day_of_week":     dt.dayofweek,
+        "month":           dt.month,
+        "week_of_year":    int(dt.isocalendar().week),
+        "quarter":         dt.quarter,
+        "day_of_year":     doy,
+        "sin_sp":          np.sin(2 * np.pi * sp / 48),
+        "cos_sp":          np.cos(2 * np.pi * sp / 48),
+        "sin_hour":        np.sin(2 * np.pi * dt.hour / 24),
+        "cos_hour":        np.cos(2 * np.pi * dt.hour / 24),
+        "sin_dow":         np.sin(2 * np.pi * dt.dayofweek / 7),
+        "cos_dow":         np.cos(2 * np.pi * dt.dayofweek / 7),
+        "sin_month":       np.sin(2 * np.pi * dt.month / 12),
+        "cos_month":       np.cos(2 * np.pi * dt.month / 12),
+        "sin_annual":      np.sin(2 * np.pi * doy / 365),
+        "cos_annual":      np.cos(2 * np.pi * doy / 365),
+        "sin_half_annual": np.sin(4 * np.pi * doy / 365),
+        "cos_half_annual": np.cos(4 * np.pi * doy / 365),
+        "is_weekend":      int(dt.dayofweek >= 5),
+        "is_peak":         int(13 <= sp <= 36),
+        "is_evening_ramp": int(33 <= sp <= 40),
+        "is_uk_holiday":   0,
+        "is_business_day": int(dt.dayofweek < 5),
+    }
+
+
+# ── Stage 1: level features from rolling daily history ────────────────────────
+
+def build_level_features(daily_hist: pd.DataFrame, target_date: date,
+                          target_weather: dict) -> dict:
+    """
+    Compute level model features for target_date from the daily history
+    DataFrame (one row per past day).
+
+    daily_hist must be sorted ascending and contain:
+        date, ssp_daily_mean, ssp_raw_daily_max, niv_daily_mean, is_spike_count
+        and optionally temp_c_daily_mean, wind_ms_daily_mean, solar_wm2_daily_mean
+    """
+    h = daily_hist.sort_values("date").reset_index(drop=True)
+
+    # Calendar for target date
+    td  = pd.Timestamp(target_date)
+    doy = td.day_of_year
+    dow = td.dayofweek
+    mon = td.month
+
+    feat: dict = {
+        "day_of_week":     dow,
+        "month":           mon,
+        "day_of_year":     doy,
+        "quarter":         td.quarter,
+        "is_weekend":      int(dow >= 5),
+        "is_business_day": int(dow < 5),
+        "sin_dow":         np.sin(2 * np.pi * dow / 7),
+        "cos_dow":         np.cos(2 * np.pi * dow / 7),
+        "sin_month":       np.sin(2 * np.pi * mon / 12),
+        "cos_month":       np.cos(2 * np.pi * mon / 12),
+        "sin_annual":      np.sin(2 * np.pi * doy / 365),
+        "cos_annual":      np.cos(2 * np.pi * doy / 365),
+        "sin_half_annual": np.sin(4 * np.pi * doy / 365),
+        "cos_half_annual": np.cos(4 * np.pi * doy / 365),
+    }
+
+    # SSP daily lag features (shift ≥ 1 day)
+    ssp_series  = h["ssp_daily_mean"].values
+    raw_max_ser = h["ssp_raw_daily_max"].values
+    raw_min_ser = h["ssp_raw_daily_min"].values if "ssp_raw_daily_min" in h.columns else ssp_series
+
+    for lag_d, idx in [(1, -1), (2, -2), (7, -7), (14, -14), (28, -28)]:
+        feat[f"ssp_daily_mean_lag{lag_d}d"]    = float(ssp_series[idx])   if len(ssp_series) >= abs(idx) else np.nan
+        feat[f"ssp_raw_daily_max_lag{lag_d}d"] = float(raw_max_ser[idx])  if len(raw_max_ser) >= abs(idx) else np.nan
+        feat[f"ssp_raw_daily_min_lag{lag_d}d"] = float(raw_min_ser[idx])  if len(raw_min_ser) >= abs(idx) else np.nan
+
+    for w in [7, 14, 28]:
+        win = ssp_series[-w:] if len(ssp_series) >= w else ssp_series
+        feat[f"ssp_daily_roll_mean_{w}d"] = float(win.mean())
+        feat[f"ssp_daily_roll_std_{w}d"]  = float(win.std(ddof=1)) if len(win) > 1 else 0.0
+        feat[f"ssp_daily_roll_max_{w}d"]  = float(win.max())
+        feat[f"ssp_daily_roll_min_{w}d"]  = float(win.min())
+        raw_win = raw_max_ser[-w:] if len(raw_max_ser) >= w else raw_max_ser
+        feat[f"ssp_raw_max_roll_mean_{w}d"] = float(raw_win.mean())
+
+    # NIV daily lags
+    niv_series = h["niv_daily_mean"].values
+    for lag_d, idx in [(1, -1), (7, -7)]:
+        feat[f"niv_daily_mean_lag{lag_d}d"] = float(niv_series[idx]) if len(niv_series) >= abs(idx) else np.nan
+    for w in [7, 14]:
+        niv_win = niv_series[-w:] if len(niv_series) >= w else niv_series
+        feat[f"niv_daily_roll_mean_{w}d"] = float(niv_win.mean())
+        feat[f"niv_daily_roll_std_{w}d"]  = float(niv_win.std(ddof=1)) if len(niv_win) > 1 else 0.0
+
+    # Spike count lags
+    spk_series = h["is_spike_count"].values if "is_spike_count" in h.columns else np.zeros(len(h))
+    for lag_d, idx in [(1, -1), (7, -7)]:
+        feat[f"spike_count_lag{lag_d}d"] = float(spk_series[idx]) if len(spk_series) >= abs(idx) else 0.0
+    spk_win = spk_series[-7:] if len(spk_series) >= 7 else spk_series
+    feat["spike_count_roll_7d"] = float(spk_win.sum())
+
+    # Weather for target_date (day-ahead forecast)
+    feat["temp_c_daily_mean"]   = float(np.mean(target_weather["temp_c"]))
+    feat["temp_c_daily_max"]    = float(np.max(target_weather["temp_c"]))
+    feat["wind_ms_daily_mean"]  = float(np.mean(target_weather["wind_ms"]))
+    feat["wind_ms_daily_max"]   = float(np.max(target_weather["wind_ms"]))
+    feat["solar_wm2_daily_mean"] = float(np.mean(target_weather["solar_wm2"]))
+    feat["solar_wm2_daily_max"]  = float(np.max(target_weather["solar_wm2"]))
+    feat["precip_mm_daily_mean"] = float(np.mean(target_weather["precip_mm"]))
+
+    # Weather lag1d (yesterday's daily mean — from history)
+    if "temp_c_daily_mean" in h.columns:
+        feat["temp_c_daily_mean_lag1d"]    = float(h["temp_c_daily_mean"].values[-1])
+        feat["temp_c_daily_mean_lag7d"]    = float(h["temp_c_daily_mean"].values[-7]) if len(h) >= 7 else float(h["temp_c_daily_mean"].values[0])
+        feat["temp_c_daily_max_lag1d"]     = float(h["temp_c_daily_max"].values[-1])  if "temp_c_daily_max" in h.columns else feat["temp_c_daily_mean_lag1d"]
+    if "wind_ms_daily_mean" in h.columns:
+        feat["wind_ms_daily_mean_lag1d"]   = float(h["wind_ms_daily_mean"].values[-1])
+        feat["wind_ms_daily_mean_lag7d"]   = float(h["wind_ms_daily_mean"].values[-7]) if len(h) >= 7 else float(h["wind_ms_daily_mean"].values[0])
+        feat["wind_ms_daily_max_lag1d"]    = float(h["wind_ms_daily_max"].values[-1])  if "wind_ms_daily_max" in h.columns else feat["wind_ms_daily_mean_lag1d"]
+    if "solar_wm2_daily_mean" in h.columns:
+        feat["solar_wm2_daily_mean_lag1d"] = float(h["solar_wm2_daily_mean"].values[-1])
+        feat["solar_wm2_daily_mean_lag7d"] = float(h["solar_wm2_daily_mean"].values[-7]) if len(h) >= 7 else float(h["solar_wm2_daily_mean"].values[0])
+        feat["solar_wm2_daily_max_lag1d"]  = float(h["solar_wm2_daily_max"].values[-1]) if "solar_wm2_daily_max" in h.columns else feat["solar_wm2_daily_mean_lag1d"]
+
+    return feat
+
+
+# ── Stage 2: shape features for one SP ───────────────────────────────────────
+
+def build_shape_row(h_idx: int, dt: pd.Timestamp,
+                    ssp_hist: np.ndarray, ssp_raw_hist: np.ndarray,
+                    is_spike_hist: np.ndarray, niv_hist: np.ndarray,
+                    weather_hist: dict,
+                    daily_mean_lag1d: float, daily_mean_lag7d: float) -> dict:
+    """
+    Build shape feature vector for one SP (h_idx = 0-based index within
+    the forecast day, so lag_48 references the same SP of yesterday).
+
+    All features use fixed lags ≥ 48 SPs — guaranteed leakage-free for
+    every SP in the 48-period forecast window.
+    """
+    HIST = len(ssp_hist)  # must be ≥ 336 (7 days of actual history)
+    row = _calendar(dt)
+
+    # ── Fixed-point SSP lags (winsorised) ─────────────────────────────────
+    row["ssp_lag_48"]  = float(ssp_hist[HIST - 48  + h_idx])   # same SP yesterday
+    row["ssp_lag_96"]  = float(ssp_hist[HIST - 96  + h_idx])
+    row["ssp_lag_336"] = float(ssp_hist[HIST - 336 + h_idx])   # same SP last week
+    row["ssp_diff_48_336"] = row["ssp_lag_48"] - row["ssp_lag_336"]
+
+    # ── Raw SSP and spike flags (actual history, lag ≥ 48) ────────────────
+    row["ssp_raw_lag_48"]   = float(ssp_raw_hist[HIST - 48  + h_idx])
+    row["ssp_raw_lag_96"]   = float(ssp_raw_hist[HIST - 96  + h_idx])
+    row["ssp_raw_lag_336"]  = float(ssp_raw_hist[HIST - 336 + h_idx])
+    row["is_spike_lag_48"]  = float(is_spike_hist[HIST - 48  + h_idx])
+    row["is_spike_lag_336"] = float(is_spike_hist[HIST - 336 + h_idx])
+    row["is_negative_lag_48"]  = float(ssp_raw_hist[HIST - 48  + h_idx] < 0)
+    row["is_negative_lag_336"] = float(ssp_raw_hist[HIST - 336 + h_idx] < 0)
+
+    # ── NIV at lag-48 (same SP yesterday) ────────────────────────────────
+    row["net_imbalance_volume_lag_48"]  = float(niv_hist[HIST - 48  + h_idx])
+    row["net_imbalance_volume_lag_336"] = float(niv_hist[HIST - 336 + h_idx])
+
+    # ── Weather at lag-48 (same SP yesterday's actual weather) ───────────
+    for wvar in ["temp_c", "wind_ms", "solar_wm2", "precip_mm"]:
+        arr = weather_hist[wvar]
+        row[f"{wvar}_lag_48"]  = float(arr[HIST - 48  + h_idx])
+        row[f"{wvar}_lag_336"] = float(arr[HIST - 336 + h_idx])
+
+    temp_lag48 = weather_hist["temp_c"][HIST - 48 + h_idx]
+    row["heating_degree"] = float(max(0.0, HEATING_BASE - temp_lag48))
+    row["cooling_degree"] = float(max(0.0, temp_lag48 - COOLING_BASE))
+
+    # ── Daily-level lag features (from level_features) ────────────────────
+    row["ssp_daily_mean_lag1d"]    = daily_mean_lag1d
+    row["ssp_daily_mean_lag7d"]    = daily_mean_lag7d
+    row["ssp_lag48_deviation"]     = row["ssp_lag_48"]  - daily_mean_lag1d
+    row["ssp_lag336_deviation"]    = row["ssp_lag_336"] - daily_mean_lag7d
+
+    return row
+
+
+# ── Main forecast ─────────────────────────────────────────────────────────────
+
+def run_forecast(target_date: date = None) -> pd.DataFrame:
+    # ── Load models ───────────────────────────────────────────────────────
+    level_q10 = joblib.load(ASSETS_DIR / "level_q10.pkl")
+    level_q50 = joblib.load(ASSETS_DIR / "level_q50.pkl")
+    level_q90 = joblib.load(ASSETS_DIR / "level_q90.pkl")
+    shape_q50 = joblib.load(ASSETS_DIR / "shape_q50.pkl")
+
+    with open(ASSETS_DIR / "level_feature_cols.json") as f:
+        level_feat_cols = json.load(f)
+    with open(ASSETS_DIR / "shape_feature_cols.json") as f:
+        shape_feat_cols = json.load(f)
+    with open(ASSETS_DIR / "tukey_fence.json") as f:
+        fence = json.load(f)
+    upper_fence = fence["upper"]
+
+    # ── Load history ──────────────────────────────────────────────────────
+    log.info("Loading feature history …")
+    base = pd.read_csv(FEATURES_FILE, parse_dates=["settlement_datetime"])
+    base = base.sort_values("settlement_datetime").reset_index(drop=True)
+    last_dt = base["settlement_datetime"].max()
+
+    # Extend with any newer rows from raw prices file
+    extra = pd.DataFrame()
+    if RAW_PRICES_FILE.exists():
+        raw = pd.read_csv(RAW_PRICES_FILE, parse_dates=["settlement_date"])
+        raw["settlement_datetime"] = (
+            raw["settlement_date"]
+            + pd.to_timedelta((raw["settlement_period"] - 1) * 30, unit="min")
+        )
+        extra = raw[raw["settlement_datetime"] > last_dt].sort_values("settlement_datetime").copy()
+        if not extra.empty:
+            extra["ssp_raw"]  = extra["ssp"]
+            extra["is_spike"] = extra["ssp_raw"] > upper_fence
+            log.info("Extending history with %d rows (%s → %s)",
+                     len(extra), extra["settlement_datetime"].min().date(),
+                     extra["settlement_datetime"].max().date())
+
+    sp_all = pd.concat([base, extra], ignore_index=True).sort_values("settlement_datetime")
+    combined_last_dt = sp_all["settlement_datetime"].max()
+
+    if target_date is None:
+        target_date = (combined_last_dt + pd.Timedelta(minutes=30)).date()
+    log.info("Forecasting %s (history ends %s)", target_date, combined_last_dt.date())
+
+    # ── Fetch day-ahead weather ───────────────────────────────────────────
+    log.info("Fetching Open-Meteo weather …")
+    weather_df = fetch_forecast_weather(target_date)
+    target_weather = _day_weather(weather_df, target_date)
+
+    # ── Build daily history for level features ────────────────────────────
+    sp_all["_date"] = sp_all["settlement_datetime"].dt.date
+
+    raw_col = "_raw_temp_c" if "_raw_temp_c" in sp_all.columns else None
+    agg_spec: dict = {
+        "ssp_daily_mean":    ("ssp",                  "mean"),
+        "ssp_raw_daily_max": ("ssp_raw",               "max"),
+        "ssp_raw_daily_min": ("ssp_raw",               "min"),
+        "niv_daily_mean":    ("net_imbalance_volume",  "mean"),
+        "is_spike_count":    ("is_spike",              "sum"),
+    }
+    if raw_col:
+        agg_spec["temp_c_daily_mean"]    = (raw_col,            "mean")
+        agg_spec["temp_c_daily_max"]     = (raw_col,            "max")
+    for wc, wn in [("_raw_wind_ms","wind_ms"), ("_raw_solar_wm2","solar_wm2")]:
+        if wc in sp_all.columns:
+            agg_spec[f"{wn}_daily_mean"] = (wc, "mean")
+            agg_spec[f"{wn}_daily_max"]  = (wc, "max")
+
+    daily_hist = (
+        sp_all[sp_all["_date"] < target_date]
+        .groupby("_date").agg(**agg_spec)
+        .reset_index()
+        .rename(columns={"_date": "date"})
+        .sort_values("date")
+        .tail(HISTORY_DAYS)
+        .reset_index(drop=True)
+    )
+    daily_hist["date"] = pd.to_datetime(daily_hist["date"])
+
+    daily_mean_lag1d = float(daily_hist["ssp_daily_mean"].values[-1])
+    daily_mean_lag7d = float(daily_hist["ssp_daily_mean"].values[-7]) if len(daily_hist) >= 7 else daily_mean_lag1d
+
+    # ── Stage 1: predict daily level ─────────────────────────────────────
+    lf = build_level_features(daily_hist, target_date, target_weather)
+    x_lvl = np.array([[lf.get(c, 0.0) for c in level_feat_cols]])
+    pred_l10 = float(level_q10.predict(x_lvl)[0])
+    pred_l50 = float(level_q50.predict(x_lvl)[0])
+    pred_l90 = float(level_q90.predict(x_lvl)[0])
+    pred_l10 = min(pred_l10, pred_l50)
+    pred_l90 = max(pred_l90, pred_l50)
+    log.info("Level prediction: P10=£%.1f  P50=£%.1f  P90=£%.1f (daily mean)",
+             pred_l10, pred_l50, pred_l90)
+
+    # ── Build SP-level history arrays for shape features ──────────────────
+    HIST_SPS = 400
+    sp_hist = sp_all[sp_all["_date"] < target_date].tail(HIST_SPS).reset_index(drop=True)
+
+    ssp_arr      = sp_hist["ssp"].values.astype(float)
+    ssp_raw_arr  = sp_hist["ssp_raw"].values.astype(float) if "ssp_raw" in sp_hist.columns else ssp_arr
+    is_spike_arr = sp_hist["is_spike"].values.astype(float) if "is_spike" in sp_hist.columns else (ssp_raw_arr > upper_fence).astype(float)
+    niv_arr      = sp_hist["net_imbalance_volume"].values.astype(float)
+
+    # Weather history arrays (SP-level)
+    def _weather_arr(col):
+        if col in sp_hist.columns:
+            return sp_hist[col].values.astype(float)
+        return np.zeros(len(sp_hist))
+
+    weather_hist = {
+        "temp_c":    _weather_arr("_raw_temp_c"),
+        "wind_ms":   _weather_arr("_raw_wind_ms"),
+        "solar_wm2": _weather_arr("_raw_solar_wm2"),
+        "precip_mm": _weather_arr("_raw_precip_mm"),
+    }
+
+    n_hist = len(sp_hist)
+    if n_hist < 336:
+        raise RuntimeError(f"Insufficient SP history: need 336, have {n_hist}")
+
+    # ── Stage 2: predict shape deviations for all 48 SPs ─────────────────
+    base_dt = pd.Timestamp(target_date)
+    records = []
+
+    shape_rows = []
+    for h in range(48):
+        dt  = base_dt + pd.Timedelta(minutes=30 * h)
+        row = build_shape_row(
+            h_idx=h, dt=dt,
+            ssp_hist=ssp_arr, ssp_raw_hist=ssp_raw_arr,
+            is_spike_hist=is_spike_arr, niv_hist=niv_arr,
+            weather_hist=weather_hist,
+            daily_mean_lag1d=daily_mean_lag1d,
+            daily_mean_lag7d=daily_mean_lag7d,
+        )
+        shape_rows.append(row)
+
+    X_shape = np.array([[r.get(c, 0.0) for c in shape_feat_cols] for r in shape_rows])
+    deviations = shape_q50.predict(X_shape)
+
+    for h in range(48):
+        dt  = base_dt + pd.Timedelta(minutes=30 * h)
+        dev = float(deviations[h])
+        records.append({
+            "settlement_datetime": dt,
+            "settlement_date":     str(target_date),
+            "settlement_period":   h + 1,
+            "ssp_predicted":       round(pred_l50 + dev, 2),
+            "ssp_q10":             round(pred_l10 + dev, 2),
+            "ssp_q50":             round(pred_l50 + dev, 2),
+            "ssp_q90":             round(pred_l90 + dev, 2),
+            "pred_daily_level":    round(pred_l50, 2),
+            "pred_deviation":      round(dev, 2),
+        })
+
+    result = pd.DataFrame(records)
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(OUTPUT_FILE, index=False)
+    log.info("Forecast saved → %s", OUTPUT_FILE)
+
+    archive_dir  = OUTPUT_FILE.parent / "forecasts"
+    archive_dir.mkdir(exist_ok=True)
+    result.to_csv(archive_dir / f"forecast_phase3_{target_date}.csv", index=False)
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Phase 3 two-stage day-ahead SSP forecast")
+    parser.add_argument("--date",     default=None, help="Target date YYYY-MM-DD")
+    parser.add_argument("--features", default=str(FEATURES_FILE))
+    args = parser.parse_args()
+    target = date.fromisoformat(args.date) if args.date else None
+    result = run_forecast(target)
+    print(f"\nPhase 3 forecast for {result['settlement_date'].iloc[0]} "
+          f"(daily level P50 = £{result['pred_daily_level'].iloc[0]:.1f}/MWh):")
+    print(result[["settlement_datetime", "settlement_period",
+                  "ssp_q10", "ssp_q50", "ssp_q90"]].to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
