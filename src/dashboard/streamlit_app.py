@@ -162,6 +162,111 @@ else:
 
 st.divider()
 
+# ── Live: Today's Forecast vs Actual SSP ─────────────────────────────────────
+st.subheader("Live: Today's Forecast vs Actual SSP")
+st.caption(
+    "Settled periods update automatically every 30 min. "
+    "Click **↻ Fetch now** to pull the latest Elexon prices immediately."
+)
+
+
+@st.fragment(run_every="30m")
+def live_comparison_panel():
+    from datetime import datetime as dt_cls
+
+    today_str = str(pd.Timestamp.now().date())
+    today_fc_path = FORECASTS_DIR / f"forecast_{today_str}.csv"
+
+    col_ts, col_btn = st.columns([5, 1])
+    col_ts.caption(f"Last check: {dt_cls.now().strftime('%H:%M:%S')}")
+    with col_btn:
+        if st.button("↻ Fetch now", use_container_width=True):
+            with st.spinner("Fetching…"):
+                subprocess.run(
+                    [sys.executable, str(FETCH_ELEXON), "--append"], capture_output=True
+                )
+            st.cache_data.clear()
+
+    if not today_fc_path.exists():
+        st.info(
+            f"No forecast for today ({today_str}). "
+            "Click **Refresh Data & Run Forecast** in the sidebar to generate one."
+        )
+        return
+
+    fc_today = pd.read_csv(today_fc_path, parse_dates=["settlement_datetime"])
+
+    # Read actuals directly (bypass cache so we always get the freshest file)
+    raw_today = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
+    actuals_today = raw_today[
+        raw_today["settlement_date"].dt.strftime("%Y-%m-%d") == today_str
+    ][["settlement_period", "ssp"]].rename(columns={"ssp": "ssp_actual"})
+    n_settled = len(actuals_today)
+
+    # Current settlement period based on local clock
+    now_local = pd.Timestamp.now()
+    current_sp = min(int(now_local.hour * 2 + now_local.minute // 30 + 1), 48)
+    now_dt = pd.Timestamp(today_str) + pd.Timedelta(minutes=30 * (current_sp - 1))
+
+    # Metrics row (only shown when actuals are available)
+    if n_settled > 0:
+        merged_live = fc_today.merge(actuals_today, on="settlement_period", how="inner")
+        merged_live["abs_error"] = (
+            merged_live["ssp_predicted"] - merged_live["ssp_actual"]
+        ).abs()
+        running_mae = merged_live["abs_error"].mean()
+        max_err     = merged_live["abs_error"].max()
+        worst_sp    = int(merged_live.loc[merged_live["abs_error"].idxmax(), "settlement_period"])
+
+        lm1, lm2, lm3, lm4 = st.columns(4)
+        lm1.metric("Settled periods", f"{n_settled} / 48")
+        lm2.metric("Running MAE", f"£{running_mae:.2f}/MWh")
+        lm3.metric("Max error so far", f"£{max_err:.2f}/MWh")
+        lm4.metric("Worst SP", f"SP {worst_sp}")
+
+    # Chart
+    fig_live = go.Figure()
+
+    # Full forecast curve (dotted orange)
+    fig_live.add_trace(go.Scatter(
+        x=fc_today["settlement_datetime"], y=fc_today["ssp_predicted"],
+        name="Forecast", line=dict(color="#ff7f0e", width=2, dash="dot"),
+        hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}/MWh<extra></extra>",
+        customdata=fc_today["settlement_period"],
+    ))
+
+    # Actual SSP for settled periods (solid blue)
+    if n_settled > 0:
+        fig_live.add_trace(go.Scatter(
+            x=merged_live["settlement_datetime"], y=merged_live["ssp_actual"],
+            name="Actual SSP", line=dict(color="#1f77b4", width=2.5),
+            hovertemplate="SP %{customdata}<br>Actual £%{y:.2f}/MWh<extra></extra>",
+            customdata=merged_live["settlement_period"],
+        ))
+    else:
+        st.caption(
+            "No actuals yet for today — Elexon publishes initial settlement prices "
+            "after each period. Click **↻ Fetch now** or check back later."
+        )
+
+    # Vertical "Now" line
+    fig_live.add_vline(
+        x=now_dt.isoformat(), line_dash="solid", line_color="grey", line_width=1.5,
+        annotation_text=f"Now · SP {current_sp}", annotation_position="top right",
+    )
+
+    fig_live.update_layout(
+        xaxis_title="Settlement Period", yaxis_title="£/MWh",
+        height=360, margin=dict(t=30, b=40), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_live, use_container_width=True)
+
+
+live_comparison_panel()
+
+st.divider()
+
 # ── Live Forecast Verification ────────────────────────────────────────────────
 st.subheader("Live Forecast Verification")
 st.caption(
