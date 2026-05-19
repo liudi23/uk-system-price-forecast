@@ -249,10 +249,19 @@ def live_comparison_panel():
             "after each period. Click **↻ Fetch now** or check back later."
         )
 
-    # Vertical "Now" line
-    fig_live.add_vline(
-        x=now_dt.isoformat(), line_dash="solid", line_color="grey", line_width=1.5,
-        annotation_text=f"Now · SP {current_sp}", annotation_position="top right",
+    # Vertical "Now" line — use add_shape to avoid Plotly type-mixing bug
+    # with add_vline annotation positioning on datetime axes
+    x_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    fig_live.add_shape(
+        type="line",
+        x0=x_str, x1=x_str, y0=0, y1=1, yref="paper",
+        line=dict(color="grey", width=1.5, dash="solid"),
+    )
+    fig_live.add_annotation(
+        x=x_str, yref="paper", y=0.98,
+        text=f"Now · SP {current_sp}",
+        showarrow=False, font=dict(color="grey", size=11),
+        xanchor="right",
     )
 
     fig_live.update_layout(
