@@ -781,9 +781,9 @@ if _pred_path.exists():
 
     with col_err:
         fig_err = px.histogram(
-            pred, x="error", nbins=40,
+            pred, x="_err", nbins=40,
             color_discrete_sequence=["#ff7f0e"],
-            labels={"error": "Forecast Error (£/MWh)", "count": "Periods"},
+            labels={"_err": "Forecast Error (£/MWh)", "count": "Periods"},
         )
         fig_err.add_vline(x=0, line_dash="dash", line_color="black")
         fig_err.update_layout(
