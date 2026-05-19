@@ -114,8 +114,8 @@ st.info(
     "**Phase 3 model — Level-Shape Decomposition (no recursive error propagation)** · "
     "Stage 1: daily level HGBR (P10/P50/P90) · Stage 2: intra-day shape HGBR · "
     "All features lag ≥ 48 SPs — zero leakage · "
-    "**Honest day-ahead MAE (P50): £25.4/MWh** · "
-    "Level MAE: £15.5/MWh/day · Shape corr: 0.35 · Peak timing: ±3.9 SPs"
+    "**Honest day-ahead MAE (P50): £27.4/MWh** · "
+    "Level MAE: £15.8/MWh/day · Shape corr: 0.33 · Peak timing: ±4.4 SPs · Wind/gas exogenous inputs"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
@@ -726,8 +726,8 @@ if _pred_path.exists():
                    help="Mean Pearson r between predicted and actual intra-day profiles per day")
         dc2.metric("Peak timing error", f"{float(pd.Series(peak_gaps).mean()):.1f} SPs",
                    help="Mean absolute SP offset between predicted and actual daily peak")
-        dc3.metric("Phase 3 vs Phase 2", "£25.4 vs £25.4/MWh (parity)",
-                   help="Both use honest evaluation on same test week; Phase 3 adds interpretability")
+        dc3.metric("Phase 3 vs Phase 2", "£27.4 vs £25.4/MWh",
+                   help="Phase 3 adds wind/gas exogenous features; SP-level MAE slightly higher on this 7-day test window")
 
     # ── Time series: actual vs predicted with quantile band ───────────────────
     fig_pred = go.Figure()

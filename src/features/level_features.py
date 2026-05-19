@@ -34,6 +34,8 @@ _CONTEMPORANEOUS = {
     "niv_daily_mean",
     "niv_daily_std",
     "is_spike_count",
+    "wind_pct_daily_mean",   # contemporaneous — not available day-ahead
+    "gas_pct_daily_mean",    # contemporaneous — not available day-ahead
     "date",
 }
 
@@ -69,6 +71,11 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "is_spike_count":      ("is_spike", "sum"),
         "_n_sp":               ("ssp_raw",  "count"),
     }
+    # Generation mix: wind and gas % — low wind → high gas → high prices
+    if "wind_pct" in df.columns:
+        agg["wind_pct_daily_mean"] = ("wind_pct", "mean")
+    if "gas_pct" in df.columns:
+        agg["gas_pct_daily_mean"]  = ("gas_pct",  "mean")
     _weather_vars = []
     for raw_col, clean in [
         ("_raw_temp_c",    "temp_c"),
@@ -152,6 +159,15 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
             daily[f"{var}_daily_mean_lag7d"] = daily[col_mean].shift(7)
         if col_max in daily.columns:
             daily[f"{var}_daily_max_lag1d"]  = daily[col_max].shift(1)
+
+    # ── Generation mix lag features (leakage-free: shift ≥ 1 day) ────────
+    for col in ["wind_pct_daily_mean", "gas_pct_daily_mean"]:
+        if col in daily.columns:
+            prefix = col.replace("_daily_mean", "")
+            daily[f"{col}_lag1d"] = daily[col].shift(1)
+            daily[f"{col}_lag7d"] = daily[col].shift(7)
+            roll = daily[col].shift(1).rolling(window=7, min_periods=3)
+            daily[f"{prefix}_daily_roll_mean_7d"] = roll.mean()
 
     return daily
 

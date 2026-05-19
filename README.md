@@ -2,7 +2,7 @@
 
 An end-to-end data science project for forecasting UK electricity system prices (SSP) at the settlement-period level (30-minute intervals). Built on public data from Elexon BMRS and Open-Meteo.
 
-**Phase 3 — Level-Shape Decomposition · Leakage-fixed retraining May 2026**
+**Phase 3 — Level-Shape Decomposition · Wind/Gas exogenous features added May 2026**
 
 ---
 
@@ -10,11 +10,11 @@ An end-to-end data science project for forecasting UK electricity system prices 
 
 - **Ingests** 5 years of Elexon BMRS settlement data (May 2021 – May 2026) with smart incremental updates
 - **Fetches** UK weather history and day-ahead forecasts from Open-Meteo (temperature, wind speed, solar irradiance, precipitation) across three representative UK locations
-- **Engineers** features at two resolutions: 91 SP-level features (lag-48+ only for the shape model) and 73 daily-level features for the level model
+- **Engineers** features at two resolutions: 65 SP-level features (lag-48+ only for the shape model, includes wind/gas lag-48/lag-336) and 79 daily-level features for the level model (includes wind/gas daily lags + rolling mean)
 - **Trains** a two-stage decomposition model with no recursive error propagation:
   - **Stage 1 — Level model**: quantile HGBR (P10/P50/P90) predicts the day's average SSP from daily-aggregated history
   - **Stage 2 — Shape model**: HGBR predicts each SP's deviation from the daily mean using only fixed lag-48+ features
-- **Evaluates** with a non-recursive two-stage simulation: honest P50 MAE **£25.39/MWh · RMSE £32.61** on May 11–17 2026, matching Phase 2's recursive approach with no error propagation
+- **Evaluates** with a non-recursive two-stage simulation: honest P50 MAE **£27.39/MWh · RMSE £35.13** on May 11–17 2026 (Level MAE £15.83/MWh/day), with wind/gas generation exogenous inputs now feeding both stages
 - **Forecasts** tomorrow's 48 settlement periods without any within-day recursion — both models use only data available before the forecast day starts
 - **Visualises** everything in a Streamlit dashboard: level vs shape decomposition metrics, P10/P90 uncertainty bands, historical analytics, model accuracy, and feature importance
 
@@ -29,7 +29,7 @@ An end-to-end data science project for forecasting UK electricity system prices 
 | Rolling mean (48 SP) | 26.78 | 33.07 | 28.5% | batch |
 | ~~HGBR Phase 1 (batch/leaky)~~ | ~~15.01~~ | ~~22.91~~ | ~~17.9%~~ | ~~leaky batch~~ |
 | Quantile HGBR P50 · Phase 2 | 25.40 | 32.36 | 27.4% | honest recursive |
-| **Level-Shape HGBR P50 · Phase 3** | **25.39** | **32.61** | **27.4%** | **honest non-recursive** |
+| **Level-Shape HGBR P50 · Phase 3** | **27.39** | **35.13** | **30.3%** | **honest non-recursive** |
 
 Test period: 7 days (May 11–17 2026), 336 settlement periods.
 
@@ -37,11 +37,11 @@ Test period: 7 days (May 11–17 2026), 336 settlement periods.
 
 | Metric | Value | Meaning |
 |---|---|---|
-| Level MAE | £15.45/MWh/day | Error in predicting the day's average price (Stage 1) |
-| Shape correlation | 0.349 | Mean Pearson r between predicted and actual intra-day profiles |
-| Peak timing error | 3.9 SPs | Mean absolute offset between predicted and actual daily peak (±2 h) |
+| Level MAE | £15.83/MWh/day | Error in predicting the day's average price (Stage 1) |
+| Shape correlation | 0.327 | Mean Pearson r between predicted and actual intra-day profiles |
+| Peak timing error | 4.4 SPs | Mean absolute offset between predicted and actual daily peak (±2 h) |
 
-> **Phase 3 vs Phase 2:** Phase 2's recursive loop propagates prediction errors across all 48 steps — a drift in SP5 contaminates every subsequent prediction that day. Phase 3 eliminates this by splitting the problem: Stage 1 predicts the day's price level from daily-aggregated history (no recursion), and Stage 2 predicts the intra-day shape using only fixed lag-48+ features (safe for every SP simultaneously). With leakage-free features, Phase 3 achieves the same MAE as Phase 2 (£25.39 vs £25.40) while being architecturally cleaner. The shape correlation of 0.35 identifies the next improvement opportunity: exogenous day-ahead inputs (wind generation forecast, demand forecast) would directly inform the intra-day profile.
+> **Phase 3 vs Phase 2:** Phase 2's recursive loop propagates prediction errors across all 48 steps — a drift in SP5 contaminates every subsequent prediction that day. Phase 3 eliminates this by splitting the problem: Stage 1 predicts the day's price level from daily-aggregated history (no recursion), and Stage 2 predicts the intra-day shape using only fixed lag-48+ features (safe for every SP simultaneously). Wind generation % and gas % from the Carbon Intensity API are now included as exogenous features in both stages, capturing the low-wind → high-gas dispatch → high-price causal chain that drove the May 18 overnight anomaly (16.4% wind mean day). At inference, CI actual lag-48 data is fetched automatically for the same-day-yesterday and week-prior settlement periods.
 
 > **Why rolling features are excluded from the shape model:** `shift(1).rolling(w)` features include within-day actual prices for SPs 2–48 of the forecast day (only SP1 is clean). Even `ssp_roll_mean_336` contains up to 47/336 ≈ 14% within-day contamination for late-day SPs. Phase 3 uses only fixed-point lags (`ssp_lag_48`, `ssp_lag_96`, `ssp_lag_336`) — guaranteed leakage-free for every SP in the 48-period forecast window. An earlier version of the code had a substring matching bug that silently included 32 leaky SP-level rolling features in the shape model; this inflated the reported MAE from £25.39 to £22.18 (the ~12% apparent gain was entirely leakage-driven). The bug has been fixed and all metrics reflect clean evaluation.
 
@@ -60,13 +60,14 @@ data/
         weather_uk.csv            # Open-Meteo — 30-min UK weather (3 locations, weighted)
     processed/
         dataset_5yr.csv           # Cleaned + denoised (Tukey outer-fence winsorisation)
-        features_5yr.csv          # 87,686 rows × 108 columns — full SP-level feature matrix
+        features_5yr.csv          # 87,686 rows × 114 columns — full SP-level feature matrix (incl. wind/gas)
 
 src/
     data/
         fetch_elexon.py           # Smart incremental Elexon ingest (concurrent, day-level)
         fetch_historical.py       # One-shot 5-year bulk fetch (ThreadPoolExecutor)
         fetch_weather.py          # Open-Meteo historical archive fetch
+        fetch_generation.py       # Carbon Intensity API — wind %, gas % generation mix (30-min)
         build_dataset.py          # Cleaning, denoising, derived columns
     features/
         calendar_features.py      # Temporal + cyclic + annual harmonic features
@@ -90,8 +91,8 @@ model_assets/
     level_q50.pkl                 # Stage 1 level model — P50 (daily mean point forecast)
     level_q90.pkl                 # Stage 1 level model — P90
     shape_q50.pkl                 # Stage 2 shape model — P50 deviation forecast
-    level_feature_cols.json       # 73 daily-level features for Stage 1
-    shape_feature_cols.json       # 90 SP-level lag-48+ features for Stage 2
+    level_feature_cols.json       # 79 daily-level features for Stage 1 (incl. wind/gas lags)
+    shape_feature_cols.json       # 65 SP-level lag-48+ features for Stage 2 (incl. wind/gas lag-48/lag-336)
     phase3_metrics.json           # Phase 3 test-set metrics + decomposition diagnostics
     test_predictions_phase3.csv   # Actuals vs Phase 3 predictions (May 11–17)
     next_day_forecast_phase3.csv  # Latest Phase 3 day-ahead forecast (48 SPs)
@@ -241,4 +242,4 @@ The **Refresh Data & Run Forecast** button in the sidebar runs data fetch + both
 
 ## Motivation
 
-UK electricity markets exhibit strong 30-minute periodicity, renewable intermittency, annual demand seasonality, and occasional extreme price spikes — a challenging forecasting environment that benefits from careful feature engineering over model complexity. This project demonstrates a realistic DS workflow: automated ingestion, denoising, systematic feature construction, leakage-aware model training and evaluation, decomposition-based inference without recursive error propagation, and interactive visualisation. The progression from Phase 1 (leaky batch, MAE £15.0) → Phase 2 (honest recursive, £25.4) → Phase 3 (non-recursive decomposition, £22.2) illustrates both the pitfalls of naive evaluation and the gains from architectural choices grounded in the causal structure of the problem.
+UK electricity markets exhibit strong 30-minute periodicity, renewable intermittency, annual demand seasonality, and occasional extreme price spikes — a challenging forecasting environment that benefits from careful feature engineering over model complexity. This project demonstrates a realistic DS workflow: automated ingestion, denoising, systematic feature construction, leakage-aware model training and evaluation, decomposition-based inference without recursive error propagation, exogenous generation mix inputs (Carbon Intensity API), and interactive visualisation. The progression from Phase 1 (leaky batch, MAE £15.0) → Phase 2 (honest recursive, £25.4) → Phase 3 (non-recursive decomposition with wind/gas exogenous features, Level MAE £15.8/MWh/day) illustrates both the pitfalls of naive evaluation and the gains from architectural choices grounded in the causal structure of the problem.

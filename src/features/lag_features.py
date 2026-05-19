@@ -121,3 +121,22 @@ def add_lag_features(
             df[f"abs_niv_roll_mean_{w}"] = abs_niv.mean()
 
     return df
+
+
+def add_generation_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Append wind_pct and gas_pct lag features (lag-48 and lag-336 only).
+
+    Wind % in the generation mix is a key marginal-cost signal: high wind
+    displaces gas plant, suppressing prices; low wind forces high-cost gas
+    peakers online, pushing prices up.  Gas % directly proxies marginal cost.
+
+    Only lag-48+ lags are added — leakage-free for the shape model.
+    """
+    df = df.copy()
+    for col in ["wind_pct", "gas_pct"]:
+        if col not in df.columns:
+            continue
+        for lag in [48, 336]:
+            df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    return df

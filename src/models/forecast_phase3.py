@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import logging
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -34,6 +35,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+from fetch_generation import fetch_range as _fetch_ci_range
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -229,6 +233,15 @@ def build_level_features(daily_hist: pd.DataFrame, target_date: date,
         feat["solar_wm2_daily_mean_lag7d"] = float(h["solar_wm2_daily_mean"].values[-7]) if len(h) >= 7 else float(h["solar_wm2_daily_mean"].values[0])
         feat["solar_wm2_daily_max_lag1d"]  = float(h["solar_wm2_daily_max"].values[-1]) if "solar_wm2_daily_max" in h.columns else feat["solar_wm2_daily_mean_lag1d"]
 
+    # Generation mix lag features (wind %, gas %) — low wind → high gas → high prices
+    for _gcol, _prefix in [("wind_pct_daily_mean", "wind_pct"), ("gas_pct_daily_mean", "gas_pct")]:
+        if _gcol in h.columns and h[_gcol].notna().any():
+            _vals = h[_gcol].values
+            feat[f"{_gcol}_lag1d"] = float(_vals[-1]) if not np.isnan(_vals[-1]) else 0.0
+            feat[f"{_gcol}_lag7d"] = (float(_vals[-7]) if len(_vals) >= 7 and not np.isnan(_vals[-7]) else feat[f"{_gcol}_lag1d"])
+            _w7 = _vals[-7:][~np.isnan(_vals[-7:])]
+            feat[f"{_prefix}_daily_roll_mean_7d"] = float(_w7.mean()) if len(_w7) > 0 else 0.0
+
     return feat
 
 
@@ -239,7 +252,8 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
                     is_spike_hist: np.ndarray, niv_hist: np.ndarray,
                     weather_hist: dict,
                     daily_mean_lag1d: float, daily_mean_lag7d: float,
-                    daily_stats: dict = None) -> dict:
+                    daily_stats: dict = None,
+                    gen_hist: dict = None) -> dict:
     """
     Build shape feature vector for one SP (h_idx = 0-based index within
     the forecast day, so lag_48 references the same SP of yesterday).
@@ -293,6 +307,13 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
     if daily_stats:
         row.update(daily_stats)
 
+    # ── Generation mix lag features (lag-48 and lag-336) ─────────────────
+    if gen_hist:
+        for _gvar in ["wind_pct", "gas_pct"]:
+            _garr = gen_hist.get(_gvar, np.zeros(HIST))
+            row[f"{_gvar}_lag_48"]  = float(_garr[HIST - 48  + h_idx])
+            row[f"{_gvar}_lag_336"] = float(_garr[HIST - 336 + h_idx]) if HIST >= 336 else 0.0
+
     return row
 
 
@@ -338,6 +359,32 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     sp_all = pd.concat([base, extra], ignore_index=True).sort_values("settlement_datetime")
     combined_last_dt = sp_all["settlement_datetime"].max()
 
+    # ── Fetch recent CI generation mix for extra rows not in features_5yr ──
+    if "wind_pct" not in sp_all.columns or sp_all["wind_pct"].isna().any():
+        _ci_start = (combined_last_dt - pd.Timedelta(days=9)).date()
+        _ci_end   = combined_last_dt.date()
+        if _ci_start <= _ci_end:
+            log.info("Fetching Carbon Intensity generation mix %s → %s …", _ci_start, _ci_end)
+            try:
+                _ci = _fetch_ci_range(_ci_start, _ci_end, delay=0.2)
+                if not _ci.empty:
+                    _ci["settlement_datetime"] = (
+                        pd.to_datetime(_ci["settlement_date"]) +
+                        pd.to_timedelta((_ci["settlement_period"] - 1) * 30, unit="min")
+                    )
+                    _ci_merge = _ci[["settlement_datetime", "wind_pct", "gas_pct"]].rename(
+                        columns={"wind_pct": "_ci_wind", "gas_pct": "_ci_gas"})
+                    for _col in ["wind_pct", "gas_pct"]:
+                        if _col not in sp_all.columns:
+                            sp_all[_col] = np.nan
+                    sp_all = sp_all.merge(_ci_merge, on="settlement_datetime", how="left")
+                    sp_all["wind_pct"] = sp_all["wind_pct"].fillna(sp_all.pop("_ci_wind"))
+                    sp_all["gas_pct"]  = sp_all["gas_pct"].fillna(sp_all.pop("_ci_gas"))
+                    log.info("  wind_pct coverage after CI fill: %.1f%%",
+                             sp_all["wind_pct"].notna().mean() * 100)
+            except Exception as _e:
+                log.warning("CI fetch failed: %s — wind/gas features will be missing", _e)
+
     if target_date is None:
         target_date = (combined_last_dt + pd.Timedelta(minutes=30)).date()
     log.info("Forecasting %s (history ends %s)", target_date, combined_last_dt.date())
@@ -365,6 +412,9 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         if wc in sp_all.columns:
             agg_spec[f"{wn}_daily_mean"] = (wc, "mean")
             agg_spec[f"{wn}_daily_max"]  = (wc, "max")
+    for _gv in ["wind_pct", "gas_pct"]:
+        if _gv in sp_all.columns:
+            agg_spec[f"{_gv}_daily_mean"] = (_gv, "mean")
 
     daily_hist = (
         sp_all[sp_all["_date"] < target_date]
@@ -427,6 +477,10 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         "solar_wm2": _weather_arr("_raw_solar_wm2"),
         "precip_mm": _weather_arr("_raw_precip_mm"),
     }
+    gen_hist = {
+        "wind_pct": _weather_arr("wind_pct"),
+        "gas_pct":  _weather_arr("gas_pct"),
+    }
 
     n_hist = len(sp_hist)
     if n_hist < 336:
@@ -447,6 +501,7 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
             daily_mean_lag1d=daily_mean_lag1d,
             daily_mean_lag7d=daily_mean_lag7d,
             daily_stats=daily_stats,
+            gen_hist=gen_hist,
         )
         shape_rows.append(row)
 

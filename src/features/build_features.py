@@ -21,9 +21,13 @@ from pathlib import Path
 
 import pandas as pd
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+
 from calendar_features import add_calendar_features
-from lag_features import add_lag_features
+from lag_features import add_lag_features, add_generation_lag_features
 from weather_features import WEATHER_FILE, add_weather_features, load_weather, merge_weather
+from fetch_generation import OUTPUT_FILE as GENERATION_FILE, load_generation
 
 IN_FILE  = Path(__file__).resolve().parents[2] / "data" / "processed" / "dataset.csv"
 OUT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features.csv"
@@ -43,6 +47,25 @@ def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> p
 
     log.info("Adding lag and rolling features…")
     df = add_lag_features(df)
+
+    if GENERATION_FILE.exists():
+        log.info("Merging generation mix (wind %%, gas %%) from %s…", GENERATION_FILE)
+        gen = load_generation(GENERATION_FILE)
+        gen["settlement_date"] = gen["settlement_date"].astype(str)
+        df["_sdate_str"] = df["settlement_date"].astype(str).str[:10]
+        df = df.merge(
+            gen[["settlement_date", "settlement_period", "wind_pct", "gas_pct"]],
+            left_on=["_sdate_str", "settlement_period"],
+            right_on=["settlement_date", "settlement_period"],
+            how="left",
+            suffixes=("", "_gen"),
+        ).drop(columns=["_sdate_str", "settlement_date_gen"], errors="ignore")
+        df = add_generation_lag_features(df)
+        log.info("  wind_pct coverage: %.1f%%",
+                 df["wind_pct"].notna().mean() * 100)
+    else:
+        log.warning("generation_mix.csv not found — skipping wind/gas features. "
+                    "Run src/data/fetch_generation.py to generate it.")
 
     if use_weather and WEATHER_FILE.exists():
         log.info("Adding weather features from %s…", WEATHER_FILE)
