@@ -30,9 +30,10 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ASSETS_DIR = Path(__file__).resolve().parents[2] / "model_assets"
-FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
-OUTPUT_FILE = ASSETS_DIR / "next_day_forecast.csv"
+ASSETS_DIR        = Path(__file__).resolve().parents[2] / "model_assets"
+FEATURES_FILE     = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
+RAW_PRICES_FILE   = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
+OUTPUT_FILE       = ASSETS_DIR / "next_day_forecast.csv"
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 UK_LOCATIONS = [
@@ -69,9 +70,15 @@ def _fetch_location_forecast(lat, lon, start, end):
     return df
 
 
-def fetch_forecast_weather(target_date: date) -> pd.DataFrame:
-    """Fetch 30-min UK weather forecast ending on target_date."""
-    start = str(target_date - timedelta(days=1))
+def fetch_forecast_weather(target_date: date, start_date: date = None) -> pd.DataFrame:
+    """Fetch 30-min UK weather from Open-Meteo forecast API.
+
+    start_date defaults to target_date - 1. Pass an earlier date to cover
+    recent history gaps (e.g. when features_5yr.csv is a few days stale).
+    """
+    if start_date is None:
+        start_date = target_date - timedelta(days=1)
+    start = str(start_date)
     end = str(target_date)
     frames = []
     for loc in UK_LOCATIONS:
@@ -144,31 +151,76 @@ def run_forecast(target_date: date = None, features_file: Path = FEATURES_FILE) 
     with open(ASSETS_DIR / "feature_cols.json") as f:
         feature_cols = json.load(f)
 
+    # ── Load base history from features file ──────────────────────────────────
     log.info("Loading feature history from %s", features_file)
-    hist_full = pd.read_csv(features_file, parse_dates=["settlement_datetime"])
-    hist_full = hist_full.sort_values("settlement_datetime").reset_index(drop=True)
+    base_hist = pd.read_csv(features_file, parse_dates=["settlement_datetime"])
+    base_hist = base_hist.sort_values("settlement_datetime").reset_index(drop=True)
+    features_last_dt = base_hist["settlement_datetime"].max()
 
-    last_dt = hist_full["settlement_datetime"].iloc[-1]
+    # ── Extend with newer rows from system_prices.csv if available ────────────
+    extra = pd.DataFrame()
+    if RAW_PRICES_FILE.exists():
+        raw = pd.read_csv(RAW_PRICES_FILE, parse_dates=["settlement_date"])
+        raw["settlement_datetime"] = (
+            raw["settlement_date"]
+            + pd.to_timedelta((raw["settlement_period"] - 1) * 30, unit="min")
+        )
+        extra = raw[raw["settlement_datetime"] > features_last_dt].sort_values(
+            "settlement_datetime"
+        )
+        if not extra.empty:
+            log.info(
+                "Extending history with %d rows from system_prices.csv (%s → %s)",
+                len(extra),
+                extra["settlement_datetime"].min().date(),
+                extra["settlement_datetime"].max().date(),
+            )
+
+    combined_last_dt = extra["settlement_datetime"].max() if not extra.empty else features_last_dt
     if target_date is None:
-        target_date = (last_dt + pd.Timedelta(minutes=30)).date()
-    log.info("Forecasting %s (48 periods after %s)", target_date, last_dt)
+        target_date = (combined_last_dt + pd.Timedelta(minutes=30)).date()
+    log.info("Forecasting %s (history ends %s)", target_date, combined_last_dt)
 
-    hist = hist_full.tail(HISTORY_ROWS).reset_index(drop=True)
+    # ── Fetch weather covering any gap + target date ──────────────────────────
+    # The Open-Meteo forecast API supports ~7 days of recent history, which is
+    # enough to fill any gap between features_5yr.csv and today.
+    weather_start = (features_last_dt + pd.Timedelta(minutes=30)).date()
+    log.info("Fetching Open-Meteo forecast/recent weather %s → %s…", weather_start, target_date)
+    weather_df = fetch_forecast_weather(target_date, start_date=weather_start)
+
+    # ── Fill weather into extended rows ───────────────────────────────────────
+    if not extra.empty:
+        w_idx = weather_df.set_index("datetime_utc")
+        extra = extra.copy()
+        merge_key = extra["settlement_datetime"].dt.floor("30min")
+        for col, raw_col in [
+            ("temp_c",    "_raw_temp_c"),
+            ("wind_ms",   "_raw_wind_ms"),
+            ("solar_wm2", "_raw_solar_wm2"),
+            ("precip_mm", "_raw_precip_mm"),
+        ]:
+            mapped = merge_key.map(w_idx[col])
+            extra[raw_col] = mapped.ffill().bfill()
+
+    # ── Build combined history tail ───────────────────────────────────────────
+    hist = (
+        pd.concat([base_hist, extra], ignore_index=True)
+        .sort_values("settlement_datetime")
+        .tail(HISTORY_ROWS)
+        .reset_index(drop=True)
+    )
 
     # ── History buffers ───────────────────────────────────────────────────────
-    ssp_buf    = list(hist["ssp"].values)                         # grows during loop
-    niv_actual = hist["net_imbalance_volume"].values
-    # Proxy today's NIV with yesterday's same settlement period
+    ssp_buf     = list(hist["ssp"].values)
+    niv_actual  = hist["net_imbalance_volume"].values
     niv_virtual = np.concatenate([niv_actual, niv_actual[-48:]])
 
-    temp_hist  = hist["_raw_temp_c"].values
-    wind_hist  = hist["_raw_wind_ms"].values
-    solar_hist = hist["_raw_solar_wm2"].values
+    temp_hist   = hist["_raw_temp_c"].values
+    wind_hist   = hist["_raw_wind_ms"].values
+    solar_hist  = hist["_raw_solar_wm2"].values
     precip_hist = hist["_raw_precip_mm"].values
 
-    # ── Weather forecast ──────────────────────────────────────────────────────
-    log.info("Fetching Open-Meteo forecast for %s…", target_date)
-    weather_df = fetch_forecast_weather(target_date)
+    # ── Weather for the forecast date ─────────────────────────────────────────
     fw = _extract_day_weather(weather_df, target_date)
 
     temp_virt  = np.concatenate([temp_hist,  fw["temp_c"]])
