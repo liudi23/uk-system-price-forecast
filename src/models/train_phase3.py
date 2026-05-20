@@ -121,9 +121,13 @@ def load_sp_data(path: Path) -> pd.DataFrame:
     """Load and clean the SP-level feature matrix."""
     df = pd.read_csv(path, parse_dates=["settlement_datetime"])
     df = df.sort_values("settlement_datetime").reset_index(drop=True)
-    # Drop rows with NaN in any lag/rolling feature (warm-up period)
-    lag_cols = [c for c in df.columns if "_lag_" in c or "_roll_" in c or "_diff_" in c]
-    return df[df[lag_cols].notna().all(axis=1)].reset_index(drop=True)
+    # Drop rows where CORE lag features (ssp/niv) are NaN (warm-up period).
+    # Wind/gas lag features are optional — HGBR handles missing values natively,
+    # so we do not drop rows just because generation data has gaps.
+    core_lag_cols = [c for c in df.columns
+                     if ("_lag_" in c or "_roll_" in c or "_diff_" in c)
+                     and not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+    return df[df[core_lag_cols].notna().all(axis=1)].reset_index(drop=True)
 
 
 def split_dates(df: pd.DataFrame, test_days: int, val_days: int):
@@ -144,9 +148,11 @@ def split_daily(daily: pd.DataFrame, test_days: int, val_days: int):
     d_max    = daily["date"].max()
     test_cut = d_max - pd.Timedelta(days=test_days)
     val_cut  = test_cut - pd.Timedelta(days=val_days)
-    # Drop rows with NaN lag features (daily warm-up)
+    # Drop rows with NaN in core daily features (lag warm-up); wind/gas optional
     feat_cols = get_level_feature_cols(daily)
-    daily_clean = daily[daily[feat_cols].notna().all(axis=1)].reset_index(drop=True)
+    core_feat = [c for c in feat_cols
+                 if not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+    daily_clean = daily[daily[core_feat].notna().all(axis=1)].reset_index(drop=True)
     train = daily_clean[daily_clean["date"] <= val_cut]
     val   = daily_clean[(daily_clean["date"] > val_cut) & (daily_clean["date"] <= test_cut)]
     test  = daily_clean[daily_clean["date"] > test_cut]
@@ -379,20 +385,138 @@ def decomposition_metrics(pred_df: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Walk-forward cross-validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Four seasonal 30-day test windows covering summer / autumn / winter / spring
+WALK_FOLDS = [
+    ("2025-07-01", "2025-07-30", "summer-2025"),
+    ("2025-10-01", "2025-10-30", "autumn-2025"),
+    ("2025-12-01", "2025-12-30", "winter-2025"),   # Jan 2026 has CI API gap
+    ("2026-04-01", "2026-04-30", "spring-2026"),
+]
+
+
+def _split_at(sp_df, daily_df, fold_start, val_days):
+    """Return (sp_train, sp_val, daily_train, daily_val) for data before fold_start."""
+    cutoff = fold_start - pd.Timedelta(days=1)
+    val_cut = cutoff - pd.Timedelta(days=val_days)
+    sp_train = sp_df[sp_df["settlement_datetime"] <= val_cut]
+    sp_val   = sp_df[(sp_df["settlement_datetime"] > val_cut) &
+                     (sp_df["settlement_datetime"] <= cutoff)]
+
+    feat_cols = get_level_feature_cols(daily_df)
+    core_feat = [c for c in feat_cols
+                 if not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+    daily_clean = daily_df[daily_df[core_feat].notna().all(axis=1)].reset_index(drop=True)
+    d_train = daily_clean[daily_clean["date"] <= val_cut]
+    d_val   = daily_clean[(daily_clean["date"] > val_cut) & (daily_clean["date"] <= cutoff)]
+    return sp_train, sp_val, d_train, d_val
+
+
+def walk_forward_eval(sp_df: pd.DataFrame, daily_df: pd.DataFrame,
+                      val_days: int = VAL_DAYS) -> pd.DataFrame:
+    """
+    Walk-forward cross-validation across seasonal folds.
+
+    For each fold the model is re-trained on all data strictly before the
+    fold's start date (minus val_days for early-stopping), then evaluated on
+    the 30-day fold window.  Production models are NOT overwritten.
+    """
+    shape_sp_full = build_shape_data(sp_df, daily_df)
+    shape_feat_cols = get_shape_feature_cols(build_shape_data(sp_df, daily_df))
+    level_feat_cols = get_level_feature_cols(daily_df)
+
+    all_fold_preds = []
+
+    for fold_start_str, fold_end_str, label in WALK_FOLDS:
+        fold_start = pd.Timestamp(fold_start_str)
+        fold_end   = pd.Timestamp(fold_end_str)
+
+        # Skip folds whose end is beyond the available data
+        if fold_end > sp_df["settlement_datetime"].max():
+            log.info("Skipping fold %s — data ends before %s", label, fold_end_str)
+            continue
+
+        log.info("── Fold %s  (%s → %s) ──", label, fold_start_str, fold_end_str)
+
+        sp_train, sp_val, d_train, d_val = _split_at(sp_df, daily_df, fold_start, val_days)
+        log.info("  Train: %d rows  Val: %d rows", len(sp_train), len(sp_val))
+
+        shape_train = build_shape_data(sp_train, daily_df)
+        shape_val   = build_shape_data(sp_val,   daily_df)
+
+        level_models = train_level_models(d_train, d_val, level_feat_cols)
+        shape_model  = train_shape_model(shape_train, shape_val, shape_feat_cols)
+
+        # Test slice
+        d_test  = daily_df[(daily_df["date"] >= fold_start) & (daily_df["date"] <= fold_end)]
+        sp_test = sp_df[(sp_df["settlement_datetime"] >= fold_start) &
+                        (sp_df["settlement_datetime"] <= fold_end + pd.Timedelta(hours=23, minutes=30))]
+        sh_test = shape_sp_full[(shape_sp_full["settlement_datetime"] >= fold_start) &
+                                (shape_sp_full["settlement_datetime"] <= fold_end + pd.Timedelta(hours=23, minutes=30))]
+
+        pred = evaluate_phase3(level_models, shape_model,
+                               d_test, sp_test, sh_test,
+                               level_feat_cols, shape_feat_cols)
+        pred["fold"] = label
+        all_fold_preds.append(pred)
+
+        m = metrics(pred["ssp_actual"].values, pred["ssp_predicted"].values)
+        dc = decomposition_metrics(pred)
+        log.info("  MAE=£%.2f  sMAPE=%.1f%%  LevelMAE=£%.2f  ShapeCorr=%.3f  PeakTiming=%.1f SPs",
+                 m["MAE"], m["sMAPE"], dc["level_mae"], dc["shape_corr_mean"], dc["peak_timing_mae"])
+
+    if not all_fold_preds:
+        log.warning("No folds completed — check data date range")
+        return pd.DataFrame()
+
+    combined = pd.concat(all_fold_preds, ignore_index=True)
+    return combined
+
+
+def _print_walk_forward_report(combined: pd.DataFrame) -> None:
+    """Print per-fold and aggregate walk-forward metrics."""
+    print("\n" + "─" * 68)
+    print(f"  Walk-forward cross-validation — {combined['fold'].nunique()} seasonal folds")
+    print("─" * 68)
+    print(f"  {'Fold':<16} {'Days':>4}  {'MAE':>8}  {'sMAPE':>7}  {'LvlMAE':>8}  {'ShapeR':>7}")
+    print("─" * 68)
+    for fold_label in combined["fold"].unique():
+        f = combined[combined["fold"] == fold_label]
+        m  = metrics(f["ssp_actual"].values, f["ssp_predicted"].values)
+        dc = decomposition_metrics(f)
+        n_days = f["settlement_date"].nunique()
+        print(f"  {fold_label:<16} {n_days:>4}  £{m['MAE']:>7.2f}  {m['sMAPE']:>6.1f}%"
+              f"  £{dc['level_mae']:>7.2f}  {dc['shape_corr_mean']:>7.3f}")
+
+    print("─" * 68)
+    m_all  = metrics(combined["ssp_actual"].values, combined["ssp_predicted"].values)
+    dc_all = decomposition_metrics(combined)
+    n_days_all = combined["settlement_date"].nunique()
+    print(f"  {'AGGREGATE':<16} {n_days_all:>4}  £{m_all['MAE']:>7.2f}  {m_all['sMAPE']:>6.1f}%"
+          f"  £{dc_all['level_mae']:>7.2f}  {dc_all['shape_corr_mean']:>7.3f}")
+    print("─" * 68)
+    print(f"  RMSE (aggregate): £{m_all['RMSE']:.2f}/MWh   n={len(combined)} periods")
+    print("─" * 68)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features",  default=str(FEATURES_FILE))
-    parser.add_argument("--test-days", type=int, default=TEST_DAYS)
-    parser.add_argument("--val-days",  type=int, default=VAL_DAYS)
+    parser.add_argument("--features",     default=str(FEATURES_FILE))
+    parser.add_argument("--test-days",    type=int, default=TEST_DAYS)
+    parser.add_argument("--val-days",     type=int, default=VAL_DAYS)
+    parser.add_argument("--walk-forward", action="store_true",
+                        help="Run seasonal walk-forward CV instead of standard holdout")
     args = parser.parse_args()
 
     # ── Load SP-level data ────────────────────────────────────────────────
     log.info("Loading SP-level features from %s …", args.features)
     sp_df = load_sp_data(Path(args.features))
-    sp_train, sp_val, sp_test = split_dates(sp_df, args.test_days, args.val_days)
 
     # ── Build daily level dataset ─────────────────────────────────────────
     log.info("Building daily level dataset …")
@@ -400,6 +524,19 @@ def main():
     level_feat_cols = get_level_feature_cols(daily_df)
     log.info("Level features: %d", len(level_feat_cols))
 
+    # ── Walk-forward mode: retrain per fold, do not overwrite production models
+    if args.walk_forward:
+        log.info("Running seasonal walk-forward cross-validation …")
+        combined = walk_forward_eval(sp_df, daily_df, val_days=args.val_days)
+        if not combined.empty:
+            _print_walk_forward_report(combined)
+            wf_path = ASSETS_DIR / "walk_forward_predictions.csv"
+            combined.to_csv(wf_path, index=False)
+            log.info("Walk-forward predictions → %s", wf_path)
+        return
+
+    # ── Standard holdout training ─────────────────────────────────────────
+    sp_train, sp_val, sp_test = split_dates(sp_df, args.test_days, args.val_days)
     daily_train, daily_val, daily_test = split_daily(daily_df, args.test_days, args.val_days)
 
     # ── Build shape dataset ───────────────────────────────────────────────
