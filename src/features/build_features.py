@@ -28,6 +28,7 @@ from calendar_features import add_calendar_features
 from lag_features import add_lag_features, add_generation_lag_features
 from weather_features import WEATHER_FILE, add_weather_features, load_weather, merge_weather
 from fetch_generation import OUTPUT_FILE as GENERATION_FILE, load_generation
+from fetch_cpi import OUTPUT_FILE as CPI_FILE, load_cpi
 
 IN_FILE  = Path(__file__).resolve().parents[2] / "data" / "processed" / "dataset.csv"
 OUT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features.csv"
@@ -66,6 +67,31 @@ def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> p
     else:
         log.warning("generation_mix.csv not found — skipping wind/gas features. "
                     "Run src/data/fetch_generation.py to generate it.")
+
+    if CPI_FILE.exists():
+        log.info("Merging UK CPIH inflation data from %s…", CPI_FILE)
+        cpi = load_cpi(CPI_FILE)
+        # Build lookup: year_month → cpi_index and 12-month-ago index for YoY
+        cpi_lookup = dict(zip(cpi["year_month"], cpi["cpi_index"]))
+        cpi_latest = cpi["cpi_index"].iloc[-1]
+        df["_ym"] = df["settlement_date"].astype(str).str[:7]
+        df["cpi_index"]    = df["_ym"].map(cpi_lookup)
+        # Forward-fill for months not yet published (ONS has ~1-month lag)
+        df["cpi_index"]    = df["cpi_index"].ffill()
+        # YoY: index 12 months prior
+        df["_ym_lag12"] = (
+            pd.to_datetime(df["_ym"]) - pd.DateOffset(months=12)
+        ).dt.strftime("%Y-%m")
+        df["_cpi_lag12"] = df["_ym_lag12"].map(cpi_lookup).ffill()
+        df["cpi_yoy"]      = (df["cpi_index"] - df["_cpi_lag12"]) / df["_cpi_lag12"] * 100
+        # deflator = latest CPI / historical CPI (1.0 for current/future months)
+        df["cpi_deflator"] = cpi_latest / df["cpi_index"]
+        df.drop(columns=["_ym", "_ym_lag12", "_cpi_lag12"], inplace=True)
+        log.info("  CPI coverage: %.1f%% (latest index=%.1f, %s)",
+                 df["cpi_index"].notna().mean() * 100, cpi_latest, cpi["year_month"].iloc[-1])
+    else:
+        log.warning("cpi_uk.csv not found — skipping CPI features. "
+                    "Run src/data/fetch_cpi.py to generate it.")
 
     if use_weather and WEATHER_FILE.exists():
         log.info("Adding weather features from %s…", WEATHER_FILE)

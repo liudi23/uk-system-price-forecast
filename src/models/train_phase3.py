@@ -58,8 +58,9 @@ from level_features import LEVEL_TARGET, build_level_dataset, get_level_feature_
 FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
 ASSETS_DIR    = Path(__file__).resolve().parents[2] / "model_assets"
 
-TEST_DAYS = 7
-VAL_DAYS  = 3
+TEST_DAYS   = 2   # yesterday + day before yesterday
+VAL_DAYS    = 3   # 3 days before test
+TRAIN_YEARS = 3   # drop data older than 3 years to reduce inflation drift
 QUANTILES = [0.10, 0.50, 0.90]
 
 # HGBR hyperparameters — same base as Phase 2 for fair comparison
@@ -86,6 +87,8 @@ SHAPE_ALWAYS_EXCLUDE = {
     "settlement_date", "settlement_datetime", "settlement_period",
     "ssp", "ssp_raw", "is_spike",
     "ssp_shape_target",
+    # CPI deflator — used to scale training targets only, not a predictor
+    "cpi_deflator",
     # Contemporaneous values (unknown at forecast time)
     "net_imbalance_volume", "abs_imbalance_volume",
     "price_derivation_code", "price_derivation_code_P",
@@ -124,18 +127,23 @@ def load_sp_data(path: Path) -> pd.DataFrame:
     # Drop rows where CORE lag features (ssp/niv) are NaN (warm-up period).
     # Wind/gas lag features are optional — HGBR handles missing values natively,
     # so we do not drop rows just because generation data has gaps.
+    _optional = {"wind_pct_", "gas_pct_", "cpi_"}
     core_lag_cols = [c for c in df.columns
                      if ("_lag_" in c or "_roll_" in c or "_diff_" in c)
-                     and not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+                     and not any(c.startswith(p) for p in _optional)]
     return df[df[core_lag_cols].notna().all(axis=1)].reset_index(drop=True)
 
 
-def split_dates(df: pd.DataFrame, test_days: int, val_days: int):
-    t_max    = df["settlement_datetime"].max()
-    test_cut = t_max - pd.Timedelta(days=test_days)
-    val_cut  = test_cut - pd.Timedelta(days=val_days)
-    train = df[df["settlement_datetime"] <= val_cut]
-    val   = df[(df["settlement_datetime"] > val_cut) & (df["settlement_datetime"] <= test_cut)]
+def split_dates(df: pd.DataFrame, test_days: int, val_days: int,
+                train_years: int = TRAIN_YEARS):
+    t_max       = df["settlement_datetime"].max()
+    test_cut    = t_max - pd.Timedelta(days=test_days)
+    val_cut     = test_cut - pd.Timedelta(days=val_days)
+    train_start = t_max - pd.Timedelta(days=train_years * 365)
+    train = df[(df["settlement_datetime"] > train_start) &
+               (df["settlement_datetime"] <= val_cut)]
+    val   = df[(df["settlement_datetime"] > val_cut) &
+               (df["settlement_datetime"] <= test_cut)]
     test  = df[df["settlement_datetime"] > test_cut]
     for name, part in [("Train", train), ("Val", val), ("Test", test)]:
         log.info("%s: %d rows  (%s → %s)", name, len(part),
@@ -144,17 +152,22 @@ def split_dates(df: pd.DataFrame, test_days: int, val_days: int):
     return train, val, test
 
 
-def split_daily(daily: pd.DataFrame, test_days: int, val_days: int):
-    d_max    = daily["date"].max()
-    test_cut = d_max - pd.Timedelta(days=test_days)
-    val_cut  = test_cut - pd.Timedelta(days=val_days)
+def split_daily(daily: pd.DataFrame, test_days: int, val_days: int,
+                train_years: int = TRAIN_YEARS):
+    d_max       = daily["date"].max()
+    test_cut    = d_max - pd.Timedelta(days=test_days)
+    val_cut     = test_cut - pd.Timedelta(days=val_days)
+    train_start = d_max - pd.Timedelta(days=train_years * 365)
     # Drop rows with NaN in core daily features (lag warm-up); wind/gas optional
     feat_cols = get_level_feature_cols(daily)
+    _opt = {"wind_pct_", "gas_pct_", "cpi_"}
     core_feat = [c for c in feat_cols
-                 if not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+                 if not any(c.startswith(p) for p in _opt)]
     daily_clean = daily[daily[core_feat].notna().all(axis=1)].reset_index(drop=True)
-    train = daily_clean[daily_clean["date"] <= val_cut]
-    val   = daily_clean[(daily_clean["date"] > val_cut) & (daily_clean["date"] <= test_cut)]
+    train = daily_clean[(daily_clean["date"] > train_start) &
+                        (daily_clean["date"] <= val_cut)]
+    val   = daily_clean[(daily_clean["date"] > val_cut) &
+                        (daily_clean["date"] <= test_cut)]
     test  = daily_clean[daily_clean["date"] > test_cut]
     log.info("Daily — Train: %d days  Val: %d days  Test: %d days",
              len(train), len(val), len(test))
@@ -234,10 +247,12 @@ def get_shape_feature_cols(sp: pd.DataFrame) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_level_models(train_daily, val_daily, feat_cols):
-    """Train P10/P50/P90 quantile HGBR on daily SSP mean."""
+    """Train P10/P50/P90 quantile HGBR on daily SSP mean (CPI-deflated to real terms)."""
     combined = pd.concat([train_daily, val_daily], ignore_index=True)
     X = combined[feat_cols].values
-    y = combined[LEVEL_TARGET].values
+    # Apply CPI deflator so model trains on real (current-money) prices
+    deflator = combined["cpi_deflator"].values if "cpi_deflator" in combined.columns else 1.0
+    y = combined[LEVEL_TARGET].values * deflator
     val_frac = len(val_daily) / len(combined)
 
     models = {}
@@ -253,12 +268,14 @@ def train_level_models(train_daily, val_daily, feat_cols):
 
 
 def train_shape_model(train_sp, val_sp, feat_cols):
-    """Train P50 HGBR on intra-day shape deviations."""
+    """Train P50 HGBR on intra-day shape deviations (CPI-deflated to real terms)."""
     combined = pd.concat([train_sp, val_sp], ignore_index=True)
     mask     = combined["ssp_shape_target"].notna() & combined[feat_cols].notna().all(axis=1)
     combined = combined[mask]
     X        = combined[feat_cols].values
-    y        = combined["ssp_shape_target"].values
+    # Deflate shape target to real terms (deviation * deflator stays interpretable)
+    deflator = combined["cpi_deflator"].values if "cpi_deflator" in combined.columns else 1.0
+    y        = combined["ssp_shape_target"].values * deflator
     val_frac = len(val_sp) / len(combined)
 
     log.info("Shape model (P50) — %d training rows …", len(combined))
@@ -406,8 +423,9 @@ def _split_at(sp_df, daily_df, fold_start, val_days):
                      (sp_df["settlement_datetime"] <= cutoff)]
 
     feat_cols = get_level_feature_cols(daily_df)
+    _opt = {"wind_pct_", "gas_pct_", "cpi_"}
     core_feat = [c for c in feat_cols
-                 if not c.startswith("wind_pct_") and not c.startswith("gas_pct_")]
+                 if not any(c.startswith(p) for p in _opt)]
     daily_clean = daily_df[daily_df[core_feat].notna().all(axis=1)].reset_index(drop=True)
     d_train = daily_clean[daily_clean["date"] <= val_cut]
     d_val   = daily_clean[(daily_clean["date"] > val_cut) & (daily_clean["date"] <= cutoff)]
@@ -512,6 +530,8 @@ def main():
     parser.add_argument("--val-days",     type=int, default=VAL_DAYS)
     parser.add_argument("--walk-forward", action="store_true",
                         help="Run seasonal walk-forward CV instead of standard holdout")
+    parser.add_argument("--train-years", type=int, default=TRAIN_YEARS,
+                        help="Max training history in years (default 3)")
     args = parser.parse_args()
 
     # ── Load SP-level data ────────────────────────────────────────────────
@@ -536,8 +556,8 @@ def main():
         return
 
     # ── Standard holdout training ─────────────────────────────────────────
-    sp_train, sp_val, sp_test = split_dates(sp_df, args.test_days, args.val_days)
-    daily_train, daily_val, daily_test = split_daily(daily_df, args.test_days, args.val_days)
+    sp_train, sp_val, sp_test = split_dates(sp_df, args.test_days, args.val_days, args.train_years)
+    daily_train, daily_val, daily_test = split_daily(daily_df, args.test_days, args.val_days, args.train_years)
 
     # ── Build shape dataset ───────────────────────────────────────────────
     log.info("Building shape dataset (merging daily lags + computing deviations) …")

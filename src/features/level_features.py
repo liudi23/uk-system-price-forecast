@@ -36,6 +36,7 @@ _CONTEMPORANEOUS = {
     "is_spike_count",
     "wind_pct_daily_mean",   # contemporaneous — not available day-ahead
     "gas_pct_daily_mean",    # contemporaneous — not available day-ahead
+    "cpi_deflator",          # training-only scaling column, not a predictor
     "date",
 }
 
@@ -76,6 +77,10 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
         agg["wind_pct_daily_mean"] = ("wind_pct", "mean")
     if "gas_pct" in df.columns:
         agg["gas_pct_daily_mean"]  = ("gas_pct",  "mean")
+    # CPI inflation — constant within a month, take first value per day
+    for _cpi_col in ["cpi_index", "cpi_yoy", "cpi_deflator"]:
+        if _cpi_col in df.columns:
+            agg[_cpi_col] = (_cpi_col, "first")
     _weather_vars = []
     for raw_col, clean in [
         ("_raw_temp_c",    "temp_c"),

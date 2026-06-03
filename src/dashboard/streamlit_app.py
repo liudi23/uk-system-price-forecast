@@ -21,11 +21,18 @@ FORECAST_PATH    = ROOT / "model_assets" / "next_day_forecast.csv"
 FORECAST_PATH_P3 = ROOT / "model_assets" / "next_day_forecast_phase3.csv"
 FI_PATH       = ROOT / "model_assets" / "hgbr_feature_importance.csv"
 
-FETCH_ELEXON      = ROOT / "src" / "data"   / "fetch_elexon.py"
-FETCH_WEATHER     = ROOT / "src" / "data"   / "fetch_weather.py"
-FORECAST_SCRIPT   = ROOT / "src" / "models" / "forecast.py"
+FETCH_ELEXON      = ROOT / "src" / "data"    / "fetch_elexon.py"
+FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
+FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
+FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
+BUILD_DATASET     = ROOT / "src" / "data"    / "build_dataset.py"
+BUILD_FEATURES    = ROOT / "src" / "features"/ "build_features.py"
+TRAIN_PHASE3      = ROOT / "src" / "models"  / "train_phase3.py"
+FORECAST_SCRIPT   = ROOT / "src" / "models"  / "forecast.py"
 FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
-FORECASTS_DIR     = ROOT / "model_assets"   / "forecasts"
+FORECASTS_DIR     = ROOT / "model_assets"    / "forecasts"
+DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
+FEATURES_5YR      = ROOT / "data" / "processed" / "features_5yr.csv"
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -56,23 +63,43 @@ st.sidebar.title("⚡ Filters")
 st.sidebar.divider()
 st.sidebar.subheader("Data & Forecast")
 if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
-    with st.spinner("Fetching latest Elexon data…"):
-        subprocess.run(
-            [sys.executable, str(FETCH_ELEXON), "--append"],
-            capture_output=True,
-        )
-    with st.spinner("Fetching latest weather…"):
-        subprocess.run(
-            [sys.executable, str(FETCH_WEATHER)],
-            capture_output=True,
-        )
-    with st.spinner("Running day-ahead forecast (Phase 2 + Phase 3)…"):
-        subprocess.run([sys.executable, str(FORECAST_SCRIPT)],    capture_output=True)
-        subprocess.run([sys.executable, str(FORECAST_SCRIPT_P3)], capture_output=True)
+    errors = []
+
+    def _run(label, cmd):
+        with st.spinner(label):
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0:
+                errors.append(f"{label}: {r.stderr.decode()[-300:]}")
+
+    _run("Fetching Elexon prices…",     [sys.executable, str(FETCH_ELEXON), "--append"])
+    _run("Fetching weather…",            [sys.executable, str(FETCH_WEATHER)])
+    _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
+    _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
+
+    # Extend dataset_5yr.csv then rebuild features
+    _run("Rebuilding dataset…",          [sys.executable, str(BUILD_DATASET),
+                                          "--raw", str(ROOT / "data" / "raw" / "system_prices.csv"),
+                                          "--out", str(DATASET_5YR)])
+    _run("Rebuilding features…",         [sys.executable, str(BUILD_FEATURES),
+                                          "--input",  str(DATASET_5YR),
+                                          "--output", str(FEATURES_5YR)])
+
+    _run("Retraining Phase 3 models…",   [sys.executable, str(TRAIN_PHASE3)])
+    _run("Running forecast…",            [sys.executable, str(FORECAST_SCRIPT_P3)])
+
+    if errors:
+        for e in errors:
+            st.sidebar.error(e)
+    else:
+        st.sidebar.success("Pipeline complete.")
+
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption("Updates system prices, weather, and tomorrow's forecast.")
+st.sidebar.caption(
+    "Fetches prices, weather, generation mix & CPI; "
+    "rebuilds features; retrains model; runs forecast."
+)
 st.sidebar.divider()
 
 min_date = df["settlement_date"].min().date()
