@@ -38,6 +38,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 from fetch_generation import fetch_range as _fetch_ci_range
+from fetch_bmrs_forecasts import get_wind_pct_forecast
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -253,7 +254,8 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
                     weather_hist: dict,
                     daily_mean_lag1d: float, daily_mean_lag7d: float,
                     daily_stats: dict = None,
-                    gen_hist: dict = None) -> dict:
+                    gen_hist: dict = None,
+                    wind_pct_forecast: np.ndarray = None) -> dict:
     """
     Build shape feature vector for one SP (h_idx = 0-based index within
     the forecast day, so lag_48 references the same SP of yesterday).
@@ -261,9 +263,10 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
     All features use fixed lags ≥ 48 SPs — guaranteed leakage-free for
     every SP in the 48-period forecast window.
 
-    daily_stats : optional dict of daily-aggregated features (ssp_raw_daily_max_lag1d,
-                  niv_daily_mean_lag1d, spike_count_lag1d, etc.) computed from
-                  daily_hist in run_forecast() and merged here for each SP.
+    wind_pct_forecast : 48-element array of day-ahead wind % from BMRS WINDFOR/TSDF.
+        When provided, substitutes into wind_pct_lag_48 (replacing the CI lag-48
+        actual with the genuine day-ahead forecast). This mirrors the weather
+        treatment: training uses actual as proxy, inference uses real forecast.
     """
     HIST = len(ssp_hist)  # must be ≥ 336 (7 days of actual history)
     row = _calendar(dt)
@@ -313,6 +316,14 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
             _garr = gen_hist.get(_gvar, np.zeros(HIST))
             row[f"{_gvar}_lag_48"]  = float(_garr[HIST - 48  + h_idx])
             row[f"{_gvar}_lag_336"] = float(_garr[HIST - 336 + h_idx]) if HIST >= 336 else 0.0
+
+    # ── WINDFOR substitution: replace wind_pct_lag_48 with day-ahead forecast ──
+    # Training uses yesterday's CI actual as a proxy; inference uses the genuine
+    # BMRS WINDFOR/TSDF day-ahead wind % — same pattern as weather (actual at
+    # training → real forecast at inference). The model sees the same feature
+    # name; we simply provide better data for that slot.
+    if wind_pct_forecast is not None and np.isfinite(wind_pct_forecast[h_idx]):
+        row["wind_pct_lag_48"] = float(wind_pct_forecast[h_idx])
 
     return row
 
@@ -389,6 +400,20 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         target_date = (combined_last_dt + pd.Timedelta(minutes=30)).date()
     log.info("Forecasting %s (history ends %s)", target_date, combined_last_dt.date())
 
+    # ── Fetch BMRS WINDFOR day-ahead wind % forecast ─────────────────────
+    wind_pct_forecast = None
+    try:
+        log.info("Fetching BMRS WINDFOR + TSDF day-ahead wind forecast for %s …", target_date)
+        wind_pct_forecast = get_wind_pct_forecast(target_date)
+        # Also update level feature: wind_pct_daily_mean_lag1d → use forecast mean
+        # (same substitution as Open-Meteo weather: actual at training, forecast at inference)
+        _wf_daily_mean = float(np.nanmean(wind_pct_forecast))
+        log.info("  WINDFOR daily mean for %s: %.1f%% (vs CI lag-1d proxy)", target_date, _wf_daily_mean)
+    except Exception as _e:
+        log.warning("WINDFOR fetch failed: %s — using CI lag-48 proxy for wind", _e)
+        wind_pct_forecast = None
+        _wf_daily_mean = None
+
     # ── Fetch day-ahead weather ───────────────────────────────────────────
     log.info("Fetching Open-Meteo weather …")
     weather_df = fetch_forecast_weather(target_date)
@@ -447,6 +472,11 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
 
     # ── Stage 1: predict daily level ─────────────────────────────────────
     lf = build_level_features(daily_hist, target_date, target_weather)
+    # Substitute WINDFOR daily mean into level feature wind_pct_daily_mean_lag1d
+    # Training proxy = yesterday's CI actual; inference = real day-ahead forecast
+    if _wf_daily_mean is not None and "wind_pct_daily_mean_lag1d" in level_feat_cols:
+        lf["wind_pct_daily_mean_lag1d"] = _wf_daily_mean
+        log.info("  Level feature wind_pct_daily_mean_lag1d → WINDFOR %.1f%% (was CI lag-1d)", _wf_daily_mean)
     x_lvl = np.array([[lf.get(c, 0.0) for c in level_feat_cols]])
     pred_l10 = float(level_q10.predict(x_lvl)[0])
     pred_l50 = float(level_q50.predict(x_lvl)[0])
@@ -502,6 +532,7 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
             daily_mean_lag7d=daily_mean_lag7d,
             daily_stats=daily_stats,
             gen_hist=gen_hist,
+            wind_pct_forecast=wind_pct_forecast,
         )
         shape_rows.append(row)
 
