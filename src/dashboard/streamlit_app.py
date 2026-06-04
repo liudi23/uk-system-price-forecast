@@ -15,11 +15,13 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH     = ROOT / "data" / "raw" / "system_prices.csv"
-PRED_PATH     = ROOT / "model_assets" / "test_predictions.csv"
-PRED_PATH_P3  = ROOT / "model_assets" / "test_predictions_phase3.csv"
-FORECAST_PATH    = ROOT / "model_assets" / "next_day_forecast.csv"
+PRED_PATH_P3     = ROOT / "model_assets" / "test_predictions_phase3.csv"
 FORECAST_PATH_P3 = ROOT / "model_assets" / "next_day_forecast_phase3.csv"
-FI_PATH       = ROOT / "model_assets" / "hgbr_feature_importance.csv"
+METRICS_P3       = ROOT / "model_assets" / "phase3_metrics.json"
+LEVEL_FEAT_JSON  = ROOT / "model_assets" / "level_feature_cols.json"
+SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
+LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
+SHAPE_IMP_CSV    = ROOT / "model_assets" / "phase3_shape_importance.csv"
 
 FETCH_ELEXON      = ROOT / "src" / "data"    / "fetch_elexon.py"
 FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
@@ -28,7 +30,6 @@ FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
 BUILD_DATASET     = ROOT / "src" / "data"    / "build_dataset.py"
 BUILD_FEATURES    = ROOT / "src" / "features"/ "build_features.py"
 TRAIN_PHASE3      = ROOT / "src" / "models"  / "train_phase3.py"
-FORECAST_SCRIPT   = ROOT / "src" / "models"  / "forecast.py"
 FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
 FORECASTS_DIR     = ROOT / "model_assets"    / "forecasts"
 DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
@@ -56,6 +57,16 @@ def load_data() -> pd.DataFrame:
 
 
 df = load_data()
+
+
+@st.cache_data
+def load_p3_metrics() -> dict:
+    import json
+    if METRICS_P3.exists():
+        with open(METRICS_P3) as f:
+            return json.load(f)
+    return {}
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("⚡ Filters")
@@ -137,12 +148,19 @@ st.caption(
 )
 
 # ── Production model banner ───────────────────────────────────────────────────
+_m = load_p3_metrics()
+_p3 = _m.get("Phase3_P50_two_stage", {})
+_dc = _m.get("decomposition", {})
+_mae_str   = f"£{_p3['MAE']:.2f}/MWh"        if "MAE"           in _p3 else "—"
+_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"  in _dc else "—"
+_corr_str  = f"{_dc['shape_corr_mean']:.3f}"  if "shape_corr_mean" in _dc else "—"
+_peak_str  = f"±{_dc['peak_timing_mae']:.1f} SPs" if "peak_timing_mae" in _dc else "—"
 st.info(
-    "**Phase 3 model — Level-Shape Decomposition (no recursive error propagation)** · "
+    "**Phase 3 — Level-Shape Decomposition · CPI-adjusted · 3-year rolling window** · "
     "Stage 1: daily level HGBR (P10/P50/P90) · Stage 2: intra-day shape HGBR · "
-    "All features lag ≥ 48 SPs — zero leakage · "
-    "**Honest day-ahead MAE (P50): £27.4/MWh** · "
-    "Level MAE: £15.8/MWh/day · Shape corr: 0.33 · Peak timing: ±4.4 SPs · Wind/gas exogenous inputs"
+    "All shape features lag ≥ 48 SPs — zero leakage · "
+    f"**Honest MAE: {_mae_str}** · Level MAE: {_lvl_str} · "
+    f"Shape corr: {_corr_str} · Peak timing: {_peak_str}"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
@@ -249,7 +267,7 @@ if _fc_path.exists():
 else:
     st.info(
         "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
-        "or run `python src/models/forecast.py`."
+        "or run `python src/models/forecast_phase3.py`."
     )
 
 st.divider()
@@ -267,7 +285,10 @@ def live_comparison_panel():
     from datetime import datetime as dt_cls
 
     today_str = str(pd.Timestamp.now().date())
-    today_fc_path = FORECASTS_DIR / f"forecast_{today_str}.csv"
+    # Prefer Phase 3 archive; fall back to Phase 2
+    today_fc_path = FORECASTS_DIR / f"forecast_phase3_{today_str}.csv"
+    if not today_fc_path.exists():
+        today_fc_path = FORECASTS_DIR / f"forecast_{today_str}.csv"
 
     col_ts, col_btn = st.columns([5, 1])
     col_ts.caption(f"Last check: {dt_cls.now().strftime('%H:%M:%S')}")
@@ -699,11 +720,16 @@ with col_pdc_tbl:
 
 # ── Actual vs Predicted ───────────────────────────────────────────────────────
 st.divider()
-st.subheader("Model Forecast vs Actual (Phase 3 Level-Shape · Test: May 11–17 2026)")
+_pred_path = PRED_PATH_P3
+_is_p3     = True
 
-# Prefer Phase 3 predictions; fall back to Phase 2
-_pred_path = PRED_PATH_P3 if PRED_PATH_P3.exists() else PRED_PATH
-_is_p3     = _pred_path == PRED_PATH_P3
+if _pred_path.exists():
+    _test_pred_tmp = pd.read_csv(_pred_path)
+    _test_dates    = sorted(_test_pred_tmp["settlement_date"].unique())
+    _test_label    = f"{_test_dates[0]} → {_test_dates[-1]}" if _test_dates else "—"
+else:
+    _test_label = "—"
+st.subheader(f"Model Forecast vs Actual (Phase 3 Level-Shape · Test: {_test_label})")
 
 if _pred_path.exists():
     pred = pd.read_csv(_pred_path, parse_dates=["settlement_datetime"])
@@ -753,8 +779,9 @@ if _pred_path.exists():
                    help="Mean Pearson r between predicted and actual intra-day profiles per day")
         dc2.metric("Peak timing error", f"{float(pd.Series(peak_gaps).mean()):.1f} SPs",
                    help="Mean absolute SP offset between predicted and actual daily peak")
-        dc3.metric("Phase 3 vs Phase 2", "£27.4 vs £25.4/MWh",
-                   help="Phase 3 adds wind/gas exogenous features; SP-level MAE slightly higher on this 7-day test window")
+        _p3_mae = f"£{_p3.get('MAE', 0):.2f}" if _p3 else "—"
+        dc3.metric("Phase 3 MAE (this test)", f"{_p3_mae}/MWh",
+                   help="Phase 3 two-stage non-recursive · CPI-adjusted · 3-year rolling train window")
 
     # ── Time series: actual vs predicted with quantile band ───────────────────
     fig_pred = go.Figure()
@@ -844,36 +871,85 @@ if _pred_path.exists():
     st.plotly_chart(fig_daily_err, use_container_width=True)
 
 else:
-    st.info("No predictions found. Run `python src/models/train_lgbm.py` to generate them.")
+    st.info("No predictions found. Run `python src/models/train_phase3.py` to generate them.")
 
 # ── Feature importance ────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Feature Importance (Top 20 · Permutation MAE Reduction)")
-st.caption("Computed on the validation set via permutation importance — shows how much each feature reduces MAE when present.")
+st.subheader("Feature Importance (Phase 3 · Top 20)")
+st.caption(
+    "Level model (Stage 1): absolute Spearman rank correlation with the CPI-deflated daily mean target "
+    "over the full training set — stable with O(1000) daily rows. "
+    "Shape model (Stage 2): permutation importance (n_repeats=5) on the validation set."
+)
 
-if FI_PATH.exists():
-    fi = pd.read_csv(FI_PATH).drop_duplicates(subset="feature").nlargest(20, "importance_mean")
-    fi = fi.sort_values("importance_mean")  # ascending for horizontal bar
 
-    fig_fi = go.Figure()
-    fig_fi.add_trace(go.Bar(
-        x=fi["importance_mean"],
-        y=fi["feature"],
-        orientation="h",
-        error_x=dict(type="data", array=fi["importance_std"].tolist(), visible=True),
-        marker_color="#1f77b4",
-        hovertemplate="%{y}<br>MAE reduction: %{x:.4f}<extra></extra>",
-    ))
-    fig_fi.update_layout(
-        xaxis_title="Mean MAE Reduction (£/MWh)",
-        yaxis_title=None,
-        height=520,
-        margin=dict(t=10, b=40, l=200),
-        showlegend=False,
+@st.cache_data
+def load_phase3_importances():
+    import json
+    if not (LEVEL_IMP_CSV.exists() and SHAPE_IMP_CSV.exists()):
+        return None, None, None, None
+    with open(LEVEL_FEAT_JSON) as f:
+        n_level = len(json.load(f))
+    with open(SHAPE_FEAT_JSON) as f:
+        n_shape = len(json.load(f))
+    level_imp = (
+        pd.read_csv(LEVEL_IMP_CSV)
+        .nlargest(20, "importance_mean")
+        .sort_values("importance_mean")
+        .rename(columns={"importance_mean": "importance"})
     )
-    st.plotly_chart(fig_fi, use_container_width=True)
+    shape_imp = (
+        pd.read_csv(SHAPE_IMP_CSV)
+        .nlargest(20, "importance_mean")
+        .sort_values("importance_mean")
+        .rename(columns={"importance_mean": "importance"})
+    )
+    return level_imp, shape_imp, n_level, n_shape
+
+
+_level_imp, _shape_imp, _n_level, _n_shape = load_phase3_importances()
+
+if _level_imp is not None:
+    fi_tab1, fi_tab2 = st.tabs([
+        f"Level model (Stage 1 · {_n_level} features)",
+        f"Shape model (Stage 2 · {_n_shape} features)",
+    ])
+
+    def _fi_chart(imp_df, color):
+        fig = go.Figure()
+        _err = imp_df["importance_std"].tolist() if "importance_std" in imp_df.columns else None
+        fig.add_trace(go.Bar(
+            x=imp_df["importance"],
+            y=imp_df["feature"],
+            orientation="h",
+            marker_color=color,
+            error_x=dict(type="data", array=_err, visible=_err is not None),
+            hovertemplate="%{y}<br>Importance: %{x:.4f}<extra></extra>",
+        ))
+        fig.update_layout(
+            xaxis_title="Mean Decrease in Impurity (relative)",
+            yaxis_title=None,
+            height=520,
+            margin=dict(t=10, b=40, l=220),
+            showlegend=False,
+        )
+        return fig
+
+    with fi_tab1:
+        st.caption(
+            "Daily-level features: SSP/NIV lags, rolling stats, weather, wind/gas generation lags, "
+            "CPI index/YoY, calendar harmonics."
+        )
+        st.plotly_chart(_fi_chart(_level_imp, "#1a6ea0"), use_container_width=True)
+
+    with fi_tab2:
+        st.caption(
+            "SP-level fixed-point features: lag-48/96/336 for SSP, NIV, weather, wind/gas; "
+            "daily-level lags merged from Stage 1; calendar (SP position, day-of-week, harmonics)."
+        )
+        st.plotly_chart(_fi_chart(_shape_imp, "#e07b39"), use_container_width=True)
 else:
-    st.info("No feature importance file found. Run `python src/models/train_lgbm.py`.")
+    st.info("No Phase 3 models found. Run `python src/models/train_phase3.py` to generate them.")
 
 # ── Raw data table ─────────────────────────────────────────────────────────────
 with st.expander("Raw data"):

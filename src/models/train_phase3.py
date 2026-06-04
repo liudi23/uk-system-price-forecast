@@ -48,6 +48,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "features"))
@@ -624,6 +625,54 @@ def main():
 
     pred_df.to_csv(ASSETS_DIR / "test_predictions_phase3.csv", index=False)
     log.info("Test predictions → %s", ASSETS_DIR / "test_predictions_phase3.csv")
+
+    # ── Feature importance ────────────────────────────────────────────────────
+    # Level model: Spearman |correlation| with target over full training set.
+    #   Permutation importance is unreliable with O(1000) daily rows; Spearman
+    #   rank correlation is a stable proxy for feature-target association.
+    # Shape model: permutation importance on val set (144 SP rows, well-behaved).
+    log.info("Computing feature importances …")
+    try:
+        from scipy.stats import spearmanr
+        _lvl_all = pd.concat([daily_train, daily_val], ignore_index=True)
+        _defl    = _lvl_all["cpi_deflator"].values if "cpi_deflator" in _lvl_all.columns else 1.0
+        _y_lvl   = _lvl_all[LEVEL_TARGET].values * _defl
+        _corrs, _stds = [], []
+        for _fc in level_feat_cols:
+            _x = _lvl_all[_fc].values
+            _ok = ~(np.isnan(_x) | np.isnan(_y_lvl))
+            if _ok.sum() > 5:
+                _r, _ = spearmanr(_x[_ok], _y_lvl[_ok])
+                _corrs.append(abs(float(_r)))
+            else:
+                _corrs.append(0.0)
+            _stds.append(0.0)
+        pd.DataFrame({
+            "feature":         level_feat_cols,
+            "importance_mean": _corrs,
+            "importance_std":  _stds,
+        }).to_csv(ASSETS_DIR / "phase3_level_importance.csv", index=False)
+
+        # Shape model: permutation importance on val set
+        _shp_mask = shape_sp_val["ssp_shape_target"].notna() & \
+                    shape_sp_val[shape_feat_cols].notna().all(axis=1)
+        _shp_val  = shape_sp_val[_shp_mask]
+        if len(_shp_val) > 0:
+            _deflshp = _shp_val["cpi_deflator"].values if "cpi_deflator" in _shp_val.columns else 1.0
+            _pi_shp = permutation_importance(
+                shape_model,
+                _shp_val[shape_feat_cols].values,
+                _shp_val["ssp_shape_target"].values * _deflshp,
+                n_repeats=5, random_state=42, n_jobs=-1,
+            )
+            pd.DataFrame({
+                "feature":         shape_feat_cols,
+                "importance_mean": _pi_shp.importances_mean,
+                "importance_std":  _pi_shp.importances_std,
+            }).to_csv(ASSETS_DIR / "phase3_shape_importance.csv", index=False)
+        log.info("Feature importances saved → %s", ASSETS_DIR)
+    except Exception as _e:
+        log.warning("Feature importance computation failed: %s", _e)
 
     all_metrics = {
         "Phase3_P50_two_stage": m_q50,
