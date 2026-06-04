@@ -90,6 +90,9 @@ SHAPE_ALWAYS_EXCLUDE = {
     "ssp_shape_target",
     # CPI deflator — used to scale training targets only, not a predictor
     "cpi_deflator",
+    # Contemporaneous generation mix — actual day-D values, not available day-ahead;
+    # the lag-48/lag-336 versions (wind_pct_lag_48 etc.) remain as features
+    "wind_pct", "gas_pct",
     # Contemporaneous values (unknown at forecast time)
     "net_imbalance_volume", "abs_imbalance_volume",
     "price_derivation_code", "price_derivation_code_P",

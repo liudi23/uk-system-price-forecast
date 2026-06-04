@@ -25,7 +25,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
 
 from calendar_features import add_calendar_features
-from lag_features import add_lag_features, add_generation_lag_features
+from lag_features import add_lag_features, add_generation_lag_features, add_sp_dynamic_features
 from weather_features import WEATHER_FILE, add_weather_features, load_weather, merge_weather
 from fetch_generation import OUTPUT_FILE as GENERATION_FILE, load_generation
 from fetch_cpi import OUTPUT_FILE as CPI_FILE, load_cpi
@@ -48,6 +48,9 @@ def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> p
 
     log.info("Adding lag and rolling features…")
     df = add_lag_features(df)
+
+    log.info("Adding same-SP dynamic features (ramps, volatility, regime)…")
+    df = add_sp_dynamic_features(df)
 
     if GENERATION_FILE.exists():
         log.info("Merging generation mix (wind %%, gas %%) from %s…", GENERATION_FILE)

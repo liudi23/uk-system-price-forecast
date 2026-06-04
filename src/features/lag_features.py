@@ -123,6 +123,76 @@ def add_lag_features(
     return df
 
 
+def add_sp_dynamic_features(
+    df: pd.DataFrame,
+    ssp_col: str = "ssp",
+    niv_col: str = "net_imbalance_volume",
+    n_days: int = 7,
+) -> pd.DataFrame:
+    """
+    Add same-SP dynamic features that capture intra-day volatility, ramps,
+    and regime changes — all with lag ≥ 48 SPs (safe for the shape model).
+
+    The key insight: for SP h on day D, the same SP on prior days is at
+    lag-48, lag-96, ..., lag-336 (not adjacent half-hours).  Standard
+    rolling windows miss this structure.
+
+    Features added
+    ──────────────
+    Ramps (rate of change at the same SP yesterday / last week):
+      ssp_ramp_48        ssp_lag_48  − ssp_lag_49   (was yesterday's SP rising?)
+      ssp_ramp_336       ssp_lag_336 − ssp_lag_337  (was last week's SP rising?)
+      ssp_raw_ramp_48    raw version of ssp_ramp_48 (unclipped price)
+      niv_ramp_48        niv_lag_48  − niv_lag_49   (NIV momentum at same SP)
+
+    Same-SP cross-day statistics (last 7 days, lag-48 through lag-336):
+      same_sp_mean_7d    mean of this SP across 7 prior days
+      same_sp_std_7d     std  of this SP across 7 prior days  ← SP volatility
+      same_sp_range_7d   max − min across 7 prior days        ← SP price band
+      ssp_sp_deviation   ssp_lag_48 − same_sp_mean_7d         ← was yesterday anomalous?
+      ssp_sp_trend_7d    ssp_lag_48 − ssp_lag_336             ← SP trending up or down?
+      niv_same_sp_std_7d std of NIV at same SP over 7 days    ← system volatility at this hour
+    """
+    df = df.copy()
+
+    # ── Ramp features (all lags ≥ 48 — leakage-free) ─────────────────────────
+    df["ssp_ramp_48"]  = df[ssp_col].shift(48) - df[ssp_col].shift(49)
+    df["ssp_ramp_336"] = df[ssp_col].shift(336) - df[ssp_col].shift(337)
+    if "ssp_raw" in df.columns:
+        df["ssp_raw_ramp_48"] = df["ssp_raw"].shift(48) - df["ssp_raw"].shift(49)
+    if niv_col in df.columns:
+        df["niv_ramp_48"] = df[niv_col].shift(48) - df[niv_col].shift(49)
+
+    # ── Same-SP cross-day statistics (compare SP to itself on prior days) ─────
+    # For SP h on day D: values at lag-48, lag-96, ..., lag-336 are the same
+    # SP on days D-1, D-2, ..., D-7.  std across these reveals how volatile
+    # *this specific settlement period* has been over the past week.
+    _sp_vals = pd.DataFrame({
+        f"_sp_d{k}": df[ssp_col].shift(k * 48)
+        for k in range(1, n_days + 1)   # k=1..7 → lag-48..lag-336
+    })
+    df["same_sp_mean_7d"]  = _sp_vals.mean(axis=1)
+    df["same_sp_std_7d"]   = _sp_vals.std(axis=1, ddof=1)
+    df["same_sp_range_7d"] = _sp_vals.max(axis=1) - _sp_vals.min(axis=1)
+
+    # Deviation: how much did yesterday's same SP diverge from its 7-day norm?
+    df["ssp_sp_deviation"] = df[ssp_col].shift(48) - df["same_sp_mean_7d"]
+
+    # Trend: directional change in same SP over the week
+    df["ssp_sp_trend_7d"]  = df[ssp_col].shift(48) - df[ssp_col].shift(336)
+
+    # NIV same-SP volatility: is the system consistently stressed at this hour?
+    if niv_col in df.columns:
+        _niv_vals = pd.DataFrame({
+            f"_niv_d{k}": df[niv_col].shift(k * 48)
+            for k in range(1, n_days + 1)
+        })
+        df["niv_same_sp_std_7d"]  = _niv_vals.std(axis=1, ddof=1)
+        df["niv_same_sp_mean_7d"] = _niv_vals.mean(axis=1)
+
+    return df
+
+
 def add_generation_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Append wind_pct and gas_pct lag features (lag-48 and lag-336 only).

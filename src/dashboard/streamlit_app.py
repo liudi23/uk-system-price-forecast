@@ -27,7 +27,7 @@ FETCH_ELEXON      = ROOT / "src" / "data"    / "fetch_elexon.py"
 FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
 FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
 FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
-BUILD_DATASET     = ROOT / "src" / "data"    / "build_dataset.py"
+EXTEND_DATASET    = ROOT / "src" / "data"    / "extend_dataset.py"
 BUILD_FEATURES    = ROOT / "src" / "features"/ "build_features.py"
 TRAIN_PHASE3      = ROOT / "src" / "models"  / "train_phase3.py"
 FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
@@ -87,10 +87,8 @@ if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
     _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
     _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
 
-    # Extend dataset_5yr.csv then rebuild features
-    _run("Rebuilding dataset…",          [sys.executable, str(BUILD_DATASET),
-                                          "--raw", str(ROOT / "data" / "raw" / "system_prices.csv"),
-                                          "--out", str(DATASET_5YR)])
+    # Extend dataset_5yr.csv with new rows (safe append — never overwrites history)
+    _run("Extending dataset…",           [sys.executable, str(EXTEND_DATASET)])
     _run("Rebuilding features…",         [sys.executable, str(BUILD_FEATURES),
                                           "--input",  str(DATASET_5YR),
                                           "--output", str(FEATURES_5YR)])
