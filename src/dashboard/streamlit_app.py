@@ -23,7 +23,6 @@ SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
 LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
 SHAPE_IMP_CSV    = ROOT / "model_assets" / "phase3_shape_importance.csv"
 
-FETCH_ELEXON      = ROOT / "src" / "data"    / "fetch_elexon.py"
 FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
 FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
 FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
@@ -82,7 +81,8 @@ if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
             if r.returncode != 0:
                 errors.append(f"{label}: {r.stderr.decode()[-300:]}")
 
-    _run("Fetching Elexon prices…",     [sys.executable, str(FETCH_ELEXON), "--append"])
+    _run("Fetching Elexon prices…",
+         [sys.executable, str(ROOT / "src" / "data" / "fetch_elexon.py"), "--append"])
     _run("Fetching weather…",            [sys.executable, str(FETCH_WEATHER)])
     _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
     _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
@@ -238,164 +238,12 @@ if _fc_path.exists():
     )
     st.plotly_chart(fig_fc, use_container_width=True)
 
-    # ── Spike probability bar chart ───────────────────────────────────────────
-    if has_quantiles and "spike_prob" in fc.columns:
-        st.markdown("**Spike Probability by Settlement Period**")
-        st.caption(
-            "Probability assigned by the binary spike classifier (trained on 5 years of Tukey-fence "
-            "exceedance events). High values signal periods where the model expects elevated risk of "
-            "prices exceeding the £354/MWh historical outer fence."
-        )
-        bar_colors = fc["spike_prob"].apply(
-            lambda p: "#d62728" if p > 0.3 else ("#ff7f0e" if p > 0.1 else "#aec7e8")
-        )
-        fig_spike = go.Figure(go.Bar(
-            x=fc["settlement_period"], y=fc["spike_prob"] * 100,
-            marker_color=bar_colors,
-            hovertemplate="SP %{x}<br>Spike prob: %{y:.1f}%<extra></extra>",
-        ))
-        fig_spike.add_hline(y=10, line_dash="dash", line_color="orange",
-                            annotation_text="10% threshold", annotation_position="top right")
-        fig_spike.update_layout(
-            xaxis_title="Settlement Period", yaxis_title="Spike probability (%)",
-            height=220, margin=dict(t=10, b=40), showlegend=False,
-        )
-        st.plotly_chart(fig_spike, use_container_width=True)
 
 else:
     st.info(
         "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
         "or run `python src/models/forecast_phase3.py`."
     )
-
-st.divider()
-
-# ── Live: Today's Forecast vs Actual SSP ─────────────────────────────────────
-st.subheader("Live: Today's Forecast vs Actual SSP")
-st.caption(
-    "Settled periods update automatically every 30 min. "
-    "Click **↻ Fetch now** to pull the latest Elexon prices immediately."
-)
-
-
-@st.fragment(run_every="30m")
-def live_comparison_panel():
-    from datetime import datetime as dt_cls
-
-    today_str = str(pd.Timestamp.now().date())
-    # Prefer Phase 3 archive; fall back to Phase 2
-    today_fc_path = FORECASTS_DIR / f"forecast_phase3_{today_str}.csv"
-    if not today_fc_path.exists():
-        today_fc_path = FORECASTS_DIR / f"forecast_{today_str}.csv"
-
-    col_ts, col_btn = st.columns([5, 1])
-    col_ts.caption(f"Last check: {dt_cls.now().strftime('%H:%M:%S')}")
-    with col_btn:
-        if st.button("↻ Fetch now", use_container_width=True):
-            with st.spinner("Fetching…"):
-                subprocess.run(
-                    [sys.executable, str(FETCH_ELEXON), "--append"], capture_output=True
-                )
-            st.cache_data.clear()
-
-    if not today_fc_path.exists():
-        st.info(
-            f"No forecast for today ({today_str}). "
-            "Click **Refresh Data & Run Forecast** in the sidebar to generate one."
-        )
-        return
-
-    fc_today = pd.read_csv(today_fc_path, parse_dates=["settlement_datetime"])
-
-    # Read actuals directly (bypass cache so we always get the freshest file)
-    raw_today = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
-    actuals_today = raw_today[
-        raw_today["settlement_date"].dt.strftime("%Y-%m-%d") == today_str
-    ][["settlement_period", "ssp"]].rename(columns={"ssp": "ssp_actual"})
-    n_settled = len(actuals_today)
-
-    # Current settlement period based on local clock
-    now_local = pd.Timestamp.now()
-    current_sp = min(int(now_local.hour * 2 + now_local.minute // 30 + 1), 48)
-    now_dt = pd.Timestamp(today_str) + pd.Timedelta(minutes=30 * (current_sp - 1))
-
-    # Metrics row (only shown when actuals are available)
-    if n_settled > 0:
-        merged_live = fc_today.merge(actuals_today, on="settlement_period", how="inner")
-        _p50 = "ssp_q50" if "ssp_q50" in merged_live.columns else "ssp_predicted"
-        merged_live["abs_error"] = (merged_live[_p50] - merged_live["ssp_actual"]).abs()
-        running_mae = merged_live["abs_error"].mean()
-        max_err     = merged_live["abs_error"].max()
-        worst_sp    = int(merged_live.loc[merged_live["abs_error"].idxmax(), "settlement_period"])
-
-        lm1, lm2, lm3, lm4 = st.columns(4)
-        lm1.metric("Settled periods", f"{n_settled} / 48")
-        lm2.metric("Running MAE", f"£{running_mae:.2f}/MWh")
-        lm3.metric("Max error so far", f"£{max_err:.2f}/MWh")
-        lm4.metric("Worst SP", f"SP {worst_sp}")
-
-    # Chart
-    fig_live = go.Figure()
-
-    # P10–P90 confidence band (if quantile forecast available)
-    has_q = "ssp_q50" in fc_today.columns
-    if has_q:
-        fig_live.add_trace(go.Scatter(
-            x=pd.concat([fc_today["settlement_datetime"],
-                          fc_today["settlement_datetime"].iloc[::-1]]),
-            y=pd.concat([fc_today["ssp_q90"], fc_today["ssp_q10"].iloc[::-1]]),
-            fill="toself", fillcolor="rgba(255,127,14,0.12)",
-            line=dict(color="rgba(255,127,14,0)"),
-            hoverinfo="skip", name="P10–P90", showlegend=True,
-        ))
-
-    # Full forecast curve (dotted orange)
-    p50_col_live = "ssp_q50" if has_q else "ssp_predicted"
-    fig_live.add_trace(go.Scatter(
-        x=fc_today["settlement_datetime"], y=fc_today[p50_col_live],
-        name="Forecast (P50)", line=dict(color="#ff7f0e", width=2, dash="dot"),
-        hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}/MWh<extra></extra>",
-        customdata=fc_today["settlement_period"],
-    ))
-
-    # Actual SSP for settled periods (solid blue)
-    if n_settled > 0:
-        fig_live.add_trace(go.Scatter(
-            x=merged_live["settlement_datetime"], y=merged_live["ssp_actual"],
-            name="Actual SSP", line=dict(color="#1f77b4", width=2.5),
-            hovertemplate="SP %{customdata}<br>Actual £%{y:.2f}/MWh<extra></extra>",
-            customdata=merged_live["settlement_period"],
-        ))
-    else:
-        st.caption(
-            "No actuals yet for today — Elexon publishes initial settlement prices "
-            "after each period. Click **↻ Fetch now** or check back later."
-        )
-
-    # Vertical "Now" line — use add_shape to avoid Plotly type-mixing bug
-    # with add_vline annotation positioning on datetime axes
-    x_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-    fig_live.add_shape(
-        type="line",
-        x0=x_str, x1=x_str, y0=0, y1=1, yref="paper",
-        line=dict(color="grey", width=1.5, dash="solid"),
-    )
-    fig_live.add_annotation(
-        x=x_str, yref="paper", y=0.98,
-        text=f"Now · SP {current_sp}",
-        showarrow=False, font=dict(color="grey", size=11),
-        xanchor="right",
-    )
-
-    fig_live.update_layout(
-        xaxis_title="Settlement Period", yaxis_title="£/MWh",
-        height=360, margin=dict(t=30, b=40), hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig_live, use_container_width=True)
-
-
-live_comparison_panel()
 
 st.divider()
 
