@@ -15,8 +15,9 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH     = ROOT / "data" / "raw" / "system_prices.csv"
-PRED_PATH_P3     = ROOT / "model_assets" / "test_predictions_phase3.csv"
-FORECAST_PATH_P3 = ROOT / "model_assets" / "next_day_forecast_phase3.csv"
+PRED_PATH_P3      = ROOT / "model_assets" / "test_predictions_phase3.csv"
+FORECAST_PATH_P3  = ROOT / "model_assets" / "next_day_forecast_phase3.csv"   # H+1 today
+FORECAST_PATH_H2  = ROOT / "model_assets" / "day2_forecast_phase3.csv"       # H+2 tomorrow
 METRICS_P3       = ROOT / "model_assets" / "phase3_metrics.json"
 LEVEL_FEAT_JSON  = ROOT / "model_assets" / "level_feature_cols.json"
 SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
@@ -244,6 +245,42 @@ else:
         "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
         "or run `python src/models/forecast_phase3.py`."
     )
+
+# ── H+2 forecast panel (tomorrow) ────────────────────────────────────────────
+if FORECAST_PATH_H2.exists():
+    fc_h2  = pd.read_csv(FORECAST_PATH_H2, parse_dates=["settlement_datetime"])
+    h2_date = fc_h2["settlement_date"].iloc[0]
+    h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
+    h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
+
+    st.subheader(f"Tomorrow Forecast · H+2 · {h2_date}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
+    st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
+
+    h2m1, h2m2, h2m3 = st.columns(3)
+    h2m1.metric("H+2 Date", h2_date)
+    h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
+    h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
+
+    fig_h2 = go.Figure()
+    if "ssp_q10" in fc_h2.columns:
+        fig_h2.add_trace(go.Scatter(
+            x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(42,157,143,0.15)",
+            line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
+        ))
+    fig_h2.add_trace(go.Scatter(
+        x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
+        name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
+        hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
+        customdata=fc_h2["settlement_period"],
+    ))
+    fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
+                     annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
+    fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
+                          height=300, margin=dict(t=10, b=40), hovermode="x unified",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(fig_h2, use_container_width=True)
 
 st.divider()
 

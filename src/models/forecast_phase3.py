@@ -46,7 +46,8 @@ log = logging.getLogger(__name__)
 ASSETS_DIR      = Path(__file__).resolve().parents[2] / "model_assets"
 FEATURES_FILE   = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
 RAW_PRICES_FILE = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
-OUTPUT_FILE     = ASSETS_DIR / "next_day_forecast_phase3.csv"
+OUTPUT_FILE     = ASSETS_DIR / "next_day_forecast_phase3.csv"       # H+1: today
+OUTPUT_FILE_H2  = ASSETS_DIR / "day2_forecast_phase3.csv"           # H+2: tomorrow
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 UK_LOCATIONS = [
@@ -343,6 +344,74 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
     return row
 
 
+def build_shape_row_h2(h_idx: int, dt: pd.Timestamp,
+                       ssp_hist: np.ndarray, ssp_raw_hist: np.ndarray,
+                       is_spike_hist: np.ndarray, niv_hist: np.ndarray,
+                       weather_hist: dict,
+                       daily_mean_lag2d: float, daily_mean_lag7d: float,
+                       daily_stats_h2: dict = None,
+                       gen_hist: dict = None,
+                       wind_pct_forecast_h2: np.ndarray = None,
+                       solar_forecast_h2: np.ndarray = None) -> dict:
+    """
+    Build H+2 shape feature vector for one SP of target_date+1 (tomorrow).
+
+    All features use lag ≥ 96 SPs so they reference settled actuals from
+    at least D (today's settled data), not D+1 which won't be available.
+
+    lag-96  from D+2 = same SP of D   (today's settled prices)
+    lag-336 from D+2 = same SP of D-5 (7 days before D+2)
+    """
+    HIST = len(ssp_hist)
+    row  = _calendar(dt)
+
+    # ── Lag-96/336 as primary same-SP signals ─────────────────────────────
+    row["ssp_lag_96"]  = float(ssp_hist[HIST - 96  + h_idx])
+    row["ssp_lag_336"] = float(ssp_hist[HIST - 336 + h_idx])
+
+    row["ssp_raw_lag_96"]   = float(ssp_raw_hist[HIST - 96  + h_idx])
+    row["ssp_raw_lag_336"]  = float(ssp_raw_hist[HIST - 336 + h_idx])
+    row["is_spike_lag_336"] = float(is_spike_hist[HIST - 336 + h_idx])
+    row["is_negative_lag_336"] = float(ssp_raw_hist[HIST - 336 + h_idx] < 0)
+
+    row["ssp_diff_48_336"]  = row["ssp_lag_96"] - row["ssp_lag_336"]  # lag96 as proxy
+
+    # ── NIV lag-336 ───────────────────────────────────────────────────────
+    row["net_imbalance_volume_lag_336"] = float(niv_hist[HIST - 336 + h_idx])
+
+    # ── Weather lag-336 ───────────────────────────────────────────────────
+    for wvar in ["temp_c", "wind_ms", "solar_wm2", "precip_mm"]:
+        arr = weather_hist[wvar]
+        row[f"{wvar}_lag_336"] = float(arr[HIST - 336 + h_idx])
+
+    temp_lag336 = weather_hist["temp_c"][HIST - 336 + h_idx]
+    row["heating_degree"] = float(max(0.0, HEATING_BASE - temp_lag336))
+    row["cooling_degree"] = float(max(0.0, temp_lag336 - COOLING_BASE))
+
+    # ── Daily-level H+2 features (lag-2d, lag-7d relative to D+2) ─────────
+    row["ssp_daily_mean_lag2d"] = daily_mean_lag2d
+    row["ssp_daily_mean_lag7d"] = daily_mean_lag7d
+    row["ssp_lag96_deviation"]  = row["ssp_lag_96"]  - daily_mean_lag2d
+    row["ssp_lag336_deviation"] = row["ssp_lag_336"] - daily_mean_lag7d
+
+    if daily_stats_h2:
+        row.update(daily_stats_h2)
+
+    # ── Generation lags (lag-336 only — lag-48 not safe for H+2) ─────────
+    if gen_hist:
+        for _gvar in ["wind_pct", "gas_pct"]:
+            _garr = gen_hist.get(_gvar, np.zeros(HIST))
+            row[f"{_gvar}_lag_336"] = float(_garr[HIST - 336 + h_idx]) if HIST >= 336 else 0.0
+
+    # ── Forecast substitutions for H+2 (D+2 day-ahead signals) ───────────
+    if wind_pct_forecast_h2 is not None and np.isfinite(wind_pct_forecast_h2[h_idx]):
+        row["wind_pct_lag_336"] = float(wind_pct_forecast_h2[h_idx])
+    if solar_forecast_h2 is not None and np.isfinite(solar_forecast_h2[h_idx]):
+        row["solar_wm2_lag_336"] = float(solar_forecast_h2[h_idx])
+
+    return row
+
+
 # ── Main forecast ─────────────────────────────────────────────────────────────
 
 def run_forecast(target_date: date = None) -> pd.DataFrame:
@@ -358,6 +427,12 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         shape_feat_cols = json.load(f)
     with open(ASSETS_DIR / "tukey_fence.json") as f:
         fence = json.load(f)
+
+    # H+2 shape model (optional — graceful fallback if not trained yet)
+    _h2_pkl  = ASSETS_DIR / "shape_h2_q50.pkl"
+    _h2_json = ASSETS_DIR / "shape_h2_feature_cols.json"
+    shape_h2_q50       = joblib.load(_h2_pkl)              if _h2_pkl.exists()  else None
+    shape_h2_feat_cols = json.load(open(_h2_json))         if _h2_json.exists() else []
 
     # Optional: negative-price regime classifier
     _neg_clf_path    = ASSETS_DIR / "neg_day_classifier.pkl"
@@ -593,11 +668,97 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     result = pd.DataFrame(records)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(OUTPUT_FILE, index=False)
-    log.info("Forecast saved → %s", OUTPUT_FILE)
+    log.info("H+1 forecast saved → %s", OUTPUT_FILE)
 
-    archive_dir  = OUTPUT_FILE.parent / "forecasts"
+    archive_dir = OUTPUT_FILE.parent / "forecasts"
     archive_dir.mkdir(exist_ok=True)
     result.to_csv(archive_dir / f"forecast_phase3_{target_date}.csv", index=False)
+
+    # ── H+2: forecast for target_date + 1 (tomorrow) ─────────────────────
+    if shape_h2_q50 is not None and shape_h2_feat_cols:
+        h2_date   = target_date + timedelta(days=1)
+        base_h2   = pd.Timestamp(h2_date)
+
+        # Level for H+2: use lag-2d features (available 2 days before H+2)
+        lf_h2 = build_level_features(daily_hist, h2_date, target_weather)
+        # WINDFOR for H+2 (tomorrow)
+        try:
+            log.info("Fetching BMRS WINDFOR for H+2 date %s …", h2_date)
+            wind_pct_h2  = get_wind_pct_forecast(h2_date)
+            wf_h2_mean   = float(np.nanmean(wind_pct_h2))
+            if "wind_pct_daily_mean_lag1d" in level_feat_cols:
+                lf_h2["wind_pct_daily_mean_lag1d"] = wf_h2_mean
+            log.info("  H+2 WINDFOR daily mean: %.1f%%", wf_h2_mean)
+        except Exception as _e:
+            wind_pct_h2 = None
+            log.warning("H+2 WINDFOR fetch failed: %s", _e)
+
+        # Open-Meteo day+2 solar for H+2 shape rows
+        try:
+            solar_h2 = _day_weather(weather_df, h2_date)["solar_wm2"]
+        except Exception:
+            solar_h2 = None
+
+        # H+2 level prediction
+        x_h2 = np.array([[lf_h2.get(c, 0.0) for c in level_feat_cols]])
+        h2_l10 = min(float(level_q10.predict(x_h2)[0]), float(level_q50.predict(x_h2)[0]))
+        h2_l50 = float(level_q50.predict(x_h2)[0])
+        h2_l90 = max(float(level_q90.predict(x_h2)[0]), h2_l50)
+        log.info("H+2 level: P10=£%.1f  P50=£%.1f  P90=£%.1f", h2_l10, h2_l50, h2_l90)
+
+        # H+2 lag-2d daily stats
+        daily_mean_lag2d = float(daily_hist["ssp_daily_mean"].values[-2]) if len(daily_hist) >= 2 else daily_mean_lag1d
+        daily_mean_lag7d_h2 = float(daily_hist["ssp_daily_mean"].values[-7]) if len(daily_hist) >= 7 else daily_mean_lag2d
+        daily_stats_h2: dict = {
+            "ssp_raw_daily_max_lag2d": float(daily_hist["ssp_raw_daily_max"].values[-2]) if len(daily_hist) >= 2 else 0.0,
+            "spike_count_lag7d":       float(daily_hist["is_spike_count"].values[-7])    if len(daily_hist) >= 7 else 0.0,
+            "spike_count_roll_7d":     float(daily_hist["is_spike_count"].values[-7:].sum()),
+            "ssp_daily_roll_mean_7d":  float(daily_hist["ssp_daily_mean"].values[-7:].mean()),
+        }
+
+        h2_shape_rows = []
+        for h in range(48):
+            dt_h2 = base_h2 + pd.Timedelta(minutes=30 * h)
+            row_h2 = build_shape_row_h2(
+                h_idx=h, dt=dt_h2,
+                ssp_hist=ssp_arr, ssp_raw_hist=ssp_raw_arr,
+                is_spike_hist=is_spike_arr, niv_hist=niv_arr,
+                weather_hist=weather_hist,
+                daily_mean_lag2d=daily_mean_lag2d,
+                daily_mean_lag7d=daily_mean_lag7d_h2,
+                daily_stats_h2=daily_stats_h2,
+                gen_hist=gen_hist,
+                wind_pct_forecast_h2=wind_pct_h2,
+                solar_forecast_h2=solar_h2,
+            )
+            h2_shape_rows.append(row_h2)
+
+        X_h2   = np.array([[r.get(c, 0.0) for c in shape_h2_feat_cols] for r in h2_shape_rows])
+        devs_h2 = shape_h2_q50.predict(X_h2)
+
+        h2_records = []
+        for h in range(48):
+            dt_h2 = base_h2 + pd.Timedelta(minutes=30 * h)
+            dev   = float(devs_h2[h])
+            h2_records.append({
+                "settlement_datetime": dt_h2,
+                "settlement_date":     str(h2_date),
+                "settlement_period":   h + 1,
+                "ssp_predicted":       round(h2_l50 + dev, 2),
+                "ssp_q10":             round(h2_l10 + dev, 2),
+                "ssp_q50":             round(h2_l50 + dev, 2),
+                "ssp_q90":             round(h2_l90 + dev, 2),
+                "pred_daily_level":    round(h2_l50, 2),
+                "pred_deviation":      round(dev, 2),
+            })
+
+        result_h2 = pd.DataFrame(h2_records)
+        result_h2.to_csv(OUTPUT_FILE_H2, index=False)
+        result_h2.to_csv(archive_dir / f"forecast_phase3_{h2_date}.csv", index=False)
+        log.info("H+2 forecast saved → %s  (daily level P50=£%.1f)", OUTPUT_FILE_H2, h2_l50)
+    else:
+        result_h2 = pd.DataFrame()
+        log.info("H+2 model not available — skipping H+2 forecast")
 
     return result
 

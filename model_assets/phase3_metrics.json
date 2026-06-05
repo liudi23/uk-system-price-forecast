@@ -1,15 +1,15 @@
 {
   "Phase3_P50_two_stage": {
-    "MAE": 48.2108,
-    "RMSE": 59.4365,
-    "MAPE": 253.8526,
-    "sMAPE": 68.0808,
-    "n": 96
+    "MAE": 31.6102,
+    "RMSE": 41.6306,
+    "MAPE": 120.4979,
+    "sMAPE": 37.7757,
+    "n": 336
   },
   "decomposition": {
-    "level_mae": 33.93,
-    "shape_corr_mean": 0.6203,
-    "peak_timing_mae": 13.0,
-    "n_days": 2
+    "level_mae": 18.07,
+    "shape_corr_mean": 0.4613,
+    "peak_timing_mae": 6.43,
+    "n_days": 7
   }
 }

@@ -59,8 +59,8 @@ from level_features import LEVEL_TARGET, build_level_dataset, get_level_feature_
 FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
 ASSETS_DIR    = Path(__file__).resolve().parents[2] / "model_assets"
 
-TEST_DAYS   = 2   # yesterday + day before yesterday
-VAL_DAYS    = 3   # 3 days before test
+TEST_DAYS   = 7   # last 7 days — full week, mix of normal + extreme days
+VAL_DAYS    = 5   # 5 days before test — stable early-stopping signal
 TRAIN_YEARS = 3   # drop data older than 3 years to reduce inflation drift
 QUANTILES = [0.10, 0.50, 0.90]
 
@@ -115,6 +115,26 @@ SHAPE_ALWAYS_EXCLUDE = {
 # NOT "_daily_roll_" (daily aggregates are safe) and NOT a "_roll_Nd" day-suffix
 # (e.g. spike_count_roll_7d is safe, ssp_roll_mean_6 is not).
 _SP_ROLL_RE = re.compile(r"_roll_\d+d$")
+
+# ── H+2 additional exclusions ─────────────────────────────────────────────────
+# Forecasting D+2 from data ending at D: lag-48 references D+1 (not settled yet).
+# Any feature whose value depends on the H+1 day must be excluded from the H+2 model.
+# The H+2 model uses lag-96 (D same SP, 2 days before D+2) as its primary signal.
+_H2_EXTRA_EXCLUDE_PATTERNS = [
+    "_lag_48", "_lag_49",            # reference D+1 (not settled)
+    "same_sp_",                       # computed from lag-48 through lag-336 → includes D+1
+    "ssp_sp_deviation", "ssp_sp_trend_7d",
+    "_ramp_48",                       # lag-48 − lag-49
+    "ssp_lag48_deviation",            # ssp_lag_48 − ssp_daily_mean_lag1d
+    # Daily stats referencing yesterday of H+2 = D+1 (not settled)
+    "ssp_daily_mean_lag1d",
+    "ssp_raw_daily_max_lag1d",
+    "niv_daily_mean_lag1d",
+    "spike_count_lag1d",
+    "temp_c_daily_mean_lag1d",
+    "wind_ms_daily_mean_lag1d",
+    "solar_wm2_daily_mean_lag1d",
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -234,16 +254,65 @@ def build_shape_data(sp_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFram
 
 
 def get_shape_feature_cols(sp: pd.DataFrame) -> list:
-    """Return shape model feature columns: lag-48+ fixed features + calendar."""
+    """Return H+1 shape model feature columns: lag-48+ fixed features + calendar."""
     def _excluded(col: str) -> bool:
         if col in SHAPE_ALWAYS_EXCLUDE:
             return True
-        # Exclude SP-level rolling features; keep daily-level rolls
-        # ("_daily_roll_" prefix) and day-suffixed rolls ("_roll_7d" etc.)
         if "_roll_" in col and "_daily_roll_" not in col and not _SP_ROLL_RE.search(col):
             return True
         return False
     return [c for c in sp.columns if not _excluded(c)]
+
+
+def get_shape_feature_cols_h2(sp: pd.DataFrame) -> list:
+    """Return H+2 shape feature columns: lag-96+ only (D+1 not settled at inference)."""
+    def _excluded_h2(col: str) -> bool:
+        if col in SHAPE_ALWAYS_EXCLUDE:
+            return True
+        if "_roll_" in col and "_daily_roll_" not in col and not _SP_ROLL_RE.search(col):
+            return True
+        if any(pat in col for pat in _H2_EXTRA_EXCLUDE_PATTERNS):
+            return True
+        return False
+    return [c for c in sp.columns if not _excluded_h2(c)]
+
+
+def build_shape_data_h2(sp_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Like build_shape_data() but merges lag-2d daily features instead of lag-1d,
+    so all merged columns are available when forecasting D+2 from data ending at D.
+
+    Shape target is the same: ssp_raw_h − actual_daily_mean_D+2.
+    New SP features using only lag ≥ 96 relative to D+2:
+        ssp_daily_mean_lag2d   — D daily mean (2 days before D+2)
+        ssp_daily_mean_lag7d   — D-5 daily mean
+        ssp_raw_daily_max_lag2d
+        ssp_lag96_deviation    — ssp_lag_96 minus D daily mean
+        ssp_lag336_deviation   — ssp_lag_336 minus D-5 daily mean
+    """
+    sp = sp_df.copy()
+    sp["_date"] = sp["settlement_datetime"].dt.normalize()
+
+    # H+2-safe daily columns: lag-2d and lag-7d are available 2 days before D+2
+    merge_cols = ["date", LEVEL_TARGET, "ssp_daily_mean",
+                  "ssp_daily_mean_lag2d", "ssp_daily_mean_lag7d",
+                  "ssp_raw_daily_max_lag2d",
+                  "spike_count_lag7d", "spike_count_roll_7d",
+                  "ssp_daily_roll_mean_7d"]
+    merge_cols = [c for c in merge_cols if c in daily_df.columns]
+    daily_sub  = daily_df[merge_cols].rename(columns={"date": "_date"})
+
+    sp = sp.merge(daily_sub, on="_date", how="left")
+    sp["ssp_shape_target"] = sp["ssp_raw"] - sp[LEVEL_TARGET]
+
+    # Relative position features using lag-96 (safe for H+2)
+    if "ssp_daily_mean_lag2d" in sp.columns and "ssp_lag_96" in sp.columns:
+        sp["ssp_lag96_deviation"] = sp["ssp_lag_96"] - sp["ssp_daily_mean_lag2d"]
+    if "ssp_daily_mean_lag7d" in sp.columns and "ssp_lag_336" in sp.columns:
+        sp["ssp_lag336_deviation"] = sp["ssp_lag_336"] - sp["ssp_daily_mean_lag7d"]
+
+    sp = sp.drop(columns=["_date"])
+    return sp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -661,6 +730,17 @@ def main():
     log.info("Training shape model (P50) on intra-day deviations …")
     shape_model = train_shape_model(shape_sp_train, shape_sp_val, shape_feat_cols)
 
+    # ── H+2 shape model ───────────────────────────────────────────────────
+    log.info("Building H+2 shape dataset (lag ≥ 96 features only) …")
+    shape_h2_all   = build_shape_data_h2(sp_df,    daily_df)
+    shape_h2_train = build_shape_data_h2(sp_train, daily_df)
+    shape_h2_val   = build_shape_data_h2(sp_val,   daily_df)
+    shape_h2_test  = build_shape_data_h2(sp_test,  daily_df)
+    shape_h2_feat_cols = get_shape_feature_cols_h2(shape_h2_all)
+    log.info("H+2 shape features: %d", len(shape_h2_feat_cols))
+    log.info("Training H+2 shape model (P50) …")
+    shape_h2_model = train_shape_model(shape_h2_train, shape_h2_val, shape_h2_feat_cols)
+
     # ── Evaluate ──────────────────────────────────────────────────────────
     log.info("Running two-stage non-recursive evaluation on test set …")
     pred_df = evaluate_phase3(
@@ -695,13 +775,16 @@ def main():
     for q, model in level_models.items():
         name = {0.10: "q10", 0.50: "q50", 0.90: "q90"}[q]
         joblib.dump(model, ASSETS_DIR / f"level_{name}.pkl")
-    joblib.dump(shape_model, ASSETS_DIR / "shape_q50.pkl")
+    joblib.dump(shape_model,    ASSETS_DIR / "shape_q50.pkl")
+    joblib.dump(shape_h2_model, ASSETS_DIR / "shape_h2_q50.pkl")
     log.info("Models saved → %s", ASSETS_DIR)
 
     with open(ASSETS_DIR / "level_feature_cols.json", "w") as f:
         json.dump(level_feat_cols, f)
     with open(ASSETS_DIR / "shape_feature_cols.json", "w") as f:
         json.dump(shape_feat_cols, f)
+    with open(ASSETS_DIR / "shape_h2_feature_cols.json", "w") as f:
+        json.dump(shape_h2_feat_cols, f)
 
     pred_df.to_csv(ASSETS_DIR / "test_predictions_phase3.csv", index=False)
     log.info("Test predictions → %s", ASSETS_DIR / "test_predictions_phase3.csv")
