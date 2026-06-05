@@ -92,6 +92,25 @@ Mean actual price was similar across seasons (£75–83/MWh), so MAE differences
 
 **K — Extremely rare (9 occurrences in 5 years).** Applied when ESO bought or sold nothing at all to balance the grid — supply and demand matched perfectly without any intervention. Too rare to be visible in the chart.
 
+## Model Hyperparameters
+
+All four HGBR models (Level P10/P50/P90 and Shape H+1) share the same base parameters. The H+2 shape model also uses these parameters.
+
+| Parameter | Value | Purpose |
+|---|---|---|
+| `loss` | `"quantile"` | Pinball loss at the target quantile (0.10, 0.50, or 0.90) |
+| `learning_rate` | 0.05 | Conservative step size — reduces overfitting |
+| `max_iter` | 1,000 | Maximum number of boosting trees |
+| `early_stopping` | True | Halts training when validation loss plateaus |
+| `n_iter_no_change` | 50 | Patience: stop after 50 consecutive non-improving iterations |
+| `max_leaf_nodes` | 31 | Shallow trees (depth ≈ 5) — each tree is a weak learner |
+| `min_samples_leaf` | 10 | Minimum samples per leaf — prevents overfitting on small groups |
+| `l2_regularization` | 0.1 | L2 penalty on leaf values — reduces variance |
+| `max_bins` | 255 | Histogram bins for feature discretisation |
+| `random_state` | 42 | Reproducibility seed |
+
+**Design rationale:** Low learning rate (0.05) combined with early stopping on the validation set is the standard bias-variance trade-off for gradient boosting — many small steps, stop when the held-out loss stops improving. The actual number of trees used (`best_iter`) varies per model and training run, typically 100–1,000. Parameters were kept identical to Phase 2 for a fair comparison; per-model hyperparameter tuning (particularly `learning_rate` and `max_leaf_nodes` separately for the level vs shape models) is a Phase 4 improvement opportunity.
+
 ## Uncertainty Quantification
 
 The level model produces three separate HGBR models trained on quantile loss for P10, P50, and P90. These provide calibrated daily prediction intervals. At the SP level, the P10 and P90 bands are formed by applying the P50 shape deviation to the level P10 and P90 respectively, propagating level uncertainty uniformly across all 48 SPs. This means interval width is constant within a day. Extending the shape model to produce its own quantile estimates — capturing intra-day uncertainty beyond level uncertainty — is the primary remaining architecture enhancement.
