@@ -466,8 +466,13 @@ st.plotly_chart(fig_ts, use_container_width=True)
 col_left, col_right = st.columns([3, 2])
 
 with col_left:
-    st.subheader("Daily SSP Heatmap by Settlement Period")
-    pivot = dff.pivot_table(
+    # Heatmap: cap at 90 days so columns remain readable and unique
+    _hm_days = 90
+    _hm_end   = dff["settlement_date"].max()
+    _hm_start = _hm_end - pd.Timedelta(days=_hm_days - 1)
+    dff_hm = dff[dff["settlement_date"] >= _hm_start]
+    st.subheader(f"Daily SSP Heatmap by Settlement Period (last {_hm_days} days)")
+    pivot = dff_hm.pivot_table(
         index="settlement_period", columns="settlement_date", values="ssp", aggfunc="mean"
     )
     pivot.columns = pivot.columns.strftime("%m-%d")
