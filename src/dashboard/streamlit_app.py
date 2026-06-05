@@ -571,9 +571,21 @@ st.plotly_chart(fig_profile, use_container_width=True)
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
 st.caption(
-    "**N (Normal)** — SSP/SBP set from the accepted bid-offer stack: the actual marginal cost of balancing.  "
-    "**P (Replacement Price)** — bid-offer stack too thin to price fairly; ESO substitutes a reference price, "
-    "making SSP = SBP by definition. ~50% of periods trigger P-code."
+    "How the system price (SSP) was calculated each half-hour:\n\n"
+    "**N — Normal market price.** "
+    "Generators and consumers submit bids and offers to the grid operator (National Grid ESO). "
+    "ESO selects the cheapest offers to cover any shortfall, and the price of the most expensive "
+    "unit it had to buy sets the system price — like a standard auction. "
+    "N means the auction ran normally and the price reflects real supply and demand.\n\n"
+    "**P — Backup (Replacement) price.** "
+    "Sometimes too few market participants submit offers for a given half-hour, making the "
+    "auction unreliable. When this happens, ESO falls back to a formula-based reference price "
+    "instead of a market-derived one. P is very common (~50% of half-hours), "
+    "particularly overnight and at weekends when market activity is lower.\n\n"
+    "**K — Special case (extremely rare: only 9 occurrences in 5 years).** "
+    "Applied when the grid was in perfect balance — ESO did not need to buy or sell any "
+    "electricity at all to balance supply and demand in that half-hour. "
+    "Too rare to be visible in the chart; shown in the legend for completeness."
 )
 
 # Full-width: daily P/N period counts over time
@@ -587,7 +599,7 @@ fig_pdc = px.bar(
     x="settlement_date",
     y="count",
     color="price_derivation_code",
-    color_discrete_map={"P": "#e377c2", "N": "#17becf"},
+    color_discrete_map={"N": "#17becf", "P": "#e377c2", "K": "#d62728"},
     labels={"settlement_date": "Date", "count": "Periods", "price_derivation_code": "Code"},
     barmode="stack",
 )
