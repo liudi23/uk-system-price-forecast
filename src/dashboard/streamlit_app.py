@@ -466,16 +466,22 @@ st.plotly_chart(fig_ts, use_container_width=True)
 col_left, col_right = st.columns([3, 2])
 
 with col_left:
-    # Heatmap: cap at 90 days so columns remain readable and unique
-    _hm_days = 90
+    # Heatmap: cap at 90 days — column names must include year so Plotly
+    # doesn't misinterpret bare "MM-DD" strings as year 2003/2004 dates.
+    # Fill remaining NaN (DST days with ≠48 SPs) via forward-fill so no gaps.
+    _hm_days  = 90
     _hm_end   = dff["settlement_date"].max()
     _hm_start = _hm_end - pd.Timedelta(days=_hm_days - 1)
     dff_hm = dff[dff["settlement_date"] >= _hm_start]
     st.subheader(f"Daily SSP Heatmap by Settlement Period (last {_hm_days} days)")
+
     pivot = dff_hm.pivot_table(
         index="settlement_period", columns="settlement_date", values="ssp", aggfunc="mean"
     )
-    pivot.columns = pivot.columns.strftime("%m-%d")
+    # Keep full YYYY-MM-DD label → unique, correctly ordered, no year ambiguity
+    pivot.columns = pivot.columns.strftime("%Y-%m-%d")
+    # Forward-fill rare NaN cells (DST 46/50-SP days) to remove visual gaps
+    pivot = pivot.ffill(axis=0).bfill(axis=0)
 
     fig_heat = px.imshow(
         pivot,
@@ -484,7 +490,7 @@ with col_left:
         labels=dict(x="Date", y="Settlement Period", color="SSP £/MWh"),
     )
     fig_heat.update_layout(height=420, margin=dict(t=10, b=40))
-    fig_heat.update_xaxes(tickangle=45, nticks=15)
+    fig_heat.update_xaxes(tickangle=45, nticks=20)
     st.plotly_chart(fig_heat, use_container_width=True)
 
 with col_right:
