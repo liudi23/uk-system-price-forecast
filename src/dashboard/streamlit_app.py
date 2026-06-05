@@ -770,13 +770,16 @@ if _pred_path.exists():
         .rename(columns={"mean": "Mean AE", "max": "Max AE"})
     )
     fig_daily_err = go.Figure()
+    # Draw Max AE first (taller bar, behind) then Mean AE on top (shorter bar, in front).
+    # This ensures Mean AE (blue) is cleanly visible at the bottom and Max AE (orange)
+    # shows only for the portion above Mean AE — no colour blending.
+    fig_daily_err.add_trace(go.Bar(
+        x=daily_err["settlement_date"], y=daily_err["Max AE"],
+        name="Max AE", marker_color="#ff7f0e",
+    ))
     fig_daily_err.add_trace(go.Bar(
         x=daily_err["settlement_date"], y=daily_err["Mean AE"],
         name="Mean AE", marker_color="#1f77b4",
-    ))
-    fig_daily_err.add_trace(go.Bar(
-        x=daily_err["settlement_date"], y=daily_err["Max AE"],
-        name="Max AE", marker_color="#ff7f0e", opacity=0.6,
     ))
     fig_daily_err.update_layout(
         xaxis_title="Date", yaxis_title="£/MWh",
