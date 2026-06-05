@@ -37,6 +37,7 @@ _CONTEMPORANEOUS = {
     "wind_pct_daily_mean",   # contemporaneous — not available day-ahead
     "gas_pct_daily_mean",    # contemporaneous — not available day-ahead
     "cpi_deflator",          # training-only scaling column, not a predictor
+    "neg_sp_daily_count",    # contemporaneous day-D count — not available before D ends
     "date",
 }
 
@@ -81,6 +82,10 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
     for _cpi_col in ["cpi_index", "cpi_yoy", "cpi_deflator"]:
         if _cpi_col in df.columns:
             agg[_cpi_col] = (_cpi_col, "first")
+    # Negative-price SP count — must be added BEFORE groupby
+    if "ssp_raw" in df.columns:
+        df["_is_neg"] = (df["ssp_raw"] < 0).astype(float)
+        agg["neg_sp_daily_count"] = ("_is_neg", "sum")
     _weather_vars = []
     for raw_col, clean in [
         ("_raw_temp_c",    "temp_c"),
@@ -100,6 +105,8 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
     # Keep only complete days (DST transitions produce 46 or 50 SPs)
     daily = daily[daily["_n_sp"] == 48].drop(columns=["_n_sp"]).reset_index(drop=True)
+    # Drop the helper column created for negative-price aggregation
+    daily = daily.drop(columns=["_is_neg"], errors="ignore")
 
     # ── Calendar features for day D ───────────────────────────────────────
     # Properties of the day itself — never derived from D's prices.
@@ -173,6 +180,15 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
             daily[f"{col}_lag7d"] = daily[col].shift(7)
             roll = daily[col].shift(1).rolling(window=7, min_periods=3)
             daily[f"{prefix}_daily_roll_mean_7d"] = roll.mean()
+
+    # ── Negative-price SP count lags ──────────────────────────────────────
+    # How many negative-price SPs did yesterday have? How many over the past week?
+    # These are the strongest leading signals for renewable-oversupply regimes.
+    if "neg_sp_daily_count" in daily.columns:
+        daily["neg_sp_count_lag1d"]   = daily["neg_sp_daily_count"].shift(1)
+        daily["neg_sp_count_lag7d"]   = daily["neg_sp_daily_count"].shift(7)
+        roll_neg = daily["neg_sp_daily_count"].shift(1).rolling(window=7, min_periods=1)
+        daily["neg_sp_count_roll_7d"] = roll_neg.sum()
 
     return daily
 

@@ -271,6 +271,61 @@ def train_level_models(train_daily, val_daily, feat_cols):
     return models
 
 
+def train_neg_day_classifier(train_daily: pd.DataFrame, val_daily: pd.DataFrame) -> object:
+    """
+    Train a binary HGBR classifier: will tomorrow have ≥ 3 negative-price SPs?
+
+    This targets the renewable oversupply regime (high wind + solar, low demand)
+    that causes deep midday price crashes.  The classifier output (probability)
+    is added as a level model feature at inference, improving the daily mean
+    prediction on high-renewable days.
+
+    Features used (all lag ≥ 1 day, no leakage):
+        neg_sp_count_lag1d/7d, neg_sp_count_roll_7d  — recent negative-price history
+        wind_pct_daily_mean_lag1d/7d                 — recent wind generation
+        solar_wm2_daily_mean_lag1d                   — recent solar
+        is_weekend, month, day_of_year               — calendar (negative prices more
+                                                        common on weekends + summer)
+    """
+    NEG_THRESHOLD = 3   # ≥ 3 negative SPs in a day → "negative-price day"
+    _clf_feats = [
+        "neg_sp_count_lag1d", "neg_sp_count_lag7d", "neg_sp_count_roll_7d",
+        "wind_pct_daily_mean_lag1d", "wind_pct_daily_mean_lag7d",
+        "solar_wm2_daily_mean_lag1d",
+        "is_weekend", "month", "day_of_year",
+    ]
+    combined = pd.concat([train_daily, val_daily], ignore_index=True)
+    avail    = [c for c in _clf_feats if c in combined.columns]
+    if not avail or "neg_sp_daily_count" not in combined.columns:
+        log.warning("Neg-day classifier: required features missing — skipping")
+        return None
+
+    mask = combined[avail].notna().all(axis=1)
+    X    = combined.loc[mask, avail].values
+    y    = (combined.loc[mask, "neg_sp_daily_count"] >= NEG_THRESHOLD).astype(int).values
+
+    pos_frac = y.mean()
+    log.info("Neg-day classifier: %d samples, %.1f%% positive (≥%d neg SPs)",
+             len(y), 100 * pos_frac, NEG_THRESHOLD)
+    if pos_frac < 0.01 or pos_frac > 0.99:
+        log.warning("Neg-day classifier: class imbalance extreme — skipping")
+        return None
+
+    val_frac = len(val_daily) / len(combined)
+    clf = HistGradientBoostingRegressor(
+        loss="quantile", quantile=0.50,   # predict median probability
+        max_iter=500, learning_rate=0.05,
+        max_leaf_nodes=15, min_samples_leaf=10,
+        l2_regularization=0.1, max_bins=64,
+        early_stopping=True, n_iter_no_change=30,
+        validation_fraction=val_frac, random_state=42,
+    )
+    clf.fit(X, y.astype(float))
+    train_pos = (clf.predict(X) > 0.5).mean()
+    log.info("  best_iter=%d  predicted positive rate=%.1f%%", clf.n_iter_, 100 * train_pos)
+    return clf, avail
+
+
 def train_shape_model(train_sp, val_sp, feat_cols):
     """Train P50 HGBR on intra-day shape deviations (CPI-deflated to real terms)."""
     combined = pd.concat([train_sp, val_sp], ignore_index=True)
@@ -578,6 +633,28 @@ def main():
              shape_sp_train["ssp_shape_target"].mean())
 
     # ── Train models ──────────────────────────────────────────────────────
+    log.info("Training negative-price regime classifier …")
+    _clf_result = train_neg_day_classifier(daily_train, daily_val)
+    neg_clf, neg_clf_feats = (_clf_result if _clf_result else (None, []))
+    if neg_clf:
+        joblib.dump(neg_clf, ASSETS_DIR / "neg_day_classifier.pkl")
+        with open(ASSETS_DIR / "neg_day_classifier_feats.json", "w") as _f:
+            json.dump(neg_clf_feats, _f)
+        log.info("Neg-day classifier saved → %s", ASSETS_DIR / "neg_day_classifier.pkl")
+
+    # ── Add classifier predictions as level feature ───────────────────────
+    # Use in-sample predictions on train+val so the level model can learn to
+    # use neg_price_risk_prob as a signal during training.
+    if neg_clf and neg_clf_feats:
+        for _dset in [daily_train, daily_val, daily_test]:
+            _avail = [c for c in neg_clf_feats if c in _dset.columns]
+            if _avail:
+                _x = _dset[_avail].fillna(0).values
+                _dset["neg_price_risk_prob"] = neg_clf.predict(_x)
+        if "neg_price_risk_prob" not in level_feat_cols:
+            level_feat_cols = level_feat_cols + ["neg_price_risk_prob"]
+            log.info("  Added neg_price_risk_prob to level features (%d total)", len(level_feat_cols))
+
     log.info("Training level models (P10/P50/P90) on daily SSP mean …")
     level_models = train_level_models(daily_train, daily_val, level_feat_cols)
 

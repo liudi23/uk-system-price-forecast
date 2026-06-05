@@ -211,6 +211,12 @@ def build_level_features(daily_hist: pd.DataFrame, target_date: date,
     spk_win = spk_series[-7:] if len(spk_series) >= 7 else spk_series
     feat["spike_count_roll_7d"] = float(spk_win.sum())
 
+    # Negative-price SP count lags — renewable oversupply regime signal
+    neg_series = h["neg_sp_daily_count"].values if "neg_sp_daily_count" in h.columns else np.zeros(len(h))
+    feat["neg_sp_count_lag1d"]   = float(neg_series[-1])  if len(neg_series) >= 1 else 0.0
+    feat["neg_sp_count_lag7d"]   = float(neg_series[-7])  if len(neg_series) >= 7 else 0.0
+    feat["neg_sp_count_roll_7d"] = float(neg_series[-7:].sum()) if len(neg_series) >= 1 else 0.0
+
     # Weather for target_date (day-ahead forecast)
     feat["temp_c_daily_mean"]   = float(np.mean(target_weather["temp_c"]))
     feat["temp_c_daily_max"]    = float(np.max(target_weather["temp_c"]))
@@ -255,7 +261,8 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
                     daily_mean_lag1d: float, daily_mean_lag7d: float,
                     daily_stats: dict = None,
                     gen_hist: dict = None,
-                    wind_pct_forecast: np.ndarray = None) -> dict:
+                    wind_pct_forecast: np.ndarray = None,
+                    solar_forecast: np.ndarray = None) -> dict:
     """
     Build shape feature vector for one SP (h_idx = 0-based index within
     the forecast day, so lag_48 references the same SP of yesterday).
@@ -264,9 +271,13 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
     every SP in the 48-period forecast window.
 
     wind_pct_forecast : 48-element array of day-ahead wind % from BMRS WINDFOR/TSDF.
-        When provided, substitutes into wind_pct_lag_48 (replacing the CI lag-48
-        actual with the genuine day-ahead forecast). This mirrors the weather
-        treatment: training uses actual as proxy, inference uses real forecast.
+        Substitutes into wind_pct_lag_48 — genuine day-ahead forecast instead of
+        CI lag-48 actual. Same pattern as weather: actual at training, forecast at inference.
+
+    solar_forecast : 48-element array of day-ahead solar irradiance (W/m²) from
+        Open-Meteo hourly data. Substitutes into solar_wm2_lag_48.
+        At training: solar_wm2_lag_48 = yesterday's actual irradiance (proxy).
+        At inference: today's Open-Meteo day-ahead forecast for each SP.
     """
     HIST = len(ssp_hist)  # must be ≥ 336 (7 days of actual history)
     row = _calendar(dt)
@@ -318,12 +329,16 @@ def build_shape_row(h_idx: int, dt: pd.Timestamp,
             row[f"{_gvar}_lag_336"] = float(_garr[HIST - 336 + h_idx]) if HIST >= 336 else 0.0
 
     # ── WINDFOR substitution: replace wind_pct_lag_48 with day-ahead forecast ──
-    # Training uses yesterday's CI actual as a proxy; inference uses the genuine
-    # BMRS WINDFOR/TSDF day-ahead wind % — same pattern as weather (actual at
-    # training → real forecast at inference). The model sees the same feature
-    # name; we simply provide better data for that slot.
     if wind_pct_forecast is not None and np.isfinite(wind_pct_forecast[h_idx]):
         row["wind_pct_lag_48"] = float(wind_pct_forecast[h_idx])
+
+    # ── Solar substitution: replace solar_wm2_lag_48 with day-ahead forecast ──
+    # Open-Meteo hourly shortwave_radiation already fetched for the target date.
+    # solar_wm2_lag_48 is the top-ranked shape feature (importance 0.11);
+    # providing the genuine day-ahead value instead of yesterday's actual is
+    # the largest single inference-time signal improvement available.
+    if solar_forecast is not None and np.isfinite(solar_forecast[h_idx]):
+        row["solar_wm2_lag_48"] = float(solar_forecast[h_idx])
 
     return row
 
@@ -343,6 +358,12 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         shape_feat_cols = json.load(f)
     with open(ASSETS_DIR / "tukey_fence.json") as f:
         fence = json.load(f)
+
+    # Optional: negative-price regime classifier
+    _neg_clf_path    = ASSETS_DIR / "neg_day_classifier.pkl"
+    _neg_feats_path  = ASSETS_DIR / "neg_day_classifier_feats.json"
+    neg_clf          = joblib.load(_neg_clf_path)   if _neg_clf_path.exists()   else None
+    neg_clf_feats    = json.load(open(_neg_feats_path)) if _neg_feats_path.exists() else []
     upper_fence = fence["upper"]
 
     # ── Load history ──────────────────────────────────────────────────────
@@ -440,6 +461,10 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     for _gv in ["wind_pct", "gas_pct"]:
         if _gv in sp_all.columns:
             agg_spec[f"{_gv}_daily_mean"] = (_gv, "mean")
+    # Negative-price SP count per day (leading indicator of renewable oversupply regime)
+    if "ssp_raw" in sp_all.columns:
+        sp_all["_is_neg"] = (sp_all["ssp_raw"] < 0).astype(float)
+        agg_spec["neg_sp_daily_count"] = ("_is_neg", "sum")
 
     daily_hist = (
         sp_all[sp_all["_date"] < target_date]
@@ -473,10 +498,20 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     # ── Stage 1: predict daily level ─────────────────────────────────────
     lf = build_level_features(daily_hist, target_date, target_weather)
     # Substitute WINDFOR daily mean into level feature wind_pct_daily_mean_lag1d
-    # Training proxy = yesterday's CI actual; inference = real day-ahead forecast
     if _wf_daily_mean is not None and "wind_pct_daily_mean_lag1d" in level_feat_cols:
         lf["wind_pct_daily_mean_lag1d"] = _wf_daily_mean
         log.info("  Level feature wind_pct_daily_mean_lag1d → WINDFOR %.1f%% (was CI lag-1d)", _wf_daily_mean)
+
+    # Negative-price regime classifier: compute P(≥3 negative SPs tomorrow)
+    # and inject as level feature so the level model can predict low daily means
+    # on high-renewable-oversupply days.
+    if neg_clf is not None and neg_clf_feats:
+        try:
+            _x_neg = np.array([[lf.get(f, 0.0) for f in neg_clf_feats]])
+            lf["neg_price_risk_prob"] = float(neg_clf.predict(_x_neg)[0])
+            log.info("  neg_price_risk_prob = %.3f", lf["neg_price_risk_prob"])
+        except Exception as _e:
+            log.warning("Neg-day classifier inference failed: %s", _e)
     x_lvl = np.array([[lf.get(c, 0.0) for c in level_feat_cols]])
     pred_l10 = float(level_q10.predict(x_lvl)[0])
     pred_l50 = float(level_q50.predict(x_lvl)[0])
@@ -533,6 +568,7 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
             daily_stats=daily_stats,
             gen_hist=gen_hist,
             wind_pct_forecast=wind_pct_forecast,
+            solar_forecast=target_weather["solar_wm2"],
         )
         shape_rows.append(row)
 
