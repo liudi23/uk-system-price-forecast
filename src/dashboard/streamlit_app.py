@@ -524,7 +524,8 @@ with col_right:
 st.subheader("Average Settlement Period Profile (SSP)")
 
 profile = (
-    dff.groupby("settlement_period")[["ssp", "time_label"]]
+    dff[dff["settlement_period"] <= 48]   # exclude SP49/50 on DST fall-back days
+    .groupby("settlement_period")[["ssp", "time_label"]]
     .agg({"ssp": "mean", "time_label": "first"})
     .reset_index()
     .sort_values("settlement_period")
