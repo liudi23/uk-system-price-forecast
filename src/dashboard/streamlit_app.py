@@ -14,7 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH     = ROOT / "data" / "raw" / "system_prices.csv"
+# Use full processed history for analytics; system_prices.csv is only a ~50-day rolling window
+DATA_PATH     = ROOT / "data" / "processed" / "dataset_5yr.csv"
 PRED_PATH_P3      = ROOT / "model_assets" / "test_predictions_phase3.csv"
 FORECAST_PATH_P3  = ROOT / "model_assets" / "next_day_forecast_phase3.csv"   # H+1 today
 FORECAST_PATH_H2  = ROOT / "model_assets" / "day2_forecast_phase3.csv"       # H+2 tomorrow
