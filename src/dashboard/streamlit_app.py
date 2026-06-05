@@ -571,26 +571,37 @@ st.plotly_chart(fig_profile, use_container_width=True)
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
 st.caption(
-    "How the system price (SSP) was calculated each half-hour:\n\n"
-    "**N — Normal market price.** "
-    "Generators and consumers submit bids and offers to the grid operator (National Grid ESO). "
-    "ESO selects the cheapest offers to cover any shortfall, and the price of the most expensive "
-    "unit it had to buy sets the system price — like a standard auction. "
-    "N means the auction ran normally and the price reflects real supply and demand.\n\n"
-    "**P — Backup (Replacement) price.** "
-    "Sometimes too few market participants submit offers for a given half-hour, making the "
-    "auction unreliable. When this happens, ESO falls back to a formula-based reference price "
-    "instead of a market-derived one. P is very common (~50% of half-hours), "
-    "particularly overnight and at weekends when market activity is lower.\n\n"
-    "**K — Special case (extremely rare: only 9 occurrences in 5 years).** "
-    "Applied when the grid was in perfect balance — ESO did not need to buy or sell any "
-    "electricity at all to balance supply and demand in that half-hour. "
-    "Too rare to be visible in the chart; shown in the legend for completeness."
+    "How the system price (SSP) was calculated for each 30-minute period:\n\n"
+    "**N — Normal market price (~50% of periods).** "
+    "Generators bid to supply electricity and consumers offer to reduce demand. "
+    "ESO accepts the cheapest bids first until supply meets demand — like an auction. "
+    "The price of the last (most expensive) unit ESO had to accept becomes the system price. "
+    "N means the market set a genuine price based on real supply and demand.\n\n"
+    "**P — Backup (Replacement) price (~50% of periods).** "
+    "Sometimes the auction has too few participants or the result would be unreliable "
+    "(e.g. only must-run nuclear and wind remain). ESO then uses a formula-based "
+    "fallback price instead. P is most common during the evening peak (18:00–21:00), "
+    "when dispatch is complex and the conventional bid stack can break down.\n\n"
+    "**Why N dominates overnight, P dominates evenings:** "
+    "In the early hours (01:00–06:00) demand is low and stable — the auction is simple, so N wins (~60–65%). "
+    "During the evening peak, dispatch involves many generator types simultaneously "
+    "and the bid-offer stack is more likely to fail the reliability test — P wins (~55–65%).\n\n"
+    "**Note on the chart:** The bar height shows the COUNT of periods per code per day "
+    "(stacked to 48 total). The N/P split within a day is spread across the full 24 hours — "
+    "N is not confined to the start of the day; it just appears at the bottom of each bar "
+    "because of how stacked bars are drawn. "
+    "On the last Sunday of October (BST→GMT clock change), bars reach 50 because the day "
+    "has two extra periods (the 01:00–02:00 hour runs twice). These are correct.\n\n"
+    "**K — Extremely rare (9 occurrences in 5 years).** "
+    "Applied when ESO bought or sold nothing at all to balance the grid — "
+    "supply and demand matched perfectly without any intervention. "
+    "Too rare to be visible in the chart."
 )
 
-# Full-width: daily P/N period counts over time
+# Full-width: daily P/N period counts over time (capped at SP 1-48; DST days have 50 SPs)
 daily_pdc = (
-    dff.groupby(["settlement_date", "price_derivation_code"])
+    dff[dff["settlement_period"] <= 48]
+    .groupby(["settlement_date", "price_derivation_code"])
     .size()
     .reset_index(name="count")
 )
