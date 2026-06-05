@@ -80,6 +80,18 @@ Mean actual price was similar across seasons (£75–83/MWh), so MAE differences
 
 **Spring** is the hardest season across all metrics (level MAE £17.07, sMAPE 52.3%). High renewable penetration combined with low demand creates an unpredictable dispatch order. Negative price periods and sudden upward spikes make the daily level exceptionally difficult to forecast. April 2026 in particular was characterised by erratic renewable output with large day-to-day swings in solar and wind availability. In this regime, gas-price lags and NIV are less informative because marginal dispatch is dominated by curtailment decisions rather than thermal plant economics.
 
+## Price Derivation Code (P vs N vs K)
+
+**N — Normal market price (~50% of periods).** Generators bid to supply electricity and consumers offer to reduce demand. ESO accepts the cheapest bids first until supply meets demand — like an auction. The price of the last (most expensive) unit ESO had to accept becomes the system price. N means the market set a genuine price based on real supply and demand.
+
+**P — Backup (Replacement) price (~50% of periods).** Sometimes the auction has too few participants or the result would be unreliable (e.g. only must-run nuclear and wind remain). ESO then uses a formula-based fallback price instead. P is most common during the evening peak (18:00–21:00), when dispatch is complex and the conventional bid stack can break down.
+
+**Why N dominates overnight, P dominates evenings:** In the early hours (01:00–06:00) demand is low and stable — the auction is simple, so N wins (~60–65%). During the evening peak, dispatch involves many generator types simultaneously and the bid-offer stack is more likely to fail the reliability test — P wins (~55–65%).
+
+**Note on the bar chart:** The bar height shows the COUNT of periods per code per day (stacked to 48 total). The N/P split within a day is spread across the full 24 hours — N is not confined to the start of the day; it just appears at the bottom of each bar because of how stacked bars are drawn. On the last Sunday of October (BST→GMT clock change), bars reach 50 because the day has two extra periods (the 01:00–02:00 hour runs twice).
+
+**K — Extremely rare (9 occurrences in 5 years).** Applied when ESO bought or sold nothing at all to balance the grid — supply and demand matched perfectly without any intervention. Too rare to be visible in the chart.
+
 ## Uncertainty Quantification
 
 The level model produces three separate HGBR models trained on quantile loss for P10, P50, and P90. These provide calibrated daily prediction intervals. At the SP level, the P10 and P90 bands are formed by applying the P50 shape deviation to the level P10 and P90 respectively, propagating level uncertainty uniformly across all 48 SPs. This means interval width is constant within a day. Extending the shape model to produce its own quantile estimates — capturing intra-day uncertainty beyond level uncertainty — is the primary remaining architecture enhancement.
