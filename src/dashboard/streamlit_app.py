@@ -527,19 +527,39 @@ profile = (
     dff.groupby("settlement_period")[["ssp", "time_label"]]
     .agg({"ssp": "mean", "time_label": "first"})
     .reset_index()
+    .sort_values("settlement_period")
 )
 
+# Use integer settlement_period on x-axis (avoids Plotly misinterpreting
+# HH:MM strings as dates, which caused a diagonal fill artifact).
+# Tick labels are formatted as HH:MM every 4 SPs (= every 2 hours).
+_sp_ticks = profile["settlement_period"].tolist()[::4]
+_lb_ticks  = profile["time_label"].tolist()[::4]
+
 fig_profile = go.Figure()
-fig_profile.add_trace(
-    go.Scatter(
-        x=profile["time_label"], y=profile["ssp"],
-        name="Avg SSP", fill="tozeroy",
-        line=dict(color="#1f77b4"),
-    )
-)
+# Baseline at y=0 so fill is an explicit filled area, not tozeroy
+fig_profile.add_trace(go.Scatter(
+    x=profile["settlement_period"].tolist() + profile["settlement_period"].tolist()[::-1],
+    y=profile["ssp"].tolist() + [0] * len(profile),
+    fill="toself",
+    fillcolor="rgba(31,119,180,0.2)",
+    line=dict(color="rgba(0,0,0,0)"),
+    hoverinfo="skip",
+    showlegend=False,
+))
+fig_profile.add_trace(go.Scatter(
+    x=profile["settlement_period"], y=profile["ssp"],
+    name="Avg SSP",
+    line=dict(color="#1f77b4", width=2),
+    hovertemplate="SP %{x}  %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
+    customdata=profile["time_label"],
+))
 fig_profile.update_layout(
-    xaxis_title="Time of Day (HH:MM)",
-    yaxis_title="£/MWh",
+    xaxis=dict(
+        tickmode="array", tickvals=_sp_ticks, ticktext=_lb_ticks,
+        title="Time of Day (HH:MM)",
+    ),
+    yaxis=dict(title="£/MWh", rangemode="tozero"),
     height=320,
     margin=dict(t=10, b=40),
     hovermode="x unified",
