@@ -245,7 +245,7 @@ if _fc_path.exists():
             font=dict(size=11, color="grey"),
         )],
     )
-    st.plotly_chart(fig_fc, use_container_width=True)
+    st.plotly_chart(fig_fc, width="stretch")
 
 
 else:
@@ -288,7 +288,7 @@ if FORECAST_PATH_H2.exists():
     fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
                           height=300, margin=dict(t=10, b=40), hovermode="x unified",
                           legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    st.plotly_chart(fig_h2, use_container_width=True)
+    st.plotly_chart(fig_h2, width="stretch")
 
 st.divider()
 
@@ -382,7 +382,7 @@ else:
             height=340, margin=dict(t=10, b=40), hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_v, use_container_width=True)
+        st.plotly_chart(fig_v, width="stretch")
 
         # Error by settlement period + error histogram side by side
         col_ep, col_eh = st.columns(2)
@@ -407,7 +407,7 @@ else:
                 title_text="Error by Settlement Period", title_x=0,
                 showlegend=False,
             )
-            st.plotly_chart(fig_ep, use_container_width=True)
+            st.plotly_chart(fig_ep, width="stretch")
 
         with col_eh:
             fig_eh = px.histogram(
@@ -420,7 +420,7 @@ else:
                 height=300, margin=dict(t=30, b=40),
                 title_text="Error Distribution (Predicted − Actual)", title_x=0,
             )
-            st.plotly_chart(fig_eh, use_container_width=True)
+            st.plotly_chart(fig_eh, width="stretch")
 
 st.divider()
 
@@ -467,7 +467,7 @@ fig_ts.update_layout(
     margin=dict(t=10, b=40),
     hovermode="x unified",
 )
-st.plotly_chart(fig_ts, use_container_width=True)
+st.plotly_chart(fig_ts, width="stretch")
 
 # ── Heatmap + Imbalance side by side ─────────────────────────────────────────
 col_left, col_right = st.columns([3, 2])
@@ -498,7 +498,7 @@ with col_left:
     )
     fig_heat.update_layout(height=420, margin=dict(t=10, b=40))
     fig_heat.update_xaxes(tickangle=45, nticks=20)
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_heat, width="stretch")
 
 with col_right:
     st.subheader("Net Imbalance Volume")
@@ -525,7 +525,7 @@ with col_right:
         margin=dict(t=10, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig_niv, use_container_width=True)
+    st.plotly_chart(fig_niv, width="stretch")
 
 # ── Average daily profile ────────────────────────────────────────────────────
 st.subheader("Average Settlement Period Profile (SSP)")
@@ -575,7 +575,7 @@ with col_sp:
         showlegend=False,
         title=dict(text="Intra-day profile (selected range)", font=dict(size=13)),
     )
-    st.plotly_chart(fig_profile, use_container_width=True)
+    st.plotly_chart(fig_profile, width="stretch")
 
 with col_wk:
     # Week-of-year profile: last 3 years, ISO weeks 1–52, averaged across years
@@ -626,7 +626,7 @@ with col_wk:
         showlegend=False,
         title=dict(text="Seasonal profile (last 3 years, weeks averaged)", font=dict(size=13)),
     )
-    st.plotly_chart(fig_week, use_container_width=True)
+    st.plotly_chart(fig_week, width="stretch")
 
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
@@ -657,7 +657,7 @@ fig_pdc.update_layout(
     margin=dict(t=10, b=40),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
-st.plotly_chart(fig_pdc, use_container_width=True)
+st.plotly_chart(fig_pdc, width="stretch")
 
 # Box plot + stats table side by side at equal width
 col_pdc_box, col_pdc_tbl = st.columns(2)
@@ -678,7 +678,7 @@ with col_pdc_box:
         margin=dict(t=10, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig_box, use_container_width=True)
+    st.plotly_chart(fig_box, width="stretch")
 
 with col_pdc_tbl:
     st.markdown("**Summary statistics by code**")
@@ -689,7 +689,7 @@ with col_pdc_tbl:
         .reset_index()
         .rename(columns={"price_derivation_code": "Code"})
     )
-    st.dataframe(stats, use_container_width=True, hide_index=True)
+    st.dataframe(stats, width="stretch", hide_index=True)
     st.caption(
         "P-code prices cluster tighter around the replacement reference value. "
         "N-code periods show wider spread — driven by the actual market stack."
@@ -785,7 +785,7 @@ if _pred_path.exists():
         height=380, margin=dict(t=10, b=40), hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig_pred, use_container_width=True)
+    st.plotly_chart(fig_pred, width="stretch")
 
     # ── Scatter + error distribution side by side ─────────────────────────────
     col_sc, col_err = st.columns(2)
@@ -808,7 +808,7 @@ if _pred_path.exists():
             height=360, margin=dict(t=30, b=40),
             title_text="Predicted vs Actual", title_x=0,
         )
-        st.plotly_chart(fig_sc, use_container_width=True)
+        st.plotly_chart(fig_sc, width="stretch")
 
     with col_err:
         fig_err = px.histogram(
@@ -821,7 +821,7 @@ if _pred_path.exists():
             height=360, margin=dict(t=30, b=40),
             title_text="Error Distribution (Predicted − Actual)", title_x=0,
         )
-        st.plotly_chart(fig_err, use_container_width=True)
+        st.plotly_chart(fig_err, width="stretch")
 
     # ── Daily error summary ───────────────────────────────────────────────────
     daily_err = (
@@ -848,7 +848,7 @@ if _pred_path.exists():
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         title_text="Daily Forecast Error", title_x=0,
     )
-    st.plotly_chart(fig_daily_err, use_container_width=True)
+    st.plotly_chart(fig_daily_err, width="stretch")
 
 else:
     st.info("No predictions found. Run `python src/models/train_phase3.py` to generate them.")
@@ -920,14 +920,14 @@ if _level_imp is not None:
             "Daily-level features: SSP/NIV lags, rolling stats, weather, wind/gas generation lags, "
             "CPI index/YoY, calendar harmonics."
         )
-        st.plotly_chart(_fi_chart(_level_imp, "#1a6ea0"), use_container_width=True)
+        st.plotly_chart(_fi_chart(_level_imp, "#1a6ea0"), width="stretch")
 
     with fi_tab2:
         st.caption(
             "SP-level fixed-point features: lag-48/96/336 for SSP, NIV, weather, wind/gas; "
             "daily-level lags merged from Stage 1; calendar (SP position, day-of-week, harmonics)."
         )
-        st.plotly_chart(_fi_chart(_shape_imp, "#e07b39"), use_container_width=True)
+        st.plotly_chart(_fi_chart(_shape_imp, "#e07b39"), width="stretch")
 else:
     st.info("No Phase 3 models found. Run `python src/models/train_phase3.py` to generate them.")
 
@@ -938,7 +938,7 @@ with st.expander("Raw data"):
              "net_imbalance_volume", "price_derivation_code", "replacement_price"]]
         .sort_values(["settlement_date", "settlement_period"], ascending=False)
         .reset_index(drop=True),
-        use_container_width=True,
+        width="stretch",
         height=300,
     )
     st.download_button(
