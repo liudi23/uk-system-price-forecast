@@ -148,6 +148,7 @@ dff = df[mask].copy()
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("UK Electricity System Price Dashboard")
+st.markdown("**Di Liu** · [github.com/liudi23/uk-system-price-forecast](https://github.com/liudi23/uk-system-price-forecast)")
 st.caption(
     f"Data: Elexon BMRS · {start_date} → {end_date} · "
     f"{len(dff):,} settlement periods"
