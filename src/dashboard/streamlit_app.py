@@ -4,9 +4,12 @@ Data source: Elexon BMRS — data/raw/system_prices.csv
 Run: streamlit run src/dashboard/streamlit_app.py
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+IS_CLOUD = os.environ.get("STREAMLIT_SHARING_MODE") == "streamlit_sharing"
 
 import pandas as pd
 import plotly.express as px
@@ -74,43 +77,46 @@ st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
 st.sidebar.subheader("Data & Forecast")
-if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
-    errors = []
+if IS_CLOUD:
+    st.sidebar.info("Forecasts updated daily — no refresh needed.")
+else:
+    if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
+        errors = []
 
-    def _run(label, cmd):
-        with st.spinner(label):
-            r = subprocess.run(cmd, capture_output=True)
-            if r.returncode != 0:
-                errors.append(f"{label}: {r.stderr.decode()[-300:]}")
+        def _run(label, cmd):
+            with st.spinner(label):
+                r = subprocess.run(cmd, capture_output=True)
+                if r.returncode != 0:
+                    errors.append(f"{label}: {r.stderr.decode()[-300:]}")
 
-    _run("Fetching Elexon prices…",
-         [sys.executable, str(ROOT / "src" / "data" / "fetch_elexon.py"), "--append"])
-    _run("Fetching weather…",            [sys.executable, str(FETCH_WEATHER)])
-    _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
-    _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
+        _run("Fetching Elexon prices…",
+             [sys.executable, str(ROOT / "src" / "data" / "fetch_elexon.py"), "--append"])
+        _run("Fetching weather…",            [sys.executable, str(FETCH_WEATHER)])
+        _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
+        _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
 
-    # Extend dataset_5yr.csv with new rows (safe append — never overwrites history)
-    _run("Extending dataset…",           [sys.executable, str(EXTEND_DATASET)])
-    _run("Rebuilding features…",         [sys.executable, str(BUILD_FEATURES),
-                                          "--input",  str(DATASET_5YR),
-                                          "--output", str(FEATURES_5YR)])
+        # Extend dataset_5yr.csv with new rows (safe append — never overwrites history)
+        _run("Extending dataset…",           [sys.executable, str(EXTEND_DATASET)])
+        _run("Rebuilding features…",         [sys.executable, str(BUILD_FEATURES),
+                                              "--input",  str(DATASET_5YR),
+                                              "--output", str(FEATURES_5YR)])
 
-    _run("Retraining Phase 3 models…",   [sys.executable, str(TRAIN_PHASE3)])
-    _run("Running forecast…",            [sys.executable, str(FORECAST_SCRIPT_P3)])
+        _run("Retraining Phase 3 models…",   [sys.executable, str(TRAIN_PHASE3)])
+        _run("Running forecast…",            [sys.executable, str(FORECAST_SCRIPT_P3)])
 
-    if errors:
-        for e in errors:
-            st.sidebar.error(e)
-    else:
-        st.sidebar.success("Pipeline complete.")
+        if errors:
+            for e in errors:
+                st.sidebar.error(e)
+        else:
+            st.sidebar.success("Pipeline complete.")
 
-    st.cache_data.clear()
-    st.rerun()
+        st.cache_data.clear()
+        st.rerun()
 
-st.sidebar.caption(
-    "Fetches prices, weather, generation mix & CPI; "
-    "rebuilds features; retrains model; runs forecast."
-)
+    st.sidebar.caption(
+        "Fetches prices, weather, generation mix & CPI; "
+        "rebuilds features; retrains model; runs forecast."
+    )
 st.sidebar.divider()
 
 min_date = df["settlement_date"].min().date()
