@@ -1,8 +1,8 @@
-pandas==2.3.3
-numpy==2.0.2
-scikit-learn==1.6.1
-streamlit==1.50.0
-plotly==5.24.1
-narwhals>=1.15.1
-requests==2.32.5
-holidays==0.83
+pandas
+numpy
+scikit-learn
+streamlit
+plotly
+narwhals
+requests
+holidays
