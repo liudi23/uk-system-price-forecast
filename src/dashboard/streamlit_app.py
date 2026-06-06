@@ -529,50 +529,103 @@ with col_right:
 # ── Average daily profile ────────────────────────────────────────────────────
 st.subheader("Average Settlement Period Profile (SSP)")
 
-profile = (
-    dff[dff["settlement_period"] <= 48]   # exclude SP49/50 on DST fall-back days
-    .groupby("settlement_period")[["ssp", "time_label"]]
-    .agg({"ssp": "mean", "time_label": "first"})
-    .reset_index()
-    .sort_values("settlement_period")
-)
+col_sp, col_wk = st.columns(2)
 
-# Use integer settlement_period on x-axis (avoids Plotly misinterpreting
-# HH:MM strings as dates, which caused a diagonal fill artifact).
-# Tick labels are formatted as HH:MM every 4 SPs (= every 2 hours).
-_sp_ticks = profile["settlement_period"].tolist()[::4]
-_lb_ticks  = profile["time_label"].tolist()[::4]
+with col_sp:
+    profile = (
+        dff[dff["settlement_period"] <= 48]   # exclude SP49/50 on DST fall-back days
+        .groupby("settlement_period")[["ssp", "time_label"]]
+        .agg({"ssp": "mean", "time_label": "first"})
+        .reset_index()
+        .sort_values("settlement_period")
+    )
 
-fig_profile = go.Figure()
-# Baseline at y=0 so fill is an explicit filled area, not tozeroy
-fig_profile.add_trace(go.Scatter(
-    x=profile["settlement_period"].tolist() + profile["settlement_period"].tolist()[::-1],
-    y=profile["ssp"].tolist() + [0] * len(profile),
-    fill="toself",
-    fillcolor="rgba(31,119,180,0.2)",
-    line=dict(color="rgba(0,0,0,0)"),
-    hoverinfo="skip",
-    showlegend=False,
-))
-fig_profile.add_trace(go.Scatter(
-    x=profile["settlement_period"], y=profile["ssp"],
-    name="Avg SSP",
-    line=dict(color="#1f77b4", width=2),
-    hovertemplate="SP %{x}  %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
-    customdata=profile["time_label"],
-))
-fig_profile.update_layout(
-    xaxis=dict(
-        tickmode="array", tickvals=_sp_ticks, ticktext=_lb_ticks,
-        title="Time of Day (HH:MM)",
-    ),
-    yaxis=dict(title="£/MWh", rangemode="tozero"),
-    height=320,
-    margin=dict(t=10, b=40),
-    hovermode="x unified",
-    showlegend=False,
-)
-st.plotly_chart(fig_profile, use_container_width=True)
+    # Use integer settlement_period on x-axis (avoids Plotly misinterpreting
+    # HH:MM strings as dates, which caused a diagonal fill artifact).
+    _sp_ticks = profile["settlement_period"].tolist()[::4]
+    _lb_ticks  = profile["time_label"].tolist()[::4]
+
+    fig_profile = go.Figure()
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"].tolist() + profile["settlement_period"].tolist()[::-1],
+        y=profile["ssp"].tolist() + [0] * len(profile),
+        fill="toself",
+        fillcolor="rgba(31,119,180,0.2)",
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=profile["ssp"],
+        name="Avg SSP",
+        line=dict(color="#1f77b4", width=2),
+        hovertemplate="SP %{x}  %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
+        customdata=profile["time_label"],
+    ))
+    fig_profile.update_layout(
+        xaxis=dict(
+            tickmode="array", tickvals=_sp_ticks, ticktext=_lb_ticks,
+            title="Time of Day (HH:MM)",
+        ),
+        yaxis=dict(title="£/MWh", rangemode="tozero"),
+        height=320,
+        margin=dict(t=30, b=40),
+        hovermode="x unified",
+        showlegend=False,
+        title=dict(text="Intra-day profile (selected range)", font=dict(size=13)),
+    )
+    st.plotly_chart(fig_profile, use_container_width=True)
+
+with col_wk:
+    # Week-of-year profile: last 3 years, ISO weeks 1–52, averaged across years
+    _wk_end   = df["settlement_date"].max()
+    _wk_start = _wk_end - pd.Timedelta(days=3 * 365)
+    df_3yr = df[df["settlement_date"] >= _wk_start].copy()
+    df_3yr["week"] = df_3yr["settlement_date"].dt.isocalendar().week.astype(int)
+    df_3yr = df_3yr[df_3yr["week"] <= 52]   # drop rare week-53 partial ISO weeks
+
+    week_profile = (
+        df_3yr.groupby("week")["ssp"]
+        .mean()
+        .reset_index()
+        .sort_values("week")
+    )
+
+    fig_week = go.Figure()
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"].tolist() + week_profile["week"].tolist()[::-1],
+        y=week_profile["ssp"].tolist() + [0] * len(week_profile),
+        fill="toself",
+        fillcolor="rgba(42,157,143,0.2)",
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=week_profile["ssp"],
+        name="Avg SSP",
+        line=dict(color="#2a9d8f", width=2),
+        hovertemplate="Week %{x}<br>£%{y:.2f}/MWh<extra></extra>",
+    ))
+    # Season band annotations
+    for x0, x1, label in [(1, 13, "Winter"), (14, 26, "Spring"),
+                           (27, 39, "Summer"), (40, 52, "Autumn")]:
+        fig_week.add_vrect(x0=x0, x1=x1, fillcolor="rgba(0,0,0,0.03)",
+                           layer="below", line_width=0,
+                           annotation_text=label, annotation_position="top left",
+                           annotation_font_size=9, annotation_font_color="#888")
+    fig_week.update_layout(
+        xaxis=dict(title="ISO Week of Year", tickmode="array",
+                   tickvals=list(range(1, 53, 4)),
+                   ticktext=[str(w) for w in range(1, 53, 4)]),
+        yaxis=dict(title="£/MWh", rangemode="tozero"),
+        height=320,
+        margin=dict(t=30, b=40),
+        hovermode="x unified",
+        showlegend=False,
+        title=dict(text="Seasonal profile (last 3 years, weeks averaged)", font=dict(size=13)),
+    )
+    st.plotly_chart(fig_week, use_container_width=True)
 
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
