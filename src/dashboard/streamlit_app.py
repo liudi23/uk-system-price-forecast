@@ -4,12 +4,7 @@ Data source: Elexon BMRS — data/raw/system_prices.csv
 Run: streamlit run src/dashboard/streamlit_app.py
 """
 
-import os
-import subprocess
-import sys
 from pathlib import Path
-
-IS_CLOUD = os.environ.get("STREAMLIT_SHARING_MODE") == "streamlit_sharing"
 
 import pandas as pd
 import plotly.express as px
@@ -76,47 +71,8 @@ def load_p3_metrics() -> dict:
 st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
-st.sidebar.subheader("Data & Forecast")
-if IS_CLOUD:
-    st.sidebar.info("Forecasts updated daily — no refresh needed.")
-else:
-    if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
-        errors = []
-
-        def _run(label, cmd):
-            with st.spinner(label):
-                r = subprocess.run(cmd, capture_output=True)
-                if r.returncode != 0:
-                    errors.append(f"{label}: {r.stderr.decode()[-300:]}")
-
-        _run("Fetching Elexon prices…",
-             [sys.executable, str(ROOT / "src" / "data" / "fetch_elexon.py"), "--append"])
-        _run("Fetching weather…",            [sys.executable, str(FETCH_WEATHER)])
-        _run("Fetching generation mix…",     [sys.executable, str(FETCH_GENERATION), "--append"])
-        _run("Fetching UK CPI inflation…",   [sys.executable, str(FETCH_CPI)])
-
-        # Extend dataset_5yr.csv with new rows (safe append — never overwrites history)
-        _run("Extending dataset…",           [sys.executable, str(EXTEND_DATASET)])
-        _run("Rebuilding features…",         [sys.executable, str(BUILD_FEATURES),
-                                              "--input",  str(DATASET_5YR),
-                                              "--output", str(FEATURES_5YR)])
-
-        _run("Retraining Phase 3 models…",   [sys.executable, str(TRAIN_PHASE3)])
-        _run("Running forecast…",            [sys.executable, str(FORECAST_SCRIPT_P3)])
-
-        if errors:
-            for e in errors:
-                st.sidebar.error(e)
-        else:
-            st.sidebar.success("Pipeline complete.")
-
-        st.cache_data.clear()
-        st.rerun()
-
-    st.sidebar.caption(
-        "Fetches prices, weather, generation mix & CPI; "
-        "rebuilds features; retrains model; runs forecast."
-    )
+_latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
+st.sidebar.caption(f"📅 Latest data: **{_latest_date}**\n\nPipeline runs automatically at 12:30 UTC daily after Elexon publishes settlement prices.")
 st.sidebar.divider()
 
 min_date = df["settlement_date"].min().date()
@@ -250,8 +206,7 @@ if _fc_path.exists():
 
 else:
     st.info(
-        "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
-        "or run `python src/models/forecast_phase3.py`."
+        "No forecast found. Run `python src/models/forecast_phase3.py` to generate one."
     )
 
 # ── H+2 forecast panel (tomorrow) ────────────────────────────────────────────
@@ -296,7 +251,7 @@ st.divider()
 st.subheader("Live Forecast Verification")
 st.caption(
     "Compares each archived day-ahead forecast against the Elexon actuals once they are available. "
-    "Click **Refresh Data & Run Forecast** in the sidebar to pull the latest prices."
+    "Forecast is generated automatically each day at 12:30 UTC."
 )
 
 archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []

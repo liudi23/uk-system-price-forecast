@@ -1,0 +1,85 @@
+name: Daily Forecast Pipeline
+
+on:
+  schedule:
+    # 12:30 UTC daily — Elexon Initial Settlement (D+1) is published by ~12:00 UTC
+    - cron: '30 12 * * *'
+  workflow_dispatch:  # allow manual trigger from GitHub Actions UI
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to push updated forecast files back to repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install pipeline dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      - name: Fetch latest Elexon prices
+        run: python src/data/fetch_elexon.py --append
+
+      - name: Fetch latest weather
+        run: python src/data/fetch_weather.py
+
+      - name: Fetch generation mix
+        run: python src/data/fetch_generation.py --append
+
+      - name: Fetch CPI index
+        run: python src/data/fetch_cpi.py
+
+      - name: Extend dataset
+        run: python src/data/extend_dataset.py
+
+      - name: Rebuild features
+        run: |
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_5yr.csv
+
+      - name: Retrain Phase 3 models
+        run: python src/models/train_phase3.py
+
+      - name: Run H+1 and H+2 forecast
+        run: python src/models/forecast_phase3.py
+
+      - name: Commit and push updated forecasts
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/processed/dataset_5yr.csv \
+                  model_assets/next_day_forecast_phase3.csv \
+                  model_assets/day2_forecast_phase3.csv \
+                  model_assets/phase3_metrics.json \
+                  model_assets/test_predictions_phase3.csv \
+                  model_assets/phase3_level_importance.csv \
+                  model_assets/phase3_shape_importance.csv \
+                  model_assets/level_q10.pkl \
+                  model_assets/level_q50.pkl \
+                  model_assets/level_q90.pkl \
+                  model_assets/shape_q50.pkl \
+                  model_assets/shape_h2_q50.pkl \
+                  model_assets/neg_day_classifier.pkl \
+                  "model_assets/forecasts/"
+          # Only commit if there are actual changes
+          git diff --staged --quiet || \
+            git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" && \
+            git push
