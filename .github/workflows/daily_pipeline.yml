@@ -1,0 +1,120 @@
+name: Daily Forecast Pipeline
+
+on:
+  schedule:
+    # 12:30 UTC daily — Elexon Initial Settlement (D+1) is published by ~12:00 UTC
+    - cron: '30 12 * * *'
+  workflow_dispatch:  # manual trigger from GitHub Actions UI
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to push updated forecast files back to repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install pipeline dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # Cache raw data by ISO week — full history re-fetch once a week,
+      # incremental append on the remaining 6 days.
+      - name: Get ISO week for cache key
+        id: date
+        run: echo "week=$(date -u +%Y-W%V)" >> $GITHUB_OUTPUT
+
+      - name: Restore raw data cache
+        uses: actions/cache@v4
+        id: data-cache
+        with:
+          path: data/raw/
+          key: raw-data-${{ steps.date.outputs.week }}
+          restore-keys: raw-data-
+
+      # ── Full history fetch (cache miss = first run this week) ──────────────
+      - name: Fetch 3-year price history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_elexon.py --start 2021-01-01
+
+      - name: Fetch 3-year weather history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_weather.py --start 2021-01-01
+
+      - name: Fetch 3-year generation mix history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_generation.py --start 2021-01-01
+
+      # ── Incremental update (cache hit = data already exists) ──────────────
+      - name: Append latest prices
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_elexon.py --append
+
+      - name: Update recent weather
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_weather.py --start $(date -u -d '7 days ago' +%Y-%m-%d)
+
+      - name: Append latest generation mix
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_generation.py --append
+
+      # ── Always fetch CPI (small monthly dataset) ──────────────────────────
+      - name: Fetch CPI index
+        run: python src/data/fetch_cpi.py
+
+      # ── Build features and train ───────────────────────────────────────────
+      - name: Extend processed dataset
+        run: python src/data/extend_dataset.py
+
+      - name: Rebuild features
+        run: |
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_5yr.csv
+
+      - name: Retrain Phase 3 models
+        run: python src/models/train_phase3.py
+
+      - name: Run H+1 and H+2 forecast
+        run: python src/models/forecast_phase3.py
+
+      # ── Commit small outputs back to repo ─────────────────────────────────
+      # dataset_5yr.csv is gitignored but force-added here so Streamlit Cloud
+      # can serve the historical analytics panel without raw data in the repo.
+      - name: Commit and push forecast outputs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/processed/dataset_5yr.csv
+          git add    model_assets/next_day_forecast_phase3.csv \
+                     model_assets/day2_forecast_phase3.csv \
+                     model_assets/phase3_metrics.json \
+                     model_assets/test_predictions_phase3.csv \
+                     model_assets/phase3_level_importance.csv \
+                     model_assets/phase3_shape_importance.csv \
+                     model_assets/level_q10.pkl \
+                     model_assets/level_q50.pkl \
+                     model_assets/level_q90.pkl \
+                     model_assets/shape_q50.pkl \
+                     model_assets/shape_h2_q50.pkl \
+                     model_assets/neg_day_classifier.pkl \
+                     "model_assets/forecasts/"
+          git diff --staged --quiet || \
+            git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" && \
+            git push
