@@ -41,7 +41,7 @@ st.set_page_config(
 )
 
 
-@st.cache_data
+@st.cache_data(ttl=7200)
 def load_data() -> pd.DataFrame:
     df = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
     df["settlement_period"] = df["settlement_period"].astype(int)
@@ -58,7 +58,7 @@ def load_data() -> pd.DataFrame:
 df = load_data()
 
 
-@st.cache_data
+@st.cache_data(ttl=7200)
 def load_p3_metrics() -> dict:
     import json
     if METRICS_P3.exists():
@@ -818,7 +818,7 @@ st.caption(
 )
 
 
-@st.cache_data
+@st.cache_data(ttl=7200)
 def load_phase3_importances():
     import json
     if not (LEVEL_IMP_CSV.exists() and SHAPE_IMP_CSV.exists()):
