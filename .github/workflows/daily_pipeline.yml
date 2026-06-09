@@ -17,6 +17,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: phase-3   # code lives here until PR is merged to main
           fetch-depth: 1
 
       - name: Set up Python 3.11
