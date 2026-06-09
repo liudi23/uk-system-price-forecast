@@ -80,7 +80,14 @@ jobs:
         run: python src/data/fetch_cpi.py
 
       # ── Build features and train ───────────────────────────────────────────
-      - name: Extend processed dataset
+      # Cache miss: dataset_5yr.csv doesn't exist yet — build from scratch.
+      # Cache hit: file was already created by a prior run — append new rows only.
+      - name: Build processed dataset from scratch
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/build_dataset.py --out data/processed/dataset_5yr.csv
+
+      - name: Extend processed dataset (incremental)
+        if: steps.data-cache.outputs.cache-hit == 'true'
         run: python src/data/extend_dataset.py
 
       - name: Rebuild features
