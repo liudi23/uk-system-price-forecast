@@ -57,6 +57,8 @@ Includes Jun 3–4 extreme renewable oversupply event (−£70 midday prices, 10
 | Phase 2 recursive HGBR | 25.40 | 32.36 | 27.4% | 7-day holdout |
 | **Phase 3 H+1 (current)** | **31.61** | **41.63** | **37.8%** | **7-day holdout** |
 
+**Why naive baselines are the right benchmark.** The naive lag-48 model predicts each half-hour slot tomorrow using the same slot's actual price today (`forecast[SP, D] = actual[SP, D−1]`). Seasonal naive lag-336 does the same using the same slot one week ago, additionally capturing the weekday/weekend demand pattern. These are hard to beat because strong intraday and day-to-day autocorrelation is a genuine feature of electricity markets — any model that fails to outperform them is merely rediscovering the lag structure. Beating the seasonal naive on a 119-day walk-forward (£27.39 vs £29.40) with honest out-of-sample evaluation confirms the model extracts signal beyond simple repetition.
+
 > The 7-day test window includes the Jun 4 extreme event (daily mean £36.8, −£70 midday). Excluding Jun 3–4, the model performs in line with the seasonal walk-forward average (£25–27).
 
 ### Seasonal walk-forward CV (119 days · 4 folds)
