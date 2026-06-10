@@ -218,8 +218,12 @@ __marimo__/
 .streamlit/secrets.toml
 .DS_Store
 
-# Large generated files — regenerate with build_features.py
-data/processed/features_5yr.csv
+# Generated data and model files — tracked only on streamlit-data branch via CI
+data/raw/*.csv
+data/processed/*.csv
+model_assets/*.csv
+model_assets/*.pkl
+model_assets/forecasts/
 
 # Raw data — fetched from public APIs at runtime (Elexon, Open-Meteo, Carbon Intensity, ONS)
 data/raw/system_prices.csv
