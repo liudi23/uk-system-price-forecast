@@ -110,11 +110,10 @@ def fetch_uk_weather(start: str, end: str) -> pd.DataFrame:
 def _last_date_in_csv(path: Path):
     if not path.exists():
         return None
-    df = pd.read_csv(path, usecols=["datetime_utc"], nrows=1, skipfooter=0)
+    df = pd.read_csv(path, usecols=["datetime_utc"])
     if df.empty:
         return None
-    full = pd.read_csv(path, usecols=["datetime_utc"])
-    return pd.to_datetime(full["datetime_utc"]).max().date()
+    return pd.to_datetime(df["datetime_utc"]).max().date()
 
 
 def main() -> None:
