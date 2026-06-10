@@ -612,6 +612,13 @@ with col_wk:
         hovertemplate="Week %{x}<br>P code: %{y:.0f}%<extra></extra>",
         yaxis="y2",
     ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=100 - week_profile["pct_P"],
+        name="% N code",
+        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+        hovertemplate="Week %{x}<br>N code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
     # Season band annotations
     for x0, x1, label in [(1, 13, "Winter"), (14, 26, "Spring"),
                            (27, 39, "Summer"), (40, 52, "Autumn")]:
