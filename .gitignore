@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.DS_Store
+
+# Generated data and model files — tracked only on streamlit-data branch via CI
+data/raw/*.csv
+data/processed/*.csv
+model_assets/*.csv
+model_assets/*.pkl
+model_assets/forecasts/
