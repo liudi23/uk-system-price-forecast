@@ -132,8 +132,7 @@ st.info(
 # ── Next-day forecast panel ───────────────────────────────────────────────────
 st.subheader("Day-Ahead Forecast (Phase 3 Level-Shape · P10 / P50 / P90 · 48 Settlement Periods)")
 
-# Prefer Phase 3 forecast; fall back to Phase 2 if not yet generated
-_fc_path = FORECAST_PATH_P3 if FORECAST_PATH_P3.exists() else FORECAST_PATH
+_fc_path = FORECAST_PATH_P3
 
 if _fc_path.exists():
     fc = pd.read_csv(_fc_path, parse_dates=["settlement_datetime"])
