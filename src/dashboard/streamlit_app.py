@@ -490,13 +490,21 @@ st.subheader("Average Settlement Period Profile (SSP)")
 col_sp, col_wk = st.columns(2)
 
 with col_sp:
+    _sp_dff = dff[dff["settlement_period"] <= 48]
     profile = (
-        dff[dff["settlement_period"] <= 48]   # exclude SP49/50 on DST fall-back days
+        _sp_dff
         .groupby("settlement_period")[["ssp", "time_label"]]
         .agg({"ssp": "mean", "time_label": "first"})
         .reset_index()
         .sort_values("settlement_period")
     )
+    pn_profile = (
+        _sp_dff.groupby("settlement_period")["price_derivation_code"]
+        .apply(lambda x: (x == "P").mean() * 100)
+        .reset_index()
+        .rename(columns={"price_derivation_code": "pct_P"})
+    )
+    profile = profile.merge(pn_profile, on="settlement_period")
 
     # Use integer settlement_period on x-axis (avoids Plotly misinterpreting
     # HH:MM strings as dates, which caused a diagonal fill artifact).
@@ -504,6 +512,7 @@ with col_sp:
     _lb_ticks  = profile["time_label"].tolist()[::4]
 
     fig_profile = go.Figure()
+    # SSP fill + line (left y-axis)
     fig_profile.add_trace(go.Scatter(
         x=profile["settlement_period"].tolist() + profile["settlement_period"].tolist()[::-1],
         y=profile["ssp"].tolist() + [0] * len(profile),
@@ -512,13 +521,30 @@ with col_sp:
         line=dict(color="rgba(0,0,0,0)"),
         hoverinfo="skip",
         showlegend=False,
+        yaxis="y1",
     ))
     fig_profile.add_trace(go.Scatter(
         x=profile["settlement_period"], y=profile["ssp"],
         name="Avg SSP",
         line=dict(color="#1f77b4", width=2),
-        hovertemplate="SP %{x}  %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
+        hovertemplate="SP %{x}  %{customdata}<br>SSP £%{y:.2f}/MWh<extra></extra>",
         customdata=profile["time_label"],
+        yaxis="y1",
+    ))
+    # % P code (right y-axis)
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=profile["pct_P"],
+        name="% P code",
+        line=dict(color="#d62728", width=1.5, dash="dot"),
+        hovertemplate="SP %{x}<br>P code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=100 - profile["pct_P"],
+        name="% N code",
+        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+        hovertemplate="SP %{x}<br>N code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
     ))
     fig_profile.update_layout(
         xaxis=dict(
@@ -526,10 +552,16 @@ with col_sp:
             title="Time of Day (HH:MM)",
         ),
         yaxis=dict(title="£/MWh", rangemode="tozero"),
+        yaxis2=dict(
+            title="% of periods",
+            overlaying="y", side="right",
+            range=[0, 100], ticksuffix="%",
+            showgrid=False,
+        ),
         height=320,
         margin=dict(t=30, b=40),
         hovermode="x unified",
-        showlegend=False,
+        legend=dict(orientation="h", y=1.08, x=0),
         title=dict(text="Intra-day profile (selected range)", font=dict(size=13)),
     )
     st.plotly_chart(fig_profile)
