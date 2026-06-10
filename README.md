@@ -29,6 +29,8 @@ An end-to-end data science project for forecasting UK electricity system prices 
 
 Test period: 7 days (May 11–17 2026), 336 settlement periods.
 
+**Why naive baselines are the right benchmark.** The naive lag-48 model predicts each half-hour slot tomorrow using the same slot's actual price today (`forecast[SP, D] = actual[SP, D−1]`). Seasonal naive lag-336 does the same using the same slot one week ago, additionally capturing the weekday/weekend demand pattern. These are hard to beat because strong intraday and day-to-day autocorrelation is a genuine feature of electricity markets — any model that fails to outperform them is merely rediscovering the lag structure. Beating the seasonal naive (£25.9 vs £29.40) with honest recursive evaluation confirms the model extracts signal beyond simple repetition.
+
 > **Evaluation note:** batch prediction on pre-computed features is misleading for day-ahead forecasting because `ssp_lag_1` (the single most important feature, importance = 22.0) references the actual price from the previous 30-minute period — information that does not exist when the forecast is generated. The correct evaluation simulates the deployment loop: for each test day, short-lag features (`ssp_lag_1/2`, `ssp_roll_*_6`, `niv_lag_1`) are filled recursively from running model predictions, matching exactly how `forecast.py` runs. This reduces the apparent MAE gap between test and live performance.
 
 Top features by permutation importance: `ssp_lag_1` (21.9), `net_imbalance_volume_lag_1` (1.7), `ssp_lag_2` (0.33), `sin_sp`/`cos_sp` (intra-day cycle), `solar_wm2_lag_1`, `wind_ms_lag_1`.
