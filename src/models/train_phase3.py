@@ -149,9 +149,11 @@ def load_sp_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["settlement_datetime"])
     df = df.sort_values("settlement_datetime").reset_index(drop=True)
     # Drop rows where CORE lag features (ssp/niv) are NaN (warm-up period).
-    # Wind/gas lag features are optional — HGBR handles missing values natively,
-    # so we do not drop rows just because generation data has gaps.
-    _optional = {"wind_pct_", "gas_pct_", "cpi_"}
+    # Weather, wind/gas, and CPI lag features are optional — HGBR handles missing
+    # values natively, so rows are only dropped for price/NIV warm-up (lag ≤ 336).
+    _optional = {"wind_pct_", "gas_pct_", "cpi_",
+                 "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+                 "heating_", "cooling_"}
     core_lag_cols = [c for c in df.columns
                      if ("_lag_" in c or "_roll_" in c or "_diff_" in c)
                      and not any(c.startswith(p) for p in _optional)]
@@ -182,9 +184,11 @@ def split_daily(daily: pd.DataFrame, test_days: int, val_days: int,
     test_cut    = d_max - pd.Timedelta(days=test_days)
     val_cut     = test_cut - pd.Timedelta(days=val_days)
     train_start = d_max - pd.Timedelta(days=train_years * 365)
-    # Drop rows with NaN in core daily features (lag warm-up); wind/gas optional
+    # Drop rows with NaN in core daily features (lag warm-up); weather/wind/gas optional
     feat_cols = get_level_feature_cols(daily)
-    _opt = {"wind_pct_", "gas_pct_", "cpi_"}
+    _opt = {"wind_pct_", "gas_pct_", "cpi_",
+            "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+            "heating_", "cooling_"}
     core_feat = [c for c in feat_cols
                  if not any(c.startswith(p) for p in _opt)]
     daily_clean = daily[daily[core_feat].notna().all(axis=1)].reset_index(drop=True)
@@ -551,7 +555,9 @@ def _split_at(sp_df, daily_df, fold_start, val_days):
                      (sp_df["settlement_datetime"] <= cutoff)]
 
     feat_cols = get_level_feature_cols(daily_df)
-    _opt = {"wind_pct_", "gas_pct_", "cpi_"}
+    _opt = {"wind_pct_", "gas_pct_", "cpi_",
+            "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+            "heating_", "cooling_"}
     core_feat = [c for c in feat_cols
                  if not any(c.startswith(p) for p in _opt)]
     daily_clean = daily_df[daily_df[core_feat].notna().all(axis=1)].reset_index(drop=True)

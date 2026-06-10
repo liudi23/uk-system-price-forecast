@@ -34,8 +34,9 @@ COOLING_BASE = 22.0
 
 
 def load_weather(path: Path = WEATHER_FILE) -> pd.DataFrame:
-    df = pd.read_csv(path, parse_dates=["datetime_utc"])
-    df["datetime_utc"] = df["datetime_utc"].dt.tz_localize(None)  # strip tz for merge
+    df = pd.read_csv(path)
+    # parse as UTC then strip tz — works whether CSV has "+00:00" suffix or not
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True).dt.tz_convert(None)
     return df.sort_values("datetime_utc").reset_index(drop=True)
 
 
