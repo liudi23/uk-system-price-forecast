@@ -4,6 +4,10 @@ Two-day-ahead forecasting of UK electricity System Sell Price (SSP) at 30-minute
 
 **Phase 3 — Level-Shape Decomposition · H+1 and H+2 forecasts · June 2026**
 
+**[Live dashboard →](https://uk-system-price-forecast.streamlit.app/)**
+
+![UK SSP Dashboard](demo/uk-ssp-streamlit.png)
+
 ---
 
 ## Architecture
@@ -145,6 +149,7 @@ reports/
 demo/
   demo_phase3.py             Four-panel demonstration figure
   phase3_demo.png
+  uk-ssp-streamlit.png       Dashboard screenshot (page 1 — forecast view)
 
 Project_Brief/
   phase-3-summary.md         Architecture and seasonal analysis
