@@ -580,6 +580,14 @@ with col_wk:
         .reset_index()
         .sort_values("week")
     )
+    pn_week_profile = (
+        df_3yr[df_3yr["settlement_period"] <= 48]
+        .groupby("week")["price_derivation_code"]
+        .apply(lambda x: (x == "P").mean() * 100)
+        .reset_index()
+        .rename(columns={"price_derivation_code": "pct_P"})
+    )
+    week_profile = week_profile.merge(pn_week_profile, on="week")
 
     fig_week = go.Figure()
     fig_week.add_trace(go.Scatter(
@@ -597,6 +605,13 @@ with col_wk:
         line=dict(color="#2a9d8f", width=2),
         hovertemplate="Week %{x}<br>£%{y:.2f}/MWh<extra></extra>",
     ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=week_profile["pct_P"],
+        name="% P code",
+        line=dict(color="#d62728", width=1.5, dash="dot"),
+        hovertemplate="Week %{x}<br>P code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
     # Season band annotations
     for x0, x1, label in [(1, 13, "Winter"), (14, 26, "Spring"),
                            (27, 39, "Summer"), (40, 52, "Autumn")]:
@@ -609,10 +624,16 @@ with col_wk:
                    tickvals=list(range(1, 53, 4)),
                    ticktext=[str(w) for w in range(1, 53, 4)]),
         yaxis=dict(title="£/MWh", rangemode="tozero"),
+        yaxis2=dict(
+            title="% of periods",
+            overlaying="y", side="right",
+            range=[0, 100], ticksuffix="%",
+            showgrid=False,
+        ),
         height=320,
         margin=dict(t=30, b=40),
         hovermode="x unified",
-        showlegend=False,
+        legend=dict(orientation="h", y=1.08, x=0),
         title=dict(text="Seasonal profile (last 3 years, weeks averaged)", font=dict(size=13)),
     )
     st.plotly_chart(fig_week)
