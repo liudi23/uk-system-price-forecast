@@ -377,6 +377,13 @@ def train_neg_day_classifier(train_daily: pd.DataFrame, val_daily: pd.DataFrame)
     X    = combined.loc[mask, avail].values
     y    = (combined.loc[mask, "neg_sp_daily_count"] >= NEG_THRESHOLD).astype(int).values
 
+    if len(y) == 0:
+        for col in avail:
+            log.warning("  %s: %d NaN / %d rows", col,
+                        combined[col].isna().sum(), len(combined))
+        log.warning("Neg-day classifier: 0 samples after NaN filter — skipping")
+        return None
+
     pos_frac = y.mean()
     log.info("Neg-day classifier: %d samples, %.1f%% positive (≥%d neg SPs)",
              len(y), 100 * pos_frac, NEG_THRESHOLD)
