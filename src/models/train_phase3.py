@@ -326,6 +326,8 @@ def build_shape_data_h2(sp_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataF
 def train_level_models(train_daily, val_daily, feat_cols):
     """Train P10/P50/P90 quantile HGBR on daily SSP mean (CPI-deflated to real terms)."""
     combined = pd.concat([train_daily, val_daily], ignore_index=True)
+    # Drop all-NaN columns — sklearn 1.9+ crashes on zero-distinct-value features
+    feat_cols = [c for c in feat_cols if combined[c].notna().any()]
     X = combined[feat_cols].values
     # Apply CPI deflator so model trains on real (current-money) prices
     deflator = combined["cpi_deflator"].values if "cpi_deflator" in combined.columns else 1.0
@@ -409,6 +411,8 @@ def train_neg_day_classifier(train_daily: pd.DataFrame, val_daily: pd.DataFrame)
 def train_shape_model(train_sp, val_sp, feat_cols):
     """Train P50 HGBR on intra-day shape deviations (CPI-deflated to real terms)."""
     combined = pd.concat([train_sp, val_sp], ignore_index=True)
+    # Drop all-NaN columns before mask so they don't eliminate every row
+    feat_cols = [c for c in feat_cols if combined[c].notna().any()]
     mask     = combined["ssp_shape_target"].notna() & combined[feat_cols].notna().all(axis=1)
     combined = combined[mask]
     X        = combined[feat_cols].values
@@ -737,6 +741,13 @@ def main():
             level_feat_cols = level_feat_cols + ["neg_price_risk_prob"]
             log.info("  Added neg_price_risk_prob to level features (%d total)", len(level_feat_cols))
 
+    # Drop all-NaN columns from feature lists so saved JSONs match trained models
+    _lvl_comb = pd.concat([daily_train, daily_val], ignore_index=True)
+    level_feat_cols = [c for c in level_feat_cols if _lvl_comb[c].notna().any()]
+
+    _shp_comb = pd.concat([shape_sp_train, shape_sp_val], ignore_index=True)
+    shape_feat_cols = [c for c in shape_feat_cols if _shp_comb[c].notna().any()]
+
     log.info("Training level models (P10/P50/P90) on daily SSP mean …")
     level_models = train_level_models(daily_train, daily_val, level_feat_cols)
 
@@ -750,6 +761,8 @@ def main():
     shape_h2_val   = build_shape_data_h2(sp_val,   daily_df)
     shape_h2_test  = build_shape_data_h2(sp_test,  daily_df)
     shape_h2_feat_cols = get_shape_feature_cols_h2(shape_h2_all)
+    _shp_h2_comb = pd.concat([shape_h2_train, shape_h2_val], ignore_index=True)
+    shape_h2_feat_cols = [c for c in shape_h2_feat_cols if _shp_h2_comb[c].notna().any()]
     log.info("H+2 shape features: %d", len(shape_h2_feat_cols))
     log.info("Training H+2 shape model (P50) …")
     shape_h2_model = train_shape_model(shape_h2_train, shape_h2_val, shape_h2_feat_cols)

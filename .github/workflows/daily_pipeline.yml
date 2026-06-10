@@ -68,7 +68,7 @@ jobs:
 
       - name: Update recent weather
         if: steps.data-cache.outputs.cache-hit == 'true'
-        run: python src/data/fetch_weather.py --start $(date -u -d '7 days ago' +%Y-%m-%d)
+        run: python src/data/fetch_weather.py --append
 
       - name: Append latest generation mix
         if: steps.data-cache.outputs.cache-hit == 'true'
