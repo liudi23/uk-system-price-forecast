@@ -40,6 +40,9 @@ st.set_page_config(
     layout="wide",
 )
 
+# Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
+_LAST_PIPELINE_RUN = "2026-06-10"
+
 
 @st.cache_data(ttl=7200)
 def load_data() -> pd.DataFrame:

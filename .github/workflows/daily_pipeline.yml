@@ -101,6 +101,11 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Touch streamlit_app.py so Streamlit Cloud redeploys (it only triggers on .py changes)
+          TODAY=$(date -u +%Y-%m-%d)
+          sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
+            src/dashboard/streamlit_app.py
+          git add src/dashboard/streamlit_app.py
           git add -f data/processed/dataset_5yr.csv
           git add    model_assets/next_day_forecast_phase3.csv \
                      model_assets/day2_forecast_phase3.csv \
