@@ -323,6 +323,24 @@ else:
 
         # Actual vs predicted time series
         fig_v = go.Figure()
+        _has_quantiles = "ssp_q10" in merged.columns and "ssp_q90" in merged.columns
+        if _has_quantiles:
+            fig_v.add_trace(go.Scatter(
+                x=merged["settlement_datetime"], y=merged["ssp_q90"],
+                name="P90", line=dict(color="rgba(0,0,0,0)"),
+                hovertemplate="SP %{customdata}<br>P90 £%{y:.2f}<extra></extra>",
+                customdata=merged["settlement_period"],
+                showlegend=False,
+            ))
+            fig_v.add_trace(go.Scatter(
+                x=merged["settlement_datetime"], y=merged["ssp_q10"],
+                name="P10–P90 band",
+                fill="tonexty",
+                fillcolor="rgba(255,127,14,0.15)",
+                line=dict(color="rgba(0,0,0,0)"),
+                hovertemplate="SP %{customdata}<br>P10 £%{y:.2f}<extra></extra>",
+                customdata=merged["settlement_period"],
+            ))
         fig_v.add_trace(go.Scatter(
             x=merged["settlement_datetime"], y=merged["ssp_actual"],
             name="Actual SSP", line=dict(color="#1f77b4", width=2),
@@ -331,7 +349,7 @@ else:
         ))
         fig_v.add_trace(go.Scatter(
             x=merged["settlement_datetime"], y=merged["ssp_predicted"],
-            name="Forecast SSP", line=dict(color="#ff7f0e", width=2, dash="dot"),
+            name="Forecast P50", line=dict(color="#ff7f0e", width=2, dash="dot"),
             hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}<extra></extra>",
             customdata=merged["settlement_period"],
         ))
