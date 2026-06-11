@@ -54,7 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "features"))
 
 from evaluate import metrics, print_report, save_metrics
-from level_features import LEVEL_TARGET, build_level_dataset, get_level_feature_cols
+from level_features import (LEVEL_TARGET, build_level_dataset, get_level_feature_cols,
+                            compute_intraday_features)
 
 FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
 ASSETS_DIR    = Path(__file__).resolve().parents[2] / "model_assets"
@@ -686,8 +687,14 @@ def main():
     # ── Build daily level dataset ─────────────────────────────────────────
     log.info("Building daily level dataset …")
     daily_df = build_level_dataset(sp_df)
+    # Merge intraday realized features (SP1-25 partial-day actuals, consistent
+    # with what is available at 12:30 UTC inference time on each historical day)
+    intraday_daily = compute_intraday_features(sp_df)
+    daily_df = daily_df.merge(intraday_daily, on="date", how="left")
     level_feat_cols = get_level_feature_cols(daily_df)
-    log.info("Level features: %d", len(level_feat_cols))
+    log.info("Level features: %d  (includes %d intraday realized)",
+             len(level_feat_cols),
+             sum(c.startswith("intraday_") for c in level_feat_cols))
 
     # ── Walk-forward mode: retrain per fold, do not overwrite production models
     if args.walk_forward:

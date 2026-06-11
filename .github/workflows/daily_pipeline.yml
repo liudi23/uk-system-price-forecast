@@ -78,6 +78,12 @@ jobs:
       - name: Fetch CPI index
         run: python src/data/fetch_cpi.py
 
+      # ── Fetch today's partial settlement data (SP1-25, near real-time) ────
+      # Used as intraday realized features in the level model — provides a
+      # strong partial-day anchor for the daily mean prediction.
+      - name: Fetch today's intraday prices
+        run: python src/data/fetch_intraday.py
+
       # ── Build features and train ───────────────────────────────────────────
       - name: Extend processed dataset
         run: python src/data/extend_dataset.py

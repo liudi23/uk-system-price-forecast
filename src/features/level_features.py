@@ -197,3 +197,42 @@ def get_level_feature_cols(daily: pd.DataFrame) -> list:
     """Return model feature columns for the level model (excludes target and
     contemporaneous day-D aggregates)."""
     return [c for c in daily.columns if c not in _CONTEMPORANEOUS]
+
+
+# ── Intraday realized features ────────────────────────────────────────────────
+# SP1–INTRADAY_CUTOFF_SP are Initial Settlement values settled before 12:00 UTC,
+# safely available when the pipeline runs at 12:30 UTC (13:30 BST).
+INTRADAY_CUTOFF_SP = 25
+
+
+def compute_intraday_features(sp_df: pd.DataFrame,
+                               cutoff_sp: int = INTRADAY_CUTOFF_SP) -> pd.DataFrame:
+    """
+    Compute partial-day realized features from SP-level data.
+
+    Uses SP1 through cutoff_sp of each date — the periods settled before the
+    pipeline runs.  Consistent between training (historical SP data, full 48 SPs
+    available so SP1-25 is always computable) and inference (today's API data).
+
+    Returns a daily DataFrame with intraday_* columns merged by date.
+    """
+    df = sp_df.copy()
+    dt_col = "settlement_datetime" if "settlement_datetime" in df.columns else "settlement_date"
+    df["_date"] = pd.to_datetime(df[dt_col]).dt.date
+    partial = df[df["settlement_period"] <= cutoff_sp].copy()
+
+    raw_col = "ssp_raw" if "ssp_raw" in partial.columns else "ssp"
+    agg: dict = {
+        "intraday_realized_mean":     (raw_col,               "mean"),
+        "intraday_realized_niv_mean": ("net_imbalance_volume", "mean"),
+        "intraday_n_settled":         ("settlement_period",    "count"),
+    }
+    if "price_derivation_code" in partial.columns:
+        partial = partial.copy()
+        partial["_is_P"] = (partial["price_derivation_code"] == "P").astype(float)
+        agg["intraday_pct_P"] = ("_is_P", "mean")
+
+    result = partial.groupby("_date").agg(**agg).reset_index()
+    result = result.rename(columns={"_date": "date"})
+    result["date"] = pd.to_datetime(result["date"])
+    return result

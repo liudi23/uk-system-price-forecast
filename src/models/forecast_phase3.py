@@ -572,6 +572,32 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
 
     # ── Stage 1: predict daily level ─────────────────────────────────────
     lf = build_level_features(daily_hist, target_date, target_weather)
+
+    # Intraday realized features: SP1-25 partial-day actuals from today's API data.
+    # Provides a strong anchor for the level prediction — SP1-25 cover ~52% of the day.
+    _intraday_path = Path(__file__).resolve().parents[2] / "data" / "raw" / "intraday_prices.csv"
+    if _intraday_path.exists():
+        try:
+            _id = pd.read_csv(_intraday_path)
+            _id_today = str(target_date)
+            if "settlement_date" in _id.columns:
+                _id = _id[_id["settlement_date"].astype(str) == _id_today]
+            _id_partial = _id[_id["settlement_period"] <= 25]
+            if not _id_partial.empty:
+                _price_col = "ssp" if "ssp" in _id_partial.columns else "systemSellPrice"
+                lf["intraday_realized_mean"] = float(_id_partial[_price_col].mean())
+                if "net_imbalance_volume" in _id_partial.columns:
+                    lf["intraday_realized_niv_mean"] = float(_id_partial["net_imbalance_volume"].mean())
+                lf["intraday_n_settled"] = len(_id_partial)
+                if "price_derivation_code" in _id_partial.columns:
+                    lf["intraday_pct_P"] = float((_id_partial["price_derivation_code"] == "P").mean())
+                log.info("Intraday features: realized_mean=£%.1f  niv_mean=%.0f  n_settled=%d",
+                         lf["intraday_realized_mean"],
+                         lf.get("intraday_realized_niv_mean", float("nan")),
+                         lf["intraday_n_settled"])
+        except Exception as _e:
+            log.warning("Could not load intraday features: %s", _e)
+
     # Substitute WINDFOR daily mean into level feature wind_pct_daily_mean_lag1d
     if _wf_daily_mean is not None and "wind_pct_daily_mean_lag1d" in level_feat_cols:
         lf["wind_pct_daily_mean_lag1d"] = _wf_daily_mean
