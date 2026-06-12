@@ -100,6 +100,17 @@ jobs:
             --input  data/processed/dataset_5yr.csv \
             --output data/processed/features_5yr.csv
 
+      - name: Save recent features for intraday inference
+        run: |
+          python -c "
+          import pandas as pd
+          df = pd.read_csv('data/processed/features_5yr.csv', parse_dates=['settlement_datetime'])
+          cutoff = df['settlement_datetime'].max() - pd.Timedelta(days=50)
+          recent = df[df['settlement_datetime'] > cutoff]
+          recent.to_csv('data/processed/features_recent.csv', index=False)
+          print(f'features_recent.csv: {len(recent)} rows, {len(recent.columns)} cols')
+          "
+
       - name: Retrain Phase 3 models
         run: python src/models/train_phase3.py
 
@@ -134,6 +145,7 @@ jobs:
 
           mkdir -p /tmp/sd/data/processed /tmp/sd/model_assets/forecasts
           cp data/processed/dataset_5yr.csv /tmp/sd/data/processed/
+          cp data/processed/features_recent.csv /tmp/sd/data/processed/
           cp model_assets/next_day_forecast_phase3.csv \
              model_assets/day2_forecast_phase3.csv \
              model_assets/phase3_metrics.json \
