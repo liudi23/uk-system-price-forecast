@@ -157,6 +157,15 @@ if _fc_path.exists():
     else:
         fm5.metric("Max P50", f"£{fc[p50_col].max():.1f}")
 
+    # Compute the orange/yellow boundary: current UTC time + 2 hours = cutoff SP
+    _now_utc = pd.Timestamp.utcnow().tz_localize(None)
+    _cutoff_sp = min(int((_now_utc.hour * 60 + _now_utc.minute) / 30) + 1 + 4, 48)
+    # Orange = SP 1 … cutoff (confirmed + next 2 h); Yellow = beyond cutoff
+    fc_orange = fc[fc["settlement_period"] <= _cutoff_sp]
+    fc_yellow  = fc[fc["settlement_period"] > _cutoff_sp]
+    # Include shared boundary point so traces connect without a gap
+    _boundary  = fc[fc["settlement_period"] == _cutoff_sp]
+
     fig_fc = go.Figure()
 
     if has_quantiles:
@@ -165,7 +174,7 @@ if _fc_path.exists():
             x=pd.concat([fc["settlement_datetime"], fc["settlement_datetime"].iloc[::-1]]),
             y=pd.concat([fc["ssp_q90"], fc["ssp_q10"].iloc[::-1]]),
             fill="toself",
-            fillcolor="rgba(255,127,14,0.15)",
+            fillcolor="rgba(255,127,14,0.12)",
             line=dict(color="rgba(255,127,14,0)"),
             hoverinfo="skip",
             name="P10–P90 band",
@@ -184,20 +193,44 @@ if _fc_path.exists():
             customdata=fc["settlement_period"],
         ))
 
-    fig_fc.add_trace(go.Scatter(
-        x=fc["settlement_datetime"], y=fc[p50_col],
-        name="P50 forecast", fill="tozeroy" if not has_quantiles else None,
-        line=dict(color="#ff7f0e", width=2.5),
-        hovertemplate="SP %{customdata}<br>P50 £%{y:.2f}<extra></extra>",
-        customdata=fc["settlement_period"],
-    ))
+    # P50 — orange segment (settled / near-term ≤ 2 h ahead)
+    if not fc_orange.empty:
+        fig_fc.add_trace(go.Scatter(
+            x=fc_orange["settlement_datetime"], y=fc_orange[p50_col],
+            name="P50 (near-term)", fill="tozeroy" if not has_quantiles else None,
+            line=dict(color="#e05c00", width=2.5),
+            hovertemplate="SP %{customdata}<br>P50 £%{y:.2f}<extra></extra>",
+            customdata=fc_orange["settlement_period"],
+        ))
+    # P50 — yellow segment (forecast horizon > 2 h ahead)
+    if not fc_yellow.empty:
+        _x_yellow = pd.concat([_boundary["settlement_datetime"], fc_yellow["settlement_datetime"]])
+        _y_yellow = pd.concat([_boundary[p50_col], fc_yellow[p50_col]])
+        _sp_yellow = pd.concat([_boundary["settlement_period"], fc_yellow["settlement_period"]])
+        fig_fc.add_trace(go.Scatter(
+            x=_x_yellow, y=_y_yellow,
+            name="P50 (forecast)", fill="tozeroy" if not has_quantiles else None,
+            line=dict(color="#f5a623", width=2.5),
+            hovertemplate="SP %{customdata}<br>P50 £%{y:.2f}<extra></extra>",
+            customdata=_sp_yellow,
+        ))
+
+    # Vertical dashed line marking the 2-hour-ahead boundary
+    if not fc_orange.empty and not fc_yellow.empty:
+        _boundary_dt = _boundary["settlement_datetime"].iloc[0]
+        fig_fc.add_vline(
+            x=_boundary_dt.value / 1e6,
+            line_dash="dot", line_color="grey", line_width=1,
+            annotation_text="now + 2h", annotation_position="top",
+            annotation_font=dict(size=10, color="grey"),
+        )
 
     fig_fc.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
         height=340, margin=dict(t=10, b=40), hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         annotations=[dict(
-            text=f"Forecast: {fc_label}",
+            text=f"Forecast: {fc_label}  ·  orange = settled/near-term · yellow = forecast horizon",
             xref="paper", yref="paper",
             x=0, y=1.08, showarrow=False,
             font=dict(size=11, color="grey"),
