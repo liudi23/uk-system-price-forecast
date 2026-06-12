@@ -43,9 +43,10 @@ from fetch_bmrs_forecasts import get_wind_pct_forecast
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ASSETS_DIR      = Path(__file__).resolve().parents[2] / "model_assets"
-FEATURES_FILE   = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
-RAW_PRICES_FILE = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
+ASSETS_DIR           = Path(__file__).resolve().parents[2] / "model_assets"
+FEATURES_FILE        = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
+FEATURES_RECENT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_recent.csv"
+RAW_PRICES_FILE      = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
 OUTPUT_FILE     = ASSETS_DIR / "next_day_forecast_phase3.csv"       # H+1: today
 OUTPUT_FILE_H2  = ASSETS_DIR / "day2_forecast_phase3.csv"           # H+2: tomorrow
 
@@ -414,7 +415,7 @@ def build_shape_row_h2(h_idx: int, dt: pd.Timestamp,
 
 # ── Main forecast ─────────────────────────────────────────────────────────────
 
-def run_forecast(target_date: date = None) -> pd.DataFrame:
+def run_forecast(target_date: date = None, features_file: str = None) -> pd.DataFrame:
     # ── Load models ───────────────────────────────────────────────────────
     level_q10 = joblib.load(ASSETS_DIR / "level_q10.pkl")
     level_q50 = joblib.load(ASSETS_DIR / "level_q50.pkl")
@@ -442,8 +443,12 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     upper_fence = fence["upper"]
 
     # ── Load history ──────────────────────────────────────────────────────
-    log.info("Loading feature history …")
-    base = pd.read_csv(FEATURES_FILE, parse_dates=["settlement_datetime"])
+    _features_path = Path(features_file) if features_file else FEATURES_FILE
+    if not _features_path.exists() and FEATURES_RECENT_FILE.exists():
+        log.info("Full features not found — falling back to features_recent.csv")
+        _features_path = FEATURES_RECENT_FILE
+    log.info("Loading feature history from %s …", _features_path.name)
+    base = pd.read_csv(_features_path, parse_dates=["settlement_datetime"])
     base = base.sort_values("settlement_datetime").reset_index(drop=True)
     last_dt = base["settlement_datetime"].max()
 
@@ -795,7 +800,7 @@ def main():
     parser.add_argument("--features", default=str(FEATURES_FILE))
     args = parser.parse_args()
     target = date.fromisoformat(args.date) if args.date else None
-    result = run_forecast(target)
+    result = run_forecast(target, features_file=args.features if args.features != str(FEATURES_FILE) else None)
     print(f"\nPhase 3 forecast for {result['settlement_date'].iloc[0]} "
           f"(daily level P50 = £{result['pred_daily_level'].iloc[0]:.1f}/MWh):")
     print(result[["settlement_datetime", "settlement_period",
