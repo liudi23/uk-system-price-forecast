@@ -45,13 +45,43 @@ jobs:
             echo "features_recent.csv not found — daily pipeline has not run yet, skipping."
           fi
 
+      - name: Refresh features if stale
+        if: steps.check_features.outputs.found == 'true'
+        run: |
+          YESTERDAY=$(python3 -c "from datetime import date, timedelta; print(date.today() - timedelta(days=1))")
+          FEATURES_END=$(python3 -c "
+          import pandas as pd
+          df = pd.read_csv('data/processed/features_recent.csv')
+          col = 'settlement_datetime' if 'settlement_datetime' in df.columns else df.columns[0]
+          print(str(df[col].max())[:10])
+          ")
+          echo "features end: ${FEATURES_END}, yesterday: ${YESTERDAY}"
+          if [ "$FEATURES_END" \< "$YESTERDAY" ]; then
+            echo "features stale (${FEATURES_END}), refreshing through ${YESTERDAY}..."
+            python src/data/fetch_elexon.py --append
+            python src/data/extend_dataset.py
+            python src/features/build_features.py \
+              --input  data/processed/dataset_5yr.csv \
+              --output data/processed/features_5yr.csv
+            python3 -c "
+          import pandas as pd
+          df = pd.read_csv('data/processed/features_5yr.csv', parse_dates=['settlement_datetime'])
+          cutoff = df['settlement_datetime'].max() - pd.Timedelta(days=50)
+          recent = df[df['settlement_datetime'] > cutoff]
+          recent.to_csv('data/processed/features_recent.csv', index=False)
+          print(f'features_recent.csv: {len(recent)} rows, ends {recent[\"settlement_datetime\"].max()}')
+          "
+          else
+            echo "features up to date (${FEATURES_END})"
+          fi
+
       - name: Fetch today's intraday prices
         if: steps.check_features.outputs.found == 'true'
         run: python src/data/fetch_intraday.py
 
       - name: Run H+1 forecast (inference only — no retrain)
         if: steps.check_features.outputs.found == 'true'
-        run: python src/models/forecast_phase3.py --features data/processed/features_recent.csv
+        run: python src/models/forecast_phase3.py --date $(date -u +%Y-%m-%d) --features data/processed/features_recent.csv
 
       - name: Commit and push updated forecast
         if: steps.check_features.outputs.found == 'true'
@@ -63,7 +93,9 @@ jobs:
           sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${NOW}\"/" \
             src/dashboard/streamlit_app.py
           git add src/dashboard/streamlit_app.py \
-                  model_assets/next_day_forecast_phase3.csv
+                  model_assets/next_day_forecast_phase3.csv \
+                  data/processed/features_recent.csv \
+                  data/processed/dataset_5yr.csv
           git diff --staged --quiet || \
             git commit -m "Intraday forecast update ${NOW}" && \
             git push origin streamlit-data
