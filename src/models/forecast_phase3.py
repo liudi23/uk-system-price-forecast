@@ -43,9 +43,10 @@ from fetch_bmrs_forecasts import get_wind_pct_forecast
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ASSETS_DIR      = Path(__file__).resolve().parents[2] / "model_assets"
-FEATURES_FILE   = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
-RAW_PRICES_FILE = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
+ASSETS_DIR           = Path(__file__).resolve().parents[2] / "model_assets"
+FEATURES_FILE        = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
+FEATURES_RECENT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_recent.csv"
+RAW_PRICES_FILE      = Path(__file__).resolve().parents[2] / "data" / "raw" / "system_prices.csv"
 OUTPUT_FILE     = ASSETS_DIR / "next_day_forecast_phase3.csv"       # H+1: today
 OUTPUT_FILE_H2  = ASSETS_DIR / "day2_forecast_phase3.csv"           # H+2: tomorrow
 
@@ -414,7 +415,7 @@ def build_shape_row_h2(h_idx: int, dt: pd.Timestamp,
 
 # ── Main forecast ─────────────────────────────────────────────────────────────
 
-def run_forecast(target_date: date = None) -> pd.DataFrame:
+def run_forecast(target_date: date = None, features_file: str = None) -> pd.DataFrame:
     # ── Load models ───────────────────────────────────────────────────────
     level_q10 = joblib.load(ASSETS_DIR / "level_q10.pkl")
     level_q50 = joblib.load(ASSETS_DIR / "level_q50.pkl")
@@ -442,8 +443,12 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     upper_fence = fence["upper"]
 
     # ── Load history ──────────────────────────────────────────────────────
-    log.info("Loading feature history …")
-    base = pd.read_csv(FEATURES_FILE, parse_dates=["settlement_datetime"])
+    _features_path = Path(features_file) if features_file else FEATURES_FILE
+    if not _features_path.exists() and FEATURES_RECENT_FILE.exists():
+        log.info("Full features not found — falling back to features_recent.csv")
+        _features_path = FEATURES_RECENT_FILE
+    log.info("Loading feature history from %s …", _features_path.name)
+    base = pd.read_csv(_features_path, parse_dates=["settlement_datetime"])
     base = base.sort_values("settlement_datetime").reset_index(drop=True)
     last_dt = base["settlement_datetime"].max()
 
@@ -576,12 +581,14 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
     # Intraday realized features: SP1-25 partial-day actuals from today's API data.
     # Provides a strong anchor for the level prediction — SP1-25 cover ~52% of the day.
     _intraday_path = Path(__file__).resolve().parents[2] / "data" / "raw" / "intraday_prices.csv"
+    _id_today_all: pd.DataFrame = pd.DataFrame()   # all settled SPs — used for post-processing
     if _intraday_path.exists():
         try:
             _id = pd.read_csv(_intraday_path)
             _id_today = str(target_date)
             if "settlement_date" in _id.columns:
                 _id = _id[_id["settlement_date"].astype(str) == _id_today]
+            # SP ≤ 25 for level model (consistent with training-time cutoff at 12:30 UTC)
             _id_partial = _id[_id["settlement_period"] <= 25]
             if not _id_partial.empty:
                 _price_col = "ssp" if "ssp" in _id_partial.columns else "systemSellPrice"
@@ -595,6 +602,8 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
                          lf["intraday_realized_mean"],
                          lf.get("intraday_realized_niv_mean", float("nan")),
                          lf["intraday_n_settled"])
+            # All available SPs — for result post-processing below (Options 1 & 2)
+            _id_today_all = _id.copy()
         except Exception as _e:
             log.warning("Could not load intraday features: %s", _e)
 
@@ -692,6 +701,57 @@ def run_forecast(target_date: date = None) -> pd.DataFrame:
         })
 
     result = pd.DataFrame(records)
+    result["is_actual"] = False   # populated below when intraday actuals are available
+
+    # ── Intraday post-processing: splice actuals + shape correction ───────
+    # Runs only when intraday_prices.csv exists and has data for today.
+    #
+    # Option 1 — Replace settled SPs with actual prices.
+    #   The orange zone on the dashboard shows real prices, not forecasts.
+    #
+    # Option 2 — Shape correction for unsettled SPs.
+    #   Mean forecast error over settled SPs → dampened correction applied to
+    #   remaining SPs (α=0.4).  If morning was £10 higher than forecast, the
+    #   afternoon shifts up by £4.  Decays to zero correction when no SPs are
+    #   settled yet (daily pipeline run) so it never degrades the pure forecast.
+    _SHAPE_ALPHA = 0.4   # dampening: don't over-commit to morning signal
+    if not _id_today_all.empty:
+        try:
+            _pc = "ssp" if "ssp" in _id_today_all.columns else "systemSellPrice"
+            _actual = _id_today_all[_id_today_all[_pc].notna()].copy()
+            _actual_map = dict(zip(
+                _actual["settlement_period"].astype(int),
+                _actual[_pc].astype(float),
+            ))
+            if _actual_map:
+                _settled = set(_actual_map)
+                _unsettled_mask = ~result["settlement_period"].isin(_settled)
+
+                # Option 2: compute correction BEFORE overwriting with actuals
+                _settled_rows  = result[result["settlement_period"].isin(_settled)]
+                _actual_vals   = [_actual_map[sp] for sp in _settled_rows["settlement_period"]]
+                _fc_vals       = _settled_rows["ssp_q50"].tolist()
+                _mean_err      = float(np.mean([a - f for a, f in zip(_actual_vals, _fc_vals)]))
+                _correction    = _SHAPE_ALPHA * _mean_err
+                if _unsettled_mask.any() and abs(_correction) > 0.5:
+                    for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
+                        result.loc[_unsettled_mask, _col] = (
+                            result.loc[_unsettled_mask, _col] + _correction
+                        ).round(2)
+                    log.info("Shape correction: mean_err=£%.1f  applied=£%.1f  (%d unsettled SPs)",
+                             _mean_err, _correction, int(_unsettled_mask.sum()))
+
+                # Option 1: replace settled SPs with actuals
+                for _sp, _av in _actual_map.items():
+                    _m = result["settlement_period"] == _sp
+                    if _m.any():
+                        for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
+                            result.loc[_m, _col] = round(_av, 2)
+                        result.loc[_m, "is_actual"] = True
+                log.info("Intraday splice: %d SPs replaced with actuals", len(_actual_map))
+        except Exception as _e:
+            log.warning("Intraday post-processing failed: %s", _e)
+
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(OUTPUT_FILE, index=False)
     log.info("H+1 forecast saved → %s", OUTPUT_FILE)
@@ -795,7 +855,7 @@ def main():
     parser.add_argument("--features", default=str(FEATURES_FILE))
     args = parser.parse_args()
     target = date.fromisoformat(args.date) if args.date else None
-    result = run_forecast(target)
+    result = run_forecast(target, features_file=args.features if args.features != str(FEATURES_FILE) else None)
     print(f"\nPhase 3 forecast for {result['settlement_date'].iloc[0]} "
           f"(daily level P50 = £{result['pred_daily_level'].iloc[0]:.1f}/MWh):")
     print(result[["settlement_datetime", "settlement_period",
