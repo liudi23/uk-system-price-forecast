@@ -9,6 +9,7 @@ Usage:
     python src/data/fetch_elexon.py                          # last 30 days
     python src/data/fetch_elexon.py --start 2025-01-01 --end 2025-03-31
     python src/data/fetch_elexon.py --start 2025-01-01 --end 2025-03-31 --append
+    python src/data/fetch_elexon.py --months 6               # last N months
 """
 
 import argparse
@@ -25,16 +26,18 @@ BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
 RAW_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 OUTPUT_FILE = RAW_DATA_DIR / "system_prices.csv"
 
-# Map Elexon camelCase field names → snake_case column names used in the project
 COLUMN_MAP = {
     "settlementDate": "settlement_date",
     "settlementPeriod": "settlement_period",
     "systemSellPrice": "ssp",
+    "systemBuyPrice": "sbp",
     "netImbalanceVolume": "net_imbalance_volume",
     "sellPriceAdjustment": "sell_price_adjustment",
     "buyPriceAdjustment": "buy_price_adjustment",
     "priceDerivationCode": "price_derivation_code",
     "replacementPrice": "replacement_price",
+    "totalSystemAcceptedOfferVolume": "total_accepted_offer_mwh",
+    "totalSystemAcceptedBidVolume": "total_accepted_bid_mwh",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -129,8 +132,9 @@ def _last_date_in_csv(path: Path) -> Optional[date]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch Elexon system prices (SSP/SBP)")
     default_end = date.today() - timedelta(days=1)
-    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD (default: day after last date in CSV, or 30 days ago)")
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=str(default_end), help="End date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--months", type=int, default=None, help="Lookback months if --start not given")
     parser.add_argument("--output", default=str(OUTPUT_FILE), help="Output CSV path")
     parser.add_argument("--append", action="store_true", help="Append to existing CSV, deduplicating on (date, period)")
     args = parser.parse_args()
@@ -140,10 +144,13 @@ def main() -> None:
 
     if args.start is None:
         last = _last_date_in_csv(output_path)
-        start = (last + timedelta(days=1)) if last else (end - timedelta(days=29))
-        # auto-enable append when picking up from an existing file
         if last:
+            start = last + timedelta(days=1)
             args.append = True
+        elif args.months:
+            start = end - timedelta(days=args.months * 30)
+        else:
+            start = end - timedelta(days=29)
     else:
         start = date.fromisoformat(args.start)
 
