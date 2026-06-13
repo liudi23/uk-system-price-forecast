@@ -1,8 +1,6 @@
 pandas
 numpy
 scikit-learn
-streamlit
-plotly
-narwhals
+scipy
 requests
 holidays

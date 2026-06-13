@@ -1,29 +1,44 @@
 """
-Histogram-based gradient boosting model for UK system price (SSP) forecasting.
+Phase 2 HGBR training: quantile regression + spike classifier.
 
-Uses sklearn's HistGradientBoostingRegressor (HGBR), which implements the
-same histogram-based algorithm as LightGBM and requires no external libs.
+Key changes vs Phase 1
+──────────────────────
+* Training target is now `ssp_raw` (actual unclipped price) instead of the
+  Tukey-winsorised `ssp`. This lifts the prediction ceiling from £354 to the
+  true market maximum (£4 038 in training data), allowing the model to learn
+  spike behaviour.
 
-To swap to LightGBM once `libomp` is installed (brew install libomp):
-    Replace the HGBR import and MODEL_PARAMS block with:
-        import lightgbm as lgb
-        model = lgb.LGBMRegressor(**LGBM_PARAMS)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
-                  callbacks=[lgb.early_stopping(50)])
+* Three quantile HGBR models are trained (P10 / P50 / P90):
+    - P50  = median point forecast (replaces the old single-model forecast)
+    - P10  = downside / crash-risk bound
+    - P90  = upside / spike-risk bound
 
-Setup:
-  Target     : ssp (Tukey-winsorised price from build_dataset.py)
-  Features   : 38 calendar, lag, rolling, imbalance and price-formation columns
-  Split      : train / val (early-stopping) / test — time-ordered, no shuffle
-  Loss       : MAE (robust to remaining price spikes)
+* A binary HistGradientBoostingClassifier is trained to predict `is_spike`
+  (SSP_raw > Tukey upper fence). Its calibrated probabilities are surfaced in
+  the dashboard as a settlement-period spike-risk indicator.
 
-Outputs (model_assets/):
-  hgbr_model.pkl                — serialised model (joblib)
-  hgbr_metrics.json             — test-set evaluation metrics
-  hgbr_feature_importance.csv   — permutation importance on val set
+* Tukey fence parameters (lower/upper) are saved to `model_assets/tukey_fence.json`
+  so forecast.py can recompute `is_spike` for newly ingested raw rows that
+  haven't passed through build_dataset.py.
+
+* Autoregressive lag features (`ssp_lag_1`, `ssp_lag_2`, …) continue to use the
+  winsorised `ssp` column so spike contamination does not corrupt the recursive
+  feature signal during inference.
+
+Outputs (model_assets/)
+──────────────────────
+  hgbr_q10.pkl               — quantile-10 HGBR (£/MWh lower bound)
+  hgbr_q50.pkl               — quantile-50 HGBR (median point forecast)
+  hgbr_q90.pkl               — quantile-90 HGBR (£/MWh upper bound)
+  spike_classifier.pkl       — binary HGBR classifier for is_spike
+  hgbr_metrics.json          — test-set evaluation metrics
+  hgbr_feature_importance.csv
+  feature_cols.json
+  tukey_fence.json            — {"lower": float, "upper": float}
 
 Usage:
     python src/models/train_lgbm.py
+    python src/models/train_lgbm.py --features data/processed/features_5yr.csv
     python src/models/train_lgbm.py --test-days 7 --val-days 3
 """
 
@@ -36,51 +51,54 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evaluate import metrics, print_report, save_metrics
 
-FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features.csv"
-ASSETS_DIR = Path(__file__).resolve().parents[2] / "model_assets"
+FEATURES_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features_5yr.csv"
+ASSETS_DIR    = Path(__file__).resolve().parents[2] / "model_assets"
 
 TEST_DAYS = 7
-VAL_DAYS = 3
+VAL_DAYS  = 3
 
+# Columns that must never enter the feature matrix
 EXCLUDE_COLS = {
     # Identifiers
     "settlement_date", "settlement_datetime", "settlement_period",
-    # Raw / derived target
-    "ssp_raw", "is_spike",
-    # Contemporaneous values — unknown at prediction time for a future period
-    "net_imbalance_volume",       # use lagged NIV features instead
-    "abs_imbalance_volume",       # = |net_imbalance_volume|, same period leakage
-    "price_derivation_code",      # string; determined after settlement
-    "price_derivation_code_P",    # binary version; same contemporaneous leakage
-    # Critical target leakage:
-    # replacement_price == SSP for all P-code rows (API) and all N-code nulls
-    # (imputed with SSP in build_dataset.py). Correlation with target = 0.9999.
+    # Contemporaneous values — unknown at prediction time
+    "net_imbalance_volume",
+    "abs_imbalance_volume",
+    "price_derivation_code",
+    "price_derivation_code_P",
+    # Target leakage: replacement_price == SSP for all P-code rows
     "replacement_price",
-    # Near-zero throughout, low signal
     "sell_price_adjustment",
     "buy_price_adjustment",
-    # Raw contemporaneous weather columns (renamed with _raw_ prefix by weather_features.py)
+    # Raw weather columns (renamed with _raw_ prefix by weather_features.py)
     "_raw_temp_c", "_raw_wind_ms", "_raw_solar_wm2", "_raw_precip_mm",
+    # Both target forms — we pick the one we want as y, exclude the other
+    "ssp",
+    "ssp_raw",
+    # is_spike is the classification target; exclude from regression features
+    "is_spike",
 }
 
-MODEL_PARAMS = {
-    "loss": "absolute_error",   # MAE — robust to remaining price spikes
-    "max_iter": 1000,
-    "learning_rate": 0.05,
-    "max_leaf_nodes": 31,
-    "min_samples_leaf": 20,
+# Quantile model specs
+QUANTILES = [0.10, 0.50, 0.90]
+QUANTILE_NAMES = {0.10: "q10", 0.50: "q50", 0.90: "q90"}
+
+BASE_PARAMS = {
+    "max_iter":          1000,
+    "learning_rate":     0.05,
+    "max_leaf_nodes":    31,
+    "min_samples_leaf":  20,
     "l2_regularization": 0.1,
-    "max_bins": 255,
-    "early_stopping": True,
-    "validation_fraction": None,  # we pass our own val set via warm_start workaround
-    "n_iter_no_change": 50,
-    "random_state": 42,
+    "max_bins":          255,
+    "early_stopping":    True,
+    "n_iter_no_change":  50,
+    "random_state":      42,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -97,11 +115,11 @@ def load_usable(path: Path) -> pd.DataFrame:
 def split(df: pd.DataFrame, test_days: int, val_days: int):
     t_max = df["settlement_datetime"].max()
     test_cut = t_max - pd.Timedelta(days=test_days)
-    val_cut = test_cut - pd.Timedelta(days=val_days)
+    val_cut  = test_cut - pd.Timedelta(days=val_days)
 
     train = df[df["settlement_datetime"] <= val_cut]
-    val = df[(df["settlement_datetime"] > val_cut) & (df["settlement_datetime"] <= test_cut)]
-    test = df[df["settlement_datetime"] > test_cut]
+    val   = df[(df["settlement_datetime"] > val_cut) & (df["settlement_datetime"] <= test_cut)]
+    test  = df[df["settlement_datetime"] > test_cut]
 
     for name, part in [("Train", train), ("Val", val), ("Test", test)]:
         log.info("%s: %d rows (%s → %s)", name, len(part),
@@ -111,24 +129,58 @@ def split(df: pd.DataFrame, test_days: int, val_days: int):
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
-    return [c for c in df.columns if c not in EXCLUDE_COLS and c != "ssp"]
+    return [c for c in df.columns if c not in EXCLUDE_COLS]
 
 
-def train_model(train_df, val_df, feature_cols):
-    # HGBR's built-in early stopping works on a fraction of training data.
-    # We concatenate train+val so the model sees early-stopping signals on val.
-    combined = pd.concat([train_df, val_df], ignore_index=True)
-    X = combined[feature_cols].values
-    y = combined["ssp"].values
+def _make_regressor(quantile: float) -> HistGradientBoostingRegressor:
+    return HistGradientBoostingRegressor(
+        loss="quantile", quantile=quantile,
+        **BASE_PARAMS,
+    )
 
-    # Tell HGBR to use the last len(val_df) rows as the validation set
-    val_fraction = len(val_df) / len(combined)
-    params = {**MODEL_PARAMS, "validation_fraction": val_fraction}
 
-    model = HistGradientBoostingRegressor(**params)
-    model.fit(X, y)
-    log.info("Best iteration: %d", model.n_iter_)
-    return model
+def train_quantile_models(train_df, val_df, feature_cols):
+    """Train P10, P50, P90 quantile regressors on ssp_raw target."""
+    combined   = pd.concat([train_df, val_df], ignore_index=True)
+    X          = combined[feature_cols].values
+    y          = combined["ssp_raw"].values
+    val_frac   = len(val_df) / len(combined)
+
+    models = {}
+    for q in QUANTILES:
+        log.info("Training quantile=%.2f model…", q)
+        m = _make_regressor(q)
+        # Inject val_fraction into params — early stopping on actual val set
+        m.set_params(validation_fraction=val_frac)
+        m.fit(X, y)
+        log.info("  q=%.2f best_iter=%d", q, m.n_iter_)
+        models[q] = m
+    return models
+
+
+def train_spike_classifier(train_df, val_df, feature_cols):
+    """Binary classifier for is_spike (SSP_raw > Tukey upper fence)."""
+    combined  = pd.concat([train_df, val_df], ignore_index=True)
+    X         = combined[feature_cols].values
+    y         = combined["is_spike"].astype(int).values
+    val_frac  = len(val_df) / len(combined)
+
+    # class_weight='balanced' adjusts for the ~2.4% spike rate
+    clf = HistGradientBoostingClassifier(
+        max_iter=500,
+        learning_rate=0.05,
+        max_leaf_nodes=31,
+        min_samples_leaf=20,
+        l2_regularization=0.1,
+        early_stopping=True,
+        n_iter_no_change=30,
+        validation_fraction=val_frac,
+        class_weight="balanced",
+        random_state=42,
+    )
+    clf.fit(X, y)
+    log.info("Spike classifier best_iter=%d", clf.n_iter_)
+    return clf
 
 
 def compute_feature_importance(model, X_val, y_val, feature_cols, n_repeats=10):
@@ -136,50 +188,57 @@ def compute_feature_importance(model, X_val, y_val, feature_cols, n_repeats=10):
         model, X_val, y_val, n_repeats=n_repeats,
         scoring="neg_mean_absolute_error", random_state=42, n_jobs=-1,
     )
-    fi = pd.DataFrame({
-        "feature": feature_cols,
-        "importance_mean": result.importances_mean,
-        "importance_std": result.importances_std,
+    return pd.DataFrame({
+        "feature":          feature_cols,
+        "importance_mean":  result.importances_mean,
+        "importance_std":   result.importances_std,
     }).sort_values("importance_mean", ascending=False)
-    return fi
 
 
-def evaluate_dayahead_recursive(model, df, test_df, feature_cols):
+def evaluate_dayahead_recursive(models_dict, clf, df, test_df, feature_cols, tukey_upper_fence):
     """
     Honest day-ahead evaluation: simulate the recursive multi-step forecast for
     each test day using only information genuinely available at forecast time.
 
-    Batch prediction on pre-computed features is misleading because ssp_lag_1,
-    ssp_lag_2, ssp_roll_*_6, ssp_diff_1_48, and niv_lag_1 all reference prices
-    or volumes from within the forecast window — information unavailable when
-    the day-ahead forecast is generated. This function overrides those features
-    with recursively computed values (running prediction buffer), matching
-    exactly what forecast.py does at deployment time.
+    Short-lag features that are leaky in batch evaluation — ssp_lag_1, ssp_lag_2,
+    ssp_roll_*_6, ssp_diff_1_48, net_imbalance_volume_lag_1, niv_roll_*_6 — are
+    recomputed from the running prediction buffer, exactly as forecast.py does.
+
+    All features with lag >= 48 (calendar, weather, price lags, spike history) are
+    taken from the pre-computed features file; they reference actual history that
+    predates the forecast day and contain no leakage.
     """
     HISTORY = 400
 
+    # Map feature name → column index for fast override
     leaky_names = {
         "ssp_lag_1", "ssp_lag_2",
         "ssp_roll_mean_6", "ssp_roll_std_6", "ssp_roll_min_6", "ssp_roll_max_6",
         "ssp_diff_1_48",
         "net_imbalance_volume_lag_1",
         "net_imbalance_volume_roll_mean_6", "net_imbalance_volume_roll_std_6",
+        "net_imbalance_volume_roll_min_6",  "net_imbalance_volume_roll_max_6",
+        "abs_niv_roll_mean_6",
     }
-    col_idx  = {f: i for i, f in enumerate(feature_cols)}
+    col_idx = {f: i for i, f in enumerate(feature_cols)}
     leaky_idx = {f: col_idx[f] for f in leaky_names if f in col_idx}
     lag48_idx = col_idx.get("ssp_lag_48")
 
     test_dates = sorted(test_df["settlement_datetime"].dt.date.unique())
-    y_true_all, y_pred_all = [], []
+    true_vals, q10_preds, q50_preds, q90_preds, spike_probs = [], [], [], [], []
 
     for target_date in test_dates:
+        # History: all usable rows strictly before this test day
         hist = df[df["settlement_datetime"].dt.date < target_date].tail(HISTORY).reset_index(drop=True)
         if len(hist) < HISTORY:
             log.warning("Skipping %s — only %d history rows", target_date, len(hist))
             continue
 
-        ssp_buf     = list(hist["ssp"].values)
-        niv_actual  = hist["net_imbalance_volume"].values
+        # ssp_buf: winsorised prices fed back as lag features (matches training distribution)
+        ssp_buf    = list(hist["ssp"].values)
+        niv_actual = hist["net_imbalance_volume"].values
+        # NIV proxy: within-day periods are unknown at day-ahead time;
+        # proxy with yesterday's same settlement period (identical to forecast.py)
         niv_virtual = np.concatenate([niv_actual, niv_actual[-48:]])
 
         day_rows = (
@@ -188,10 +247,12 @@ def evaluate_dayahead_recursive(model, df, test_df, feature_cols):
         )
 
         for h_idx, (_, row_s) in enumerate(day_rows.iterrows()):
-            idx = HISTORY + h_idx
+            idx = HISTORY + h_idx   # position in niv_virtual
 
+            # Base feature vector from pre-computed row (non-leaky features intact)
             x = np.array([row_s.get(f, 0.0) for f in feature_cols], dtype=float)
 
+            # ── Override leaky short-lag features ─────────────────────────────
             ssp_arr = np.array(ssp_buf)
 
             if "ssp_lag_1" in leaky_idx:
@@ -200,12 +261,8 @@ def evaluate_dayahead_recursive(model, df, test_df, feature_cols):
                 x[leaky_idx["ssp_lag_2"]] = float(ssp_arr[-2])
 
             win6 = ssp_arr[-6:]
-            for k, fn in [
-                ("mean", np.mean),
-                ("std",  lambda a: float(np.std(a, ddof=1)) if len(a) > 1 else 0.0),
-                ("min",  np.min),
-                ("max",  np.max),
-            ]:
+            for k, fn in [("mean", np.mean), ("std", lambda a: np.std(a, ddof=1) if len(a) > 1 else 0.0),
+                          ("min",  np.min),  ("max",  np.max)]:
                 key = f"ssp_roll_{k}_6"
                 if key in leaky_idx:
                     x[leaky_idx[key]] = float(fn(win6))
@@ -214,102 +271,165 @@ def evaluate_dayahead_recursive(model, df, test_df, feature_cols):
                 lag48 = x[lag48_idx] if lag48_idx is not None else float(ssp_arr[-48])
                 x[leaky_idx["ssp_diff_1_48"]] = float(ssp_arr[-1]) - lag48
 
+            # NIV: proxy from yesterday for within-day periods
             niv6 = niv_virtual[idx - 6 : idx]
             if "net_imbalance_volume_lag_1" in leaky_idx:
                 x[leaky_idx["net_imbalance_volume_lag_1"]] = float(niv_virtual[idx - 1])
-            if "net_imbalance_volume_roll_mean_6" in leaky_idx:
-                x[leaky_idx["net_imbalance_volume_roll_mean_6"]] = float(niv6.mean())
-            if "net_imbalance_volume_roll_std_6" in leaky_idx:
-                x[leaky_idx["net_imbalance_volume_roll_std_6"]] = (
-                    float(np.std(niv6, ddof=1)) if len(niv6) > 1 else 0.0
-                )
+            for k, fn in [("mean", np.mean), ("std", lambda a: np.std(a, ddof=1) if len(a) > 1 else 0.0),
+                          ("min",  np.min),  ("max",  np.max)]:
+                key = f"net_imbalance_volume_roll_{k}_6"
+                if key in leaky_idx:
+                    x[leaky_idx[key]] = float(fn(niv6))
+            if "abs_niv_roll_mean_6" in leaky_idx:
+                x[leaky_idx["abs_niv_roll_mean_6"]] = float(np.abs(niv6).mean())
 
-            pred = float(model.predict(x.reshape(1, -1))[0])
-            ssp_buf.append(pred)
-            y_pred_all.append(pred)
-            y_true_all.append(float(row_s["ssp"]))
+            # ── Predict ───────────────────────────────────────────────────────
+            X = x.reshape(1, -1)
+            pred_q50 = float(models_dict[0.50].predict(X)[0])
+            pred_q10 = float(models_dict[0.10].predict(X)[0])
+            pred_q90 = float(models_dict[0.90].predict(X)[0])
+            spike_p  = float(clf.predict_proba(X)[0, 1])
 
-    return np.array(y_true_all), np.array(y_pred_all)
+            # Feed back clipped q50 so ssp_lag_1/2 stay in training distribution
+            ssp_buf.append(float(np.clip(pred_q50, -500, tukey_upper_fence)))
+
+            q50_preds.append(pred_q50)
+            q10_preds.append(pred_q10)
+            q90_preds.append(pred_q90)
+            spike_probs.append(spike_p)
+            true_vals.append(float(row_s["ssp_raw"]))
+
+    return (
+        np.array(true_vals),
+        {"q10": np.array(q10_preds), "q50": np.array(q50_preds), "q90": np.array(q90_preds)},
+        np.array(spike_probs),
+    )
 
 
-def save_predictions(test_df, y_pred, assets_dir):
+def save_predictions(test_df, preds_dict, assets_dir):
+    """Save test-set predictions (recursive day-ahead evaluation)."""
     pred_path = assets_dir / "test_predictions.csv"
-    out = test_df[["settlement_datetime", "settlement_date", "settlement_period", "ssp"]].copy()
-    out = out.rename(columns={"ssp": "ssp_actual"})
-    out["ssp_predicted"] = y_pred
-    out["error"] = out["ssp_predicted"] - out["ssp_actual"]
-    out["abs_error"] = out["error"].abs()
+    out = test_df[["settlement_datetime", "settlement_date", "settlement_period",
+                   "ssp", "ssp_raw"]].copy()
+    out = out.rename(columns={"ssp_raw": "ssp_actual", "ssp": "ssp_winsorised"})
+    for name, y_pred in preds_dict.items():
+        out[f"ssp_{name}"] = y_pred
+    # Backwards-compatible alias
+    out["ssp_predicted"] = out["ssp_q50"]
+    out["error"]         = out["ssp_predicted"] - out["ssp_actual"]
+    out["abs_error"]     = out["error"].abs()
     out.to_csv(pred_path, index=False)
     log.info("Predictions saved → %s", pred_path)
 
 
-def save_outputs(model, fi, test_metrics, assets_dir, feature_cols):
-    import json
+def save_outputs(models_dict, clf, fi, test_metrics, assets_dir, feature_cols, tukey_fence):
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = assets_dir / "hgbr_model.pkl"
-    joblib.dump(model, model_path)
-    log.info("Model saved → %s", model_path)
+    # Quantile models
+    for q, model in models_dict.items():
+        name = QUANTILE_NAMES[q]
+        path = assets_dir / f"hgbr_{name}.pkl"
+        joblib.dump(model, path)
+        log.info("Saved %s → %s", name, path)
 
+    # Backwards-compatible alias: hgbr_model.pkl → q50
+    joblib.dump(models_dict[0.50], assets_dir / "hgbr_model.pkl")
+
+    # Spike classifier
+    joblib.dump(clf, assets_dir / "spike_classifier.pkl")
+    log.info("Spike classifier saved → %s", assets_dir / "spike_classifier.pkl")
+
+    # Feature importance
     fi_path = assets_dir / "hgbr_feature_importance.csv"
     fi.to_csv(fi_path, index=False)
-    log.info("Feature importance saved → %s", fi_path)
 
-    fc_path = assets_dir / "feature_cols.json"
-    with open(fc_path, "w") as f:
+    # Feature column list
+    with open(assets_dir / "feature_cols.json", "w") as f:
         json.dump(feature_cols, f)
-    log.info("Feature columns saved → %s", fc_path)
 
-    save_metrics({"HGBR": test_metrics}, assets_dir / "hgbr_metrics.json")
+    # Tukey fence for inference-time is_spike computation
+    with open(assets_dir / "tukey_fence.json", "w") as f:
+        json.dump(tukey_fence, f)
+    log.info("Tukey fence saved → %s", assets_dir / "tukey_fence.json")
+
+    save_metrics({"HGBR_q50": test_metrics}, assets_dir / "hgbr_metrics.json")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-days", type=int, default=TEST_DAYS)
-    parser.add_argument("--val-days", type=int, default=VAL_DAYS)
-    parser.add_argument("--features", default=str(FEATURES_FILE), help="Path to features CSV")
+    parser.add_argument("--val-days",  type=int, default=VAL_DAYS)
+    parser.add_argument("--features",  default=str(FEATURES_FILE))
     args = parser.parse_args()
-    FEATURES_FILE_USE = Path(args.features)
 
-    df = load_usable(FEATURES_FILE_USE)
+    df = load_usable(Path(args.features))
     train_df, val_df, test_df = split(df, args.test_days, args.val_days)
     feature_cols = get_feature_cols(df)
     log.info("Features: %d", len(feature_cols))
 
-    log.info("Training HGBR…")
-    model = train_model(train_df, val_df, feature_cols)
+    # Recover Tukey fence from the processed data (fence was applied in build_dataset.py)
+    q1  = df["ssp"].quantile(0.25)   # winsorised == raw below upper fence
+    q3  = df["ssp"].quantile(0.75)
+    iqr = q3 - q1
+    tukey_fence = {"lower": round(q1 - 3 * iqr, 4), "upper": round(q3 + 3 * iqr, 4)}
+    log.info("Tukey fence: lower=%.2f  upper=%.2f", tukey_fence["lower"], tukey_fence["upper"])
 
-    # ── Recursive day-ahead evaluation (honest) ───────────────────────────────
-    # Batch predict(test_df) is misleading: ssp_lag_1 uses actual within-day
-    # prices (future info unavailable at forecast time). The recursive eval
-    # overrides short-lag features with running model predictions, matching
-    # exactly what forecast.py does at deployment.
+    # ── Quantile models ───────────────────────────────────────────────────────
+    log.info("Training quantile regressors (P10 / P50 / P90) on ssp_raw…")
+    models = train_quantile_models(train_df, val_df, feature_cols)
+
+    # ── Spike classifier ──────────────────────────────────────────────────────
+    log.info("Training spike classifier…")
+    clf = train_spike_classifier(train_df, val_df, feature_cols)
+
+    # ── Evaluate: recursive day-ahead simulation (honest) ────────────────────
+    # Batch prediction on the pre-computed feature matrix is misleading because
+    # ssp_lag_1/lag_2/roll_6 use actual prices from within the forecast window
+    # (future information). The recursive evaluation replicates forecast.py's
+    # loop, overriding those features with running model predictions.
     log.info("Running recursive day-ahead evaluation on test set…")
-    y_true, y_pred = evaluate_dayahead_recursive(model, df, test_df, feature_cols)
-
-    m = metrics(y_true, y_pred)
-    print_report("HistGradientBoosting (HGBR) — recursive day-ahead (honest)", m)
-
-    # Log the inflated batch metric so the gap is visible
-    y_pred_batch = model.predict(test_df[feature_cols].values)
-    m_batch = metrics(test_df["ssp"].values, y_pred_batch)
-    log.info(
-        "Reference batch eval (leaky): MAE=%.2f  |  "
-        "Honest recursive MAE=%.2f  |  gap=%.2f (ssp_lag_1 contamination)",
-        m_batch["MAE"], m["MAE"], m["MAE"] - m_batch["MAE"],
+    y_true_rec, preds_rec, spike_prob_rec = evaluate_dayahead_recursive(
+        models, clf, df, test_df, feature_cols, tukey_fence["upper"]
     )
 
-    save_metrics({"HGBR": m}, ASSETS_DIR / "hgbr_metrics.json")
+    all_metrics = {}
+    for name in ["q10", "q50", "q90"]:
+        m = metrics(y_true_rec, preds_rec[name])
+        all_metrics[f"HGBR_{name}"] = m
+        print_report(f"HGBR {name} — recursive day-ahead (honest)", m)
 
+    # For reference: show the inflated batch metric so the gap is visible
+    log.info("Reference batch eval (leaky — shows how much ssp_lag_1 inflates score):")
+    y_batch = models[0.50].predict(test_df[feature_cols].values)
+    m_batch = metrics(test_df["ssp_raw"].values, y_batch)
+    log.info("  Batch P50 MAE=%.2f  (recursive honest MAE=%.2f  — gap=%.2f)",
+             m_batch["MAE"], all_metrics["HGBR_q50"]["MAE"],
+             all_metrics["HGBR_q50"]["MAE"] - m_batch["MAE"])
+
+    # Spike classifier recall on test set (batch OK here — classifier doesn't self-feed)
+    X_test     = test_df[feature_cols].values
+    spike_true = test_df["is_spike"].astype(int).values
+    spike_pred_batch = (clf.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+    n_actual   = spike_true.sum()
+    n_caught   = (spike_pred_batch & spike_true).sum()
+    log.info("Spike classifier: %d actual spikes, %d caught (recall=%.1f%%)",
+             n_actual, n_caught, 100 * n_caught / max(n_actual, 1))
+
+    # ── Feature importance on val set (q50 model) ────────────────────────────
     log.info("Computing permutation importance on val set…")
     fi = compute_feature_importance(
-        model, val_df[feature_cols].values, val_df["ssp"].values, feature_cols
+        models[0.50],
+        val_df[feature_cols].values, val_df["ssp_raw"].values,
+        feature_cols,
     )
 
-    save_outputs(model, fi, m, ASSETS_DIR, feature_cols)
-    save_predictions(test_df, y_pred, ASSETS_DIR)
+    # ── Save everything ───────────────────────────────────────────────────────
+    # test_predictions.csv uses the RECURSIVE (honest) predictions
+    save_predictions(test_df, preds_rec, ASSETS_DIR)
+    save_outputs(models, clf, fi, all_metrics.get("HGBR_q50", {}),
+                 ASSETS_DIR, feature_cols, tukey_fence)
 
-    print("\nTop-10 features by permutation importance (MAE reduction):")
+    print("\nTop-10 features by permutation importance (MAE reduction on ssp_raw):")
     print(fi.head(10)[["feature", "importance_mean", "importance_std"]].to_string(index=False))
 
 

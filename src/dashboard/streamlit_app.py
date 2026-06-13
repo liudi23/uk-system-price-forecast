@@ -4,8 +4,6 @@ Data source: Elexon BMRS — data/raw/system_prices.csv
 Run: streamlit run src/dashboard/streamlit_app.py
 """
 
-import subprocess
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -14,15 +12,27 @@ import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH     = ROOT / "data" / "raw" / "system_prices.csv"
-PRED_PATH     = ROOT / "model_assets" / "test_predictions.csv"
-FORECAST_PATH = ROOT / "model_assets" / "next_day_forecast.csv"
-FI_PATH       = ROOT / "model_assets" / "hgbr_feature_importance.csv"
+# Use full processed history for analytics; system_prices.csv is only a ~50-day rolling window
+DATA_PATH     = ROOT / "data" / "processed" / "dataset_5yr.csv"
+PRED_PATH_P3      = ROOT / "model_assets" / "test_predictions_phase3.csv"
+FORECAST_PATH_P3  = ROOT / "model_assets" / "next_day_forecast_phase3.csv"   # H+1 today
+FORECAST_PATH_H2  = ROOT / "model_assets" / "day2_forecast_phase3.csv"       # H+2 tomorrow
+METRICS_P3       = ROOT / "model_assets" / "phase3_metrics.json"
+LEVEL_FEAT_JSON  = ROOT / "model_assets" / "level_feature_cols.json"
+SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
+LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
+SHAPE_IMP_CSV    = ROOT / "model_assets" / "phase3_shape_importance.csv"
 
-FETCH_ELEXON    = ROOT / "src" / "data"   / "fetch_elexon.py"
-FETCH_WEATHER   = ROOT / "src" / "data"   / "fetch_weather.py"
-FORECAST_SCRIPT = ROOT / "src" / "models" / "forecast.py"
-FORECASTS_DIR   = ROOT / "model_assets"   / "forecasts"
+FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
+FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
+FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
+EXTEND_DATASET    = ROOT / "src" / "data"    / "extend_dataset.py"
+BUILD_FEATURES    = ROOT / "src" / "features"/ "build_features.py"
+TRAIN_PHASE3      = ROOT / "src" / "models"  / "train_phase3.py"
+FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
+FORECASTS_DIR     = ROOT / "model_assets"    / "forecasts"
+DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
+FEATURES_5YR      = ROOT / "data" / "processed" / "features_5yr.csv"
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -30,8 +40,11 @@ st.set_page_config(
     layout="wide",
 )
 
+# Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
+_LAST_PIPELINE_RUN = "2026-06-12"
 
-@st.cache_data
+
+@st.cache_data(ttl=7200)
 def load_data() -> pd.DataFrame:
     df = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
     df["settlement_period"] = df["settlement_period"].astype(int)
@@ -47,31 +60,22 @@ def load_data() -> pd.DataFrame:
 
 df = load_data()
 
+
+@st.cache_data(ttl=7200)
+def load_p3_metrics() -> dict:
+    import json
+    if METRICS_P3.exists():
+        with open(METRICS_P3) as f:
+            return json.load(f)
+    return {}
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
-st.sidebar.subheader("Data & Forecast")
-if st.sidebar.button("Refresh Data & Run Forecast", use_container_width=True):
-    with st.spinner("Fetching latest Elexon data…"):
-        subprocess.run(
-            [sys.executable, str(FETCH_ELEXON), "--append"],
-            capture_output=True,
-        )
-    with st.spinner("Fetching latest weather…"):
-        subprocess.run(
-            [sys.executable, str(FETCH_WEATHER)],
-            capture_output=True,
-        )
-    with st.spinner("Running day-ahead forecast…"):
-        subprocess.run(
-            [sys.executable, str(FORECAST_SCRIPT)],
-            capture_output=True,
-        )
-    st.cache_data.clear()
-    st.rerun()
-
-st.sidebar.caption("Updates system prices, weather, and tomorrow's forecast.")
+_latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
+st.sidebar.caption(f"📅 Latest data: **{_latest_date}**\n\nPipeline runs automatically at 12:30 UTC daily after Elexon publishes settlement prices.")
 st.sidebar.divider()
 
 min_date = df["settlement_date"].min().date()
@@ -103,177 +107,146 @@ dff = df[mask].copy()
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("UK Electricity System Price Dashboard")
+st.markdown("**Di Liu** · [github.com/liudi23/uk-system-price-forecast](https://github.com/liudi23/uk-system-price-forecast)")
 st.caption(
     f"Data: Elexon BMRS · {start_date} → {end_date} · "
     f"{len(dff):,} settlement periods"
 )
 
 # ── Production model banner ───────────────────────────────────────────────────
+_m = load_p3_metrics()
+_p3 = _m.get("Phase3_P50_two_stage", {})
+_dc = _m.get("decomposition", {})
+_mae_str   = f"£{_p3['MAE']:.2f}/MWh"        if "MAE"           in _p3 else "—"
+_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"  in _dc else "—"
+_corr_str  = f"{_dc['shape_corr_mean']:.3f}"  if "shape_corr_mean" in _dc else "—"
+_peak_str  = f"±{_dc['peak_timing_mae']:.1f} SPs" if "peak_timing_mae" in _dc else "—"
 st.info(
-    "**Production model:** HistGradientBoosting (HGBR) · "
-    "Trained on 5 years of Elexon BMRS data (May 2021 – May 2026) · "
-    "Features: price lags, rolling statistics, calendar/annual harmonics, "
-    "UK weather (temperature, wind speed, solar irradiance, precipitation) · "
-    "**Honest day-ahead MAE: £25.9/MWh · sMAPE: 28.0%** "
-    "(recursive simulation — previously reported £15.0 was inflated by ssp_lag_1 leakage)"
+    "**Phase 3 — Level-Shape Decomposition · CPI-adjusted · 3-year rolling window** · "
+    "Stage 1: daily level HGBR (P10/P50/P90) · Stage 2: intra-day shape HGBR · "
+    "All shape features lag ≥ 48 SPs — zero leakage · "
+    f"**Honest MAE: {_mae_str}** · Level MAE: {_lvl_str} · "
+    f"Shape corr: {_corr_str} · Peak timing: {_peak_str}"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
-st.subheader("Day-Ahead Forecast (HGBR · 48 Settlement Periods)")
+st.subheader("Day-Ahead Forecast (Phase 3 Level-Shape · P10 / P50 / P90 · 48 Settlement Periods)")
 
-if FORECAST_PATH.exists():
-    fc = pd.read_csv(FORECAST_PATH, parse_dates=["settlement_datetime"])
-    fc_date = fc["settlement_date"].iloc[0]
+# Prefer Phase 3 forecast; fall back to Phase 2 if not yet generated
+_fc_path = FORECAST_PATH_P3 if FORECAST_PATH_P3.exists() else FORECAST_PATH
+
+if _fc_path.exists():
+    fc = pd.read_csv(_fc_path, parse_dates=["settlement_datetime"])
+    fc_date  = fc["settlement_date"].iloc[0]
     fc_label = f"{fc_date}  ·  SP 1–48 (midnight → 23:30)"
 
-    fm1, fm2, fm3, fm4 = st.columns(4)
+    has_quantiles = "ssp_q50" in fc.columns
+    p50_col = "ssp_q50" if has_quantiles else "ssp_predicted"
+
+    fm1, fm2, fm3, fm4, fm5 = st.columns(5)
     fm1.metric("Forecast date", fc_date)
-    fm2.metric("Min predicted SSP", f"£{fc['ssp_predicted'].min():.2f}")
-    fm3.metric("Avg predicted SSP", f"£{fc['ssp_predicted'].mean():.2f}")
-    fm4.metric("Max predicted SSP", f"£{fc['ssp_predicted'].max():.2f}")
+    fm2.metric("Min P50", f"£{fc[p50_col].min():.1f}")
+    fm3.metric("Avg P50 (daily level)", f"£{fc[p50_col].mean():.1f}")
+    fm4.metric("Max P50", f"£{fc[p50_col].max():.1f}")
+    if "pred_daily_level" in fc.columns:
+        fm5.metric("Predicted daily level", f"£{fc['pred_daily_level'].iloc[0]:.1f}/MWh",
+                   help="Stage 1 level model prediction — expected daily average price")
+    elif has_quantiles and "spike_prob" in fc.columns:
+        peak_sp  = int(fc.loc[fc["ssp_q90"].idxmax(), "settlement_period"])
+        peak_q90 = fc["ssp_q90"].max()
+        fm5.metric("Peak P90 risk", f"£{peak_q90:.0f}  SP {peak_sp}")
+    else:
+        fm5.metric("Max P50", f"£{fc[p50_col].max():.1f}")
 
     fig_fc = go.Figure()
+
+    if has_quantiles:
+        # P10–P90 confidence band
+        fig_fc.add_trace(go.Scatter(
+            x=pd.concat([fc["settlement_datetime"], fc["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc["ssp_q90"], fc["ssp_q10"].iloc[::-1]]),
+            fill="toself",
+            fillcolor="rgba(255,127,14,0.15)",
+            line=dict(color="rgba(255,127,14,0)"),
+            hoverinfo="skip",
+            name="P10–P90 band",
+            showlegend=True,
+        ))
+        fig_fc.add_trace(go.Scatter(
+            x=fc["settlement_datetime"], y=fc["ssp_q90"],
+            name="P90 (spike risk)", line=dict(color="#ff7f0e", width=1, dash="dot"),
+            hovertemplate="SP %{customdata}<br>P90 £%{y:.2f}<extra></extra>",
+            customdata=fc["settlement_period"],
+        ))
+        fig_fc.add_trace(go.Scatter(
+            x=fc["settlement_datetime"], y=fc["ssp_q10"],
+            name="P10 (downside)", line=dict(color="#ff7f0e", width=1, dash="dot"),
+            hovertemplate="SP %{customdata}<br>P10 £%{y:.2f}<extra></extra>",
+            customdata=fc["settlement_period"],
+        ))
+
     fig_fc.add_trace(go.Scatter(
-        x=fc["settlement_datetime"], y=fc["ssp_predicted"],
-        name="Predicted SSP", fill="tozeroy",
-        line=dict(color="#ff7f0e", width=2),
-        hovertemplate="SP %{customdata}<br>£%{y:.2f}/MWh<extra></extra>",
+        x=fc["settlement_datetime"], y=fc[p50_col],
+        name="P50 forecast", fill="tozeroy" if not has_quantiles else None,
+        line=dict(color="#ff7f0e", width=2.5),
+        hovertemplate="SP %{customdata}<br>P50 £%{y:.2f}<extra></extra>",
         customdata=fc["settlement_period"],
     ))
+
     fig_fc.update_layout(
-        xaxis_title="Datetime",
-        yaxis_title="£/MWh",
-        height=320,
-        margin=dict(t=10, b=40),
-        hovermode="x unified",
-        showlegend=False,
+        xaxis_title="Datetime", yaxis_title="£/MWh",
+        height=340, margin=dict(t=10, b=40), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         annotations=[dict(
-            text=f"Forecast generated: {fc_label}",
+            text=f"Forecast: {fc_label}",
             xref="paper", yref="paper",
-            x=0, y=1.02, showarrow=False,
+            x=0, y=1.08, showarrow=False,
             font=dict(size=11, color="grey"),
         )],
     )
-    st.plotly_chart(fig_fc, use_container_width=True)
+    st.plotly_chart(fig_fc)
+
+
 else:
     st.info(
-        "No forecast found. Click **Refresh Data & Run Forecast** in the sidebar "
-        "or run `python src/models/forecast.py`."
+        "No forecast found. Run `python src/models/forecast_phase3.py` to generate one."
     )
 
-st.divider()
+# ── H+2 forecast panel (tomorrow) ────────────────────────────────────────────
+if FORECAST_PATH_H2.exists():
+    fc_h2  = pd.read_csv(FORECAST_PATH_H2, parse_dates=["settlement_datetime"])
+    h2_date = fc_h2["settlement_date"].iloc[0]
+    h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
+    h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
 
-# ── Live: Today's Forecast vs Actual SSP ─────────────────────────────────────
-st.subheader("Live: Today's Forecast vs Actual SSP")
-st.caption(
-    "Settled periods update automatically every 30 min. "
-    "Click **↻ Fetch now** to pull the latest Elexon prices immediately."
-)
+    st.subheader(f"Tomorrow Forecast · H+2 · {h2_date}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
+    st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
 
+    h2m1, h2m2, h2m3 = st.columns(3)
+    h2m1.metric("H+2 Date", h2_date)
+    h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
+    h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
 
-@st.fragment(run_every="30m")
-def live_comparison_panel():
-    from datetime import datetime as dt_cls
-
-    today_str = str(pd.Timestamp.now().date())
-    today_fc_path = FORECASTS_DIR / f"forecast_{today_str}.csv"
-
-    col_ts, col_btn = st.columns([5, 1])
-    col_ts.caption(f"Last check: {dt_cls.now().strftime('%H:%M:%S')}")
-    with col_btn:
-        if st.button("↻ Fetch now", use_container_width=True):
-            with st.spinner("Fetching…"):
-                subprocess.run(
-                    [sys.executable, str(FETCH_ELEXON), "--append"], capture_output=True
-                )
-            st.cache_data.clear()
-
-    if not today_fc_path.exists():
-        st.info(
-            f"No forecast for today ({today_str}). "
-            "Click **Refresh Data & Run Forecast** in the sidebar to generate one."
-        )
-        return
-
-    fc_today = pd.read_csv(today_fc_path, parse_dates=["settlement_datetime"])
-
-    # Read actuals directly (bypass cache so we always get the freshest file)
-    raw_today = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
-    actuals_today = raw_today[
-        raw_today["settlement_date"].dt.strftime("%Y-%m-%d") == today_str
-    ][["settlement_period", "ssp"]].rename(columns={"ssp": "ssp_actual"})
-    n_settled = len(actuals_today)
-
-    # Current settlement period based on local clock
-    now_local = pd.Timestamp.now()
-    current_sp = min(int(now_local.hour * 2 + now_local.minute // 30 + 1), 48)
-    now_dt = pd.Timestamp(today_str) + pd.Timedelta(minutes=30 * (current_sp - 1))
-
-    # Metrics row (only shown when actuals are available)
-    if n_settled > 0:
-        merged_live = fc_today.merge(actuals_today, on="settlement_period", how="inner")
-        merged_live["abs_error"] = (
-            merged_live["ssp_predicted"] - merged_live["ssp_actual"]
-        ).abs()
-        running_mae = merged_live["abs_error"].mean()
-        max_err     = merged_live["abs_error"].max()
-        worst_sp    = int(merged_live.loc[merged_live["abs_error"].idxmax(), "settlement_period"])
-
-        lm1, lm2, lm3, lm4 = st.columns(4)
-        lm1.metric("Settled periods", f"{n_settled} / 48")
-        lm2.metric("Running MAE", f"£{running_mae:.2f}/MWh")
-        lm3.metric("Max error so far", f"£{max_err:.2f}/MWh")
-        lm4.metric("Worst SP", f"SP {worst_sp}")
-
-    # Chart
-    fig_live = go.Figure()
-
-    # Full forecast curve (dotted orange)
-    fig_live.add_trace(go.Scatter(
-        x=fc_today["settlement_datetime"], y=fc_today["ssp_predicted"],
-        name="Forecast", line=dict(color="#ff7f0e", width=2, dash="dot"),
-        hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}/MWh<extra></extra>",
-        customdata=fc_today["settlement_period"],
-    ))
-
-    # Actual SSP for settled periods (solid blue)
-    if n_settled > 0:
-        fig_live.add_trace(go.Scatter(
-            x=merged_live["settlement_datetime"], y=merged_live["ssp_actual"],
-            name="Actual SSP", line=dict(color="#1f77b4", width=2.5),
-            hovertemplate="SP %{customdata}<br>Actual £%{y:.2f}/MWh<extra></extra>",
-            customdata=merged_live["settlement_period"],
+    fig_h2 = go.Figure()
+    if "ssp_q10" in fc_h2.columns:
+        fig_h2.add_trace(go.Scatter(
+            x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(42,157,143,0.15)",
+            line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
         ))
-    else:
-        st.caption(
-            "No actuals yet for today — Elexon publishes initial settlement prices "
-            "after each period. Click **↻ Fetch now** or check back later."
-        )
-
-    # Vertical "Now" line — use add_shape to avoid Plotly type-mixing bug
-    # with add_vline annotation positioning on datetime axes
-    x_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-    fig_live.add_shape(
-        type="line",
-        x0=x_str, x1=x_str, y0=0, y1=1, yref="paper",
-        line=dict(color="grey", width=1.5, dash="solid"),
-    )
-    fig_live.add_annotation(
-        x=x_str, yref="paper", y=0.98,
-        text=f"Now · SP {current_sp}",
-        showarrow=False, font=dict(color="grey", size=11),
-        xanchor="right",
-    )
-
-    fig_live.update_layout(
-        xaxis_title="Settlement Period", yaxis_title="£/MWh",
-        height=360, margin=dict(t=30, b=40), hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig_live, use_container_width=True)
-
-
-live_comparison_panel()
+    fig_h2.add_trace(go.Scatter(
+        x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
+        name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
+        hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
+        customdata=fc_h2["settlement_period"],
+    ))
+    fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
+                     annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
+    fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
+                          height=300, margin=dict(t=10, b=40), hovermode="x unified",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(fig_h2)
 
 st.divider()
 
@@ -281,26 +254,29 @@ st.divider()
 st.subheader("Live Forecast Verification")
 st.caption(
     "Compares each archived day-ahead forecast against the Elexon actuals once they are available. "
-    "Click **Refresh Data & Run Forecast** in the sidebar to pull the latest prices."
+    "Forecast is generated automatically each day at 12:30 UTC."
 )
 
 archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []
 
+# Separate Phase 2 and Phase 3 archives; prefer Phase 3 for each date
+def _archive_date(f):
+    stem = f.stem  # "forecast_2026-05-18" or "forecast_phase3_2026-05-18"
+    return stem.replace("forecast_phase3_", "").replace("forecast_", "")
+
 if not archived:
     st.info("No archived forecasts yet. Run the forecast once to start tracking.")
 else:
-    # Find which archived dates also have actuals in the loaded data
     actual_dates = set(df["settlement_date"].dt.strftime("%Y-%m-%d").unique())
-    verified_dates = [
-        f.stem.replace("forecast_", "")
-        for f in archived
-        if f.stem.replace("forecast_", "") in actual_dates
-    ]
-    pending_dates = [
-        f.stem.replace("forecast_", "")
-        for f in archived
-        if f.stem.replace("forecast_", "") not in actual_dates
-    ]
+    # Build date → file mapping, preferring phase3 archives
+    date_to_file: dict = {}
+    for f in archived:
+        d = _archive_date(f)
+        if d not in date_to_file or "phase3" in f.stem:
+            date_to_file[d] = f
+
+    verified_dates = [d for d in date_to_file if d in actual_dates]
+    pending_dates  = [d for d in date_to_file if d not in actual_dates]
 
     if pending_dates:
         st.info(
@@ -318,7 +294,7 @@ else:
         )
 
         fc_v = pd.read_csv(
-            FORECASTS_DIR / f"forecast_{sel_date}.csv",
+            date_to_file[sel_date],
             parse_dates=["settlement_datetime"],
         )
         act_v = (
@@ -347,6 +323,24 @@ else:
 
         # Actual vs predicted time series
         fig_v = go.Figure()
+        _has_quantiles = "ssp_q10" in merged.columns and "ssp_q90" in merged.columns
+        if _has_quantiles:
+            fig_v.add_trace(go.Scatter(
+                x=merged["settlement_datetime"], y=merged["ssp_q90"],
+                name="P90", line=dict(color="rgba(0,0,0,0)"),
+                hovertemplate="SP %{customdata}<br>P90 £%{y:.2f}<extra></extra>",
+                customdata=merged["settlement_period"],
+                showlegend=False,
+            ))
+            fig_v.add_trace(go.Scatter(
+                x=merged["settlement_datetime"], y=merged["ssp_q10"],
+                name="P10–P90 band",
+                fill="tonexty",
+                fillcolor="rgba(255,127,14,0.15)",
+                line=dict(color="rgba(0,0,0,0)"),
+                hovertemplate="SP %{customdata}<br>P10 £%{y:.2f}<extra></extra>",
+                customdata=merged["settlement_period"],
+            ))
         fig_v.add_trace(go.Scatter(
             x=merged["settlement_datetime"], y=merged["ssp_actual"],
             name="Actual SSP", line=dict(color="#1f77b4", width=2),
@@ -355,7 +349,7 @@ else:
         ))
         fig_v.add_trace(go.Scatter(
             x=merged["settlement_datetime"], y=merged["ssp_predicted"],
-            name="Forecast SSP", line=dict(color="#ff7f0e", width=2, dash="dot"),
+            name="Forecast P50", line=dict(color="#ff7f0e", width=2, dash="dot"),
             hovertemplate="SP %{customdata}<br>Forecast £%{y:.2f}<extra></extra>",
             customdata=merged["settlement_period"],
         ))
@@ -364,7 +358,7 @@ else:
             height=340, margin=dict(t=10, b=40), hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_v, use_container_width=True)
+        st.plotly_chart(fig_v)
 
         # Error by settlement period + error histogram side by side
         col_ep, col_eh = st.columns(2)
@@ -389,7 +383,7 @@ else:
                 title_text="Error by Settlement Period", title_x=0,
                 showlegend=False,
             )
-            st.plotly_chart(fig_ep, use_container_width=True)
+            st.plotly_chart(fig_ep)
 
         with col_eh:
             fig_eh = px.histogram(
@@ -402,7 +396,7 @@ else:
                 height=300, margin=dict(t=30, b=40),
                 title_text="Error Distribution (Predicted − Actual)", title_x=0,
             )
-            st.plotly_chart(fig_eh, use_container_width=True)
+            st.plotly_chart(fig_eh)
 
 st.divider()
 
@@ -449,17 +443,28 @@ fig_ts.update_layout(
     margin=dict(t=10, b=40),
     hovermode="x unified",
 )
-st.plotly_chart(fig_ts, use_container_width=True)
+st.plotly_chart(fig_ts)
 
 # ── Heatmap + Imbalance side by side ─────────────────────────────────────────
 col_left, col_right = st.columns([3, 2])
 
 with col_left:
-    st.subheader("Daily SSP Heatmap by Settlement Period")
-    pivot = dff.pivot_table(
+    # Heatmap: cap at 90 days — column names must include year so Plotly
+    # doesn't misinterpret bare "MM-DD" strings as year 2003/2004 dates.
+    # Fill remaining NaN (DST days with ≠48 SPs) via forward-fill so no gaps.
+    _hm_days  = 90
+    _hm_end   = dff["settlement_date"].max()
+    _hm_start = _hm_end - pd.Timedelta(days=_hm_days - 1)
+    dff_hm = dff[dff["settlement_date"] >= _hm_start]
+    st.subheader(f"Daily SSP Heatmap by Settlement Period (last {_hm_days} days)")
+
+    pivot = dff_hm.pivot_table(
         index="settlement_period", columns="settlement_date", values="ssp", aggfunc="mean"
     )
-    pivot.columns = pivot.columns.strftime("%m-%d")
+    # Keep full YYYY-MM-DD label → unique, correctly ordered, no year ambiguity
+    pivot.columns = pivot.columns.strftime("%Y-%m-%d")
+    # Forward-fill rare NaN cells (DST 46/50-SP days) to remove visual gaps
+    pivot = pivot.ffill(axis=0).bfill(axis=0)
 
     fig_heat = px.imshow(
         pivot,
@@ -468,8 +473,8 @@ with col_left:
         labels=dict(x="Date", y="Settlement Period", color="SSP £/MWh"),
     )
     fig_heat.update_layout(height=420, margin=dict(t=10, b=40))
-    fig_heat.update_xaxes(tickangle=45, nticks=15)
-    st.plotly_chart(fig_heat, use_container_width=True)
+    fig_heat.update_xaxes(tickangle=45, nticks=20)
+    st.plotly_chart(fig_heat)
 
 with col_right:
     st.subheader("Net Imbalance Volume")
@@ -496,46 +501,181 @@ with col_right:
         margin=dict(t=10, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig_niv, use_container_width=True)
+    st.plotly_chart(fig_niv)
 
 # ── Average daily profile ────────────────────────────────────────────────────
 st.subheader("Average Settlement Period Profile (SSP)")
 
-profile = (
-    dff.groupby("settlement_period")[["ssp", "time_label"]]
-    .agg({"ssp": "mean", "time_label": "first"})
-    .reset_index()
-)
+col_sp, col_wk = st.columns(2)
 
-fig_profile = go.Figure()
-fig_profile.add_trace(
-    go.Scatter(
-        x=profile["time_label"], y=profile["ssp"],
-        name="Avg SSP", fill="tozeroy",
-        line=dict(color="#1f77b4"),
+with col_sp:
+    _sp_dff = dff[dff["settlement_period"] <= 48]
+    profile = (
+        _sp_dff
+        .groupby("settlement_period")[["ssp", "time_label"]]
+        .agg({"ssp": "mean", "time_label": "first"})
+        .reset_index()
+        .sort_values("settlement_period")
     )
-)
-fig_profile.update_layout(
-    xaxis_title="Time of Day (HH:MM)",
-    yaxis_title="£/MWh",
-    height=320,
-    margin=dict(t=10, b=40),
-    hovermode="x unified",
-    showlegend=False,
-)
-st.plotly_chart(fig_profile, use_container_width=True)
+    pn_profile = (
+        _sp_dff.groupby("settlement_period")["price_derivation_code"]
+        .apply(lambda x: (x == "P").mean() * 100)
+        .reset_index()
+        .rename(columns={"price_derivation_code": "pct_P"})
+    )
+    profile = profile.merge(pn_profile, on="settlement_period")
+
+    # Use integer settlement_period on x-axis (avoids Plotly misinterpreting
+    # HH:MM strings as dates, which caused a diagonal fill artifact).
+    _sp_ticks = profile["settlement_period"].tolist()[::4]
+    _lb_ticks  = profile["time_label"].tolist()[::4]
+
+    fig_profile = go.Figure()
+    # SSP fill + line (left y-axis)
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"].tolist() + profile["settlement_period"].tolist()[::-1],
+        y=profile["ssp"].tolist() + [0] * len(profile),
+        fill="toself",
+        fillcolor="rgba(31,119,180,0.2)",
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        showlegend=False,
+        yaxis="y1",
+    ))
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=profile["ssp"],
+        name="Avg SSP",
+        line=dict(color="#1f77b4", width=2),
+        hovertemplate="SP %{x}  %{customdata}<br>SSP £%{y:.2f}/MWh<extra></extra>",
+        customdata=profile["time_label"],
+        yaxis="y1",
+    ))
+    # % P code (right y-axis)
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=profile["pct_P"],
+        name="% P code",
+        line=dict(color="#d62728", width=1.5, dash="dot"),
+        hovertemplate="SP %{x}<br>P code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
+    fig_profile.add_trace(go.Scatter(
+        x=profile["settlement_period"], y=100 - profile["pct_P"],
+        name="% N code",
+        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+        hovertemplate="SP %{x}<br>N code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
+    fig_profile.update_layout(
+        xaxis=dict(
+            tickmode="array", tickvals=_sp_ticks, ticktext=_lb_ticks,
+            title="Time of Day (HH:MM)",
+        ),
+        yaxis=dict(title="£/MWh", rangemode="tozero"),
+        yaxis2=dict(
+            title="% of periods",
+            overlaying="y", side="right",
+            range=[0, 100], ticksuffix="%",
+            showgrid=False,
+        ),
+        height=320,
+        margin=dict(t=30, b=40),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        title=dict(text="Intra-day profile (selected range)", font=dict(size=13)),
+    )
+    st.plotly_chart(fig_profile)
+
+with col_wk:
+    # Week-of-year profile: last 3 years, ISO weeks 1–52, averaged across years
+    _wk_end   = df["settlement_date"].max()
+    _wk_start = _wk_end - pd.Timedelta(days=3 * 365)
+    df_3yr = df[df["settlement_date"] >= _wk_start].copy()
+    df_3yr["week"] = df_3yr["settlement_date"].dt.isocalendar().week.astype(int)
+    df_3yr = df_3yr[df_3yr["week"] <= 52]   # drop rare week-53 partial ISO weeks
+
+    week_profile = (
+        df_3yr.groupby("week")["ssp"]
+        .mean()
+        .reset_index()
+        .sort_values("week")
+    )
+    pn_week_profile = (
+        df_3yr[df_3yr["settlement_period"] <= 48]
+        .groupby("week")["price_derivation_code"]
+        .apply(lambda x: (x == "P").mean() * 100)
+        .reset_index()
+        .rename(columns={"price_derivation_code": "pct_P"})
+    )
+    week_profile = week_profile.merge(pn_week_profile, on="week")
+
+    fig_week = go.Figure()
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"].tolist() + week_profile["week"].tolist()[::-1],
+        y=week_profile["ssp"].tolist() + [0] * len(week_profile),
+        fill="toself",
+        fillcolor="rgba(42,157,143,0.2)",
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=week_profile["ssp"],
+        name="Avg SSP",
+        line=dict(color="#2a9d8f", width=2),
+        hovertemplate="Week %{x}<br>£%{y:.2f}/MWh<extra></extra>",
+    ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=week_profile["pct_P"],
+        name="% P code",
+        line=dict(color="#d62728", width=1.5, dash="dot"),
+        hovertemplate="Week %{x}<br>P code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
+    fig_week.add_trace(go.Scatter(
+        x=week_profile["week"], y=100 - week_profile["pct_P"],
+        name="% N code",
+        line=dict(color="#2ca02c", width=1.5, dash="dot"),
+        hovertemplate="Week %{x}<br>N code: %{y:.0f}%<extra></extra>",
+        yaxis="y2",
+    ))
+    # Season band annotations
+    for x0, x1, label in [(1, 13, "Winter"), (14, 26, "Spring"),
+                           (27, 39, "Summer"), (40, 52, "Autumn")]:
+        fig_week.add_vrect(x0=x0, x1=x1, fillcolor="rgba(0,0,0,0.03)",
+                           layer="below", line_width=0,
+                           annotation_text=label, annotation_position="top left",
+                           annotation_font_size=9, annotation_font_color="#888")
+    fig_week.update_layout(
+        xaxis=dict(title="ISO Week of Year", tickmode="array",
+                   tickvals=list(range(1, 53, 4)),
+                   ticktext=[str(w) for w in range(1, 53, 4)]),
+        yaxis=dict(title="£/MWh", rangemode="tozero"),
+        yaxis2=dict(
+            title="% of periods",
+            overlaying="y", side="right",
+            range=[0, 100], ticksuffix="%",
+            showgrid=False,
+        ),
+        height=320,
+        margin=dict(t=30, b=40),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        title=dict(text="Seasonal profile (last 3 years, weeks averaged)", font=dict(size=13)),
+    )
+    st.plotly_chart(fig_week)
 
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
 st.caption(
-    "**N (Normal)** — SSP/SBP set from the accepted bid-offer stack: the actual marginal cost of balancing.  "
-    "**P (Replacement Price)** — bid-offer stack too thin to price fairly; ESO substitutes a reference price, "
-    "making SSP = SBP by definition. ~50% of periods trigger P-code."
+    "**N** — genuine market auction price; **P** — formula fallback when the auction is unreliable (~50% each). "
+    "N is more common overnight (simple dispatch); P dominates evening peaks (complex multi-generator dispatch). "
+    "Bar height = count of periods per code per day (max 48). K is a rare special case (9 times in 5 years)."
 )
 
-# Full-width: daily P/N period counts over time
+# Full-width: daily P/N period counts over time (capped at SP 1-48; DST days have 50 SPs)
 daily_pdc = (
-    dff.groupby(["settlement_date", "price_derivation_code"])
+    dff[dff["settlement_period"] <= 48]
+    .groupby(["settlement_date", "price_derivation_code"])
     .size()
     .reset_index(name="count")
 )
@@ -544,7 +684,7 @@ fig_pdc = px.bar(
     x="settlement_date",
     y="count",
     color="price_derivation_code",
-    color_discrete_map={"P": "#e377c2", "N": "#17becf"},
+    color_discrete_map={"N": "#17becf", "P": "#e377c2", "K": "#d62728"},
     labels={"settlement_date": "Date", "count": "Periods", "price_derivation_code": "Code"},
     barmode="stack",
 )
@@ -553,7 +693,7 @@ fig_pdc.update_layout(
     margin=dict(t=10, b=40),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
-st.plotly_chart(fig_pdc, use_container_width=True)
+st.plotly_chart(fig_pdc)
 
 # Box plot + stats table side by side at equal width
 col_pdc_box, col_pdc_tbl = st.columns(2)
@@ -574,7 +714,7 @@ with col_pdc_box:
         margin=dict(t=10, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig_box, use_container_width=True)
+    st.plotly_chart(fig_box)
 
 with col_pdc_tbl:
     st.markdown("**Summary statistics by code**")
@@ -585,7 +725,7 @@ with col_pdc_tbl:
         .reset_index()
         .rename(columns={"price_derivation_code": "Code"})
     )
-    st.dataframe(stats, use_container_width=True, hide_index=True)
+    st.dataframe(stats, width="stretch", hide_index=True)
     st.caption(
         "P-code prices cluster tighter around the replacement reference value. "
         "N-code periods show wider spread — driven by the actual market stack."
@@ -593,39 +733,95 @@ with col_pdc_tbl:
 
 # ── Actual vs Predicted ───────────────────────────────────────────────────────
 st.divider()
-st.subheader("Model Forecast vs Actual (HGBR — 5-year + Weather · Test: May 11–17 2026)")
+_pred_path = PRED_PATH_P3
+_is_p3     = True
 
-if PRED_PATH.exists():
-    pred = pd.read_csv(PRED_PATH, parse_dates=["settlement_datetime"])
+if _pred_path.exists():
+    _test_pred_tmp = pd.read_csv(_pred_path)
+    _test_dates    = sorted(_test_pred_tmp["settlement_date"].unique())
+    _test_label    = f"{_test_dates[0]} → {_test_dates[-1]}" if _test_dates else "—"
+else:
+    _test_label = "—"
+st.subheader(f"Model Forecast vs Actual (Phase 3 Level-Shape · Test: {_test_label})")
+
+if _pred_path.exists():
+    pred = pd.read_csv(_pred_path, parse_dates=["settlement_datetime"])
+    has_q_pred = "ssp_q50" in pred.columns
 
     # ── Metrics row ───────────────────────────────────────────────────────────
-    mae_val  = pred["abs_error"].mean()
-    rmse_val = (pred["error"] ** 2).mean() ** 0.5
-    denom    = (pred["ssp_actual"].abs() + pred["ssp_predicted"].abs()) / 2
-    smape_val = (pred["abs_error"] / denom.replace(0, float("nan"))).mean() * 100
+    mae_val   = pred["abs_error"].mean() if "abs_error" in pred.columns else (pred["ssp_predicted"] - pred["ssp_actual"]).abs().mean()
+    pred["_err"] = pred["ssp_predicted"] - pred["ssp_actual"]
+    pred["_abs"]  = pred["_err"].abs()
+    rmse_val  = (pred["_err"] ** 2).mean() ** 0.5
+    denom     = (pred["ssp_actual"].abs() + pred["ssp_predicted"].abs()) / 2
+    smape_val = (pred["_abs"] / denom.replace(0, float("nan"))).mean() * 100
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("MAE", f"£{mae_val:.2f}/MWh")
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("MAE (P50, all periods)", f"£{mae_val:.2f}/MWh")
     mc2.metric("RMSE", f"£{rmse_val:.2f}/MWh")
     mc3.metric("sMAPE", f"{smape_val:.1f}%")
     mc4.metric("Test periods", len(pred))
 
-    # ── Time series: actual vs predicted ─────────────────────────────────────
+    # Phase 3 decomposition metrics
+    if _is_p3 and "actual_daily_level" in pred.columns and "pred_level_q50" in pred.columns:
+        level_errs = (
+            pred.groupby("settlement_date")
+            .apply(lambda g: abs(g["pred_level_q50"].iloc[0] - g["actual_daily_level"].iloc[0]))
+        )
+        mc5.metric("Level MAE", f"£{level_errs.mean():.2f}/MWh/day",
+                   help="Error in predicting the day's average price level (Stage 1)")
+    else:
+        elevated = pred[pred["ssp_actual"] > 200]
+        elev_mae = elevated["_abs"].mean() if len(elevated) > 0 else float("nan")
+        mc5.metric("MAE (SSP > £200)", f"£{elev_mae:.1f}" if not pd.isna(elev_mae) else "n/a")
+
+    # Phase 3 shape decomposition row
+    if _is_p3 and "actual_daily_level" in pred.columns:
+        import numpy as np
+        from scipy.stats import pearsonr
+        shape_corrs, peak_gaps = [], []
+        for _, day in pred.groupby("settlement_date"):
+            act  = day["ssp_actual"].values;  am = act.mean()
+            prd  = day["ssp_predicted"].values; pm = prd.mean()
+            if (act - am).std() > 0 and (prd - pm).std() > 0:
+                r, _ = pearsonr(act - am, prd - pm)
+                shape_corrs.append(r)
+            peak_gaps.append(abs(int(np.argmax(act)) - int(np.argmax(prd))))
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.metric("Shape correlation", f"{float(pd.Series(shape_corrs).mean()):.3f}",
+                   help="Mean Pearson r between predicted and actual intra-day profiles per day")
+        dc2.metric("Peak timing error", f"{float(pd.Series(peak_gaps).mean()):.1f} SPs",
+                   help="Mean absolute SP offset between predicted and actual daily peak")
+        _p3_mae = f"£{_p3.get('MAE', 0):.2f}" if _p3 else "—"
+        dc3.metric("Phase 3 MAE (this test)", f"{_p3_mae}/MWh",
+                   help="Phase 3 two-stage non-recursive · CPI-adjusted · 3-year rolling train window")
+
+    # ── Time series: actual vs predicted with quantile band ───────────────────
     fig_pred = go.Figure()
+
+    if has_q_pred:
+        fig_pred.add_trace(go.Scatter(
+            x=pd.concat([pred["settlement_datetime"], pred["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([pred["ssp_q90"], pred["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(255,127,14,0.12)",
+            line=dict(color="rgba(255,127,14,0)"),
+            hoverinfo="skip", name="P10–P90",
+        ))
+
     fig_pred.add_trace(go.Scatter(
         x=pred["settlement_datetime"], y=pred["ssp_actual"],
         name="Actual SSP", line=dict(color="#1f77b4", width=1.5),
     ))
     fig_pred.add_trace(go.Scatter(
         x=pred["settlement_datetime"], y=pred["ssp_predicted"],
-        name="Predicted SSP", line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+        name="P50 Forecast", line=dict(color="#ff7f0e", width=1.5, dash="dot"),
     ))
     fig_pred.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
         height=380, margin=dict(t=10, b=40), hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig_pred, use_container_width=True)
+    st.plotly_chart(fig_pred)
 
     # ── Scatter + error distribution side by side ─────────────────────────────
     col_sc, col_err = st.columns(2)
@@ -648,36 +844,39 @@ if PRED_PATH.exists():
             height=360, margin=dict(t=30, b=40),
             title_text="Predicted vs Actual", title_x=0,
         )
-        st.plotly_chart(fig_sc, use_container_width=True)
+        st.plotly_chart(fig_sc)
 
     with col_err:
         fig_err = px.histogram(
-            pred, x="error", nbins=40,
+            pred, x="_err", nbins=40,
             color_discrete_sequence=["#ff7f0e"],
-            labels={"error": "Forecast Error (£/MWh)", "count": "Periods"},
+            labels={"_err": "Forecast Error (£/MWh)", "count": "Periods"},
         )
         fig_err.add_vline(x=0, line_dash="dash", line_color="black")
         fig_err.update_layout(
             height=360, margin=dict(t=30, b=40),
             title_text="Error Distribution (Predicted − Actual)", title_x=0,
         )
-        st.plotly_chart(fig_err, use_container_width=True)
+        st.plotly_chart(fig_err)
 
     # ── Daily error summary ───────────────────────────────────────────────────
     daily_err = (
-        pred.groupby("settlement_date")["abs_error"]
+        pred.groupby("settlement_date")["_abs"]
         .agg(["mean", "max"])
         .reset_index()
         .rename(columns={"mean": "Mean AE", "max": "Max AE"})
     )
     fig_daily_err = go.Figure()
+    # Draw Max AE first (taller bar, behind) then Mean AE on top (shorter bar, in front).
+    # This ensures Mean AE (blue) is cleanly visible at the bottom and Max AE (orange)
+    # shows only for the portion above Mean AE — no colour blending.
+    fig_daily_err.add_trace(go.Bar(
+        x=daily_err["settlement_date"], y=daily_err["Max AE"],
+        name="Max AE", marker_color="#ff7f0e",
+    ))
     fig_daily_err.add_trace(go.Bar(
         x=daily_err["settlement_date"], y=daily_err["Mean AE"],
         name="Mean AE", marker_color="#1f77b4",
-    ))
-    fig_daily_err.add_trace(go.Bar(
-        x=daily_err["settlement_date"], y=daily_err["Max AE"],
-        name="Max AE", marker_color="#ff7f0e", opacity=0.6,
     ))
     fig_daily_err.update_layout(
         xaxis_title="Date", yaxis_title="£/MWh",
@@ -685,39 +884,88 @@ if PRED_PATH.exists():
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         title_text="Daily Forecast Error", title_x=0,
     )
-    st.plotly_chart(fig_daily_err, use_container_width=True)
+    st.plotly_chart(fig_daily_err)
 
 else:
-    st.info("No predictions found. Run `python src/models/train_lgbm.py` to generate them.")
+    st.info("No predictions found. Run `python src/models/train_phase3.py` to generate them.")
 
 # ── Feature importance ────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Feature Importance (Top 20 · Permutation MAE Reduction)")
-st.caption("Computed on the validation set via permutation importance — shows how much each feature reduces MAE when present.")
+st.subheader("Feature Importance (Phase 3 · Top 20)")
+st.caption(
+    "Level model (Stage 1): absolute Spearman rank correlation with the CPI-deflated daily mean target "
+    "over the full training set — stable with O(1000) daily rows. "
+    "Shape model (Stage 2): permutation importance (n_repeats=5) on the validation set."
+)
 
-if FI_PATH.exists():
-    fi = pd.read_csv(FI_PATH).drop_duplicates(subset="feature").nlargest(20, "importance_mean")
-    fi = fi.sort_values("importance_mean")  # ascending for horizontal bar
 
-    fig_fi = go.Figure()
-    fig_fi.add_trace(go.Bar(
-        x=fi["importance_mean"],
-        y=fi["feature"],
-        orientation="h",
-        error_x=dict(type="data", array=fi["importance_std"].tolist(), visible=True),
-        marker_color="#1f77b4",
-        hovertemplate="%{y}<br>MAE reduction: %{x:.4f}<extra></extra>",
-    ))
-    fig_fi.update_layout(
-        xaxis_title="Mean MAE Reduction (£/MWh)",
-        yaxis_title=None,
-        height=520,
-        margin=dict(t=10, b=40, l=200),
-        showlegend=False,
+@st.cache_data(ttl=7200)
+def load_phase3_importances():
+    import json
+    if not (LEVEL_IMP_CSV.exists() and SHAPE_IMP_CSV.exists()):
+        return None, None, None, None
+    with open(LEVEL_FEAT_JSON) as f:
+        n_level = len(json.load(f))
+    with open(SHAPE_FEAT_JSON) as f:
+        n_shape = len(json.load(f))
+    level_imp = (
+        pd.read_csv(LEVEL_IMP_CSV)
+        .nlargest(20, "importance_mean")
+        .sort_values("importance_mean")
+        .rename(columns={"importance_mean": "importance"})
     )
-    st.plotly_chart(fig_fi, use_container_width=True)
+    shape_imp = (
+        pd.read_csv(SHAPE_IMP_CSV)
+        .nlargest(20, "importance_mean")
+        .sort_values("importance_mean")
+        .rename(columns={"importance_mean": "importance"})
+    )
+    return level_imp, shape_imp, n_level, n_shape
+
+
+_level_imp, _shape_imp, _n_level, _n_shape = load_phase3_importances()
+
+if _level_imp is not None:
+    fi_tab1, fi_tab2 = st.tabs([
+        f"Level model (Stage 1 · {_n_level} features)",
+        f"Shape model (Stage 2 · {_n_shape} features)",
+    ])
+
+    def _fi_chart(imp_df, color):
+        fig = go.Figure()
+        _err = imp_df["importance_std"].tolist() if "importance_std" in imp_df.columns else None
+        fig.add_trace(go.Bar(
+            x=imp_df["importance"],
+            y=imp_df["feature"],
+            orientation="h",
+            marker_color=color,
+            error_x=dict(type="data", array=_err, visible=_err is not None),
+            hovertemplate="%{y}<br>Importance: %{x:.4f}<extra></extra>",
+        ))
+        fig.update_layout(
+            xaxis_title="Mean Decrease in Impurity (relative)",
+            yaxis_title=None,
+            height=520,
+            margin=dict(t=10, b=40, l=220),
+            showlegend=False,
+        )
+        return fig
+
+    with fi_tab1:
+        st.caption(
+            "Daily-level features: SSP/NIV lags, rolling stats, weather, wind/gas generation lags, "
+            "CPI index/YoY, calendar harmonics."
+        )
+        st.plotly_chart(_fi_chart(_level_imp, "#1a6ea0"))
+
+    with fi_tab2:
+        st.caption(
+            "SP-level fixed-point features: lag-48/96/336 for SSP, NIV, weather, wind/gas; "
+            "daily-level lags merged from Stage 1; calendar (SP position, day-of-week, harmonics)."
+        )
+        st.plotly_chart(_fi_chart(_shape_imp, "#e07b39"))
 else:
-    st.info("No feature importance file found. Run `python src/models/train_lgbm.py`.")
+    st.info("No Phase 3 models found. Run `python src/models/train_phase3.py` to generate them.")
 
 # ── Raw data table ─────────────────────────────────────────────────────────────
 with st.expander("Raw data"):
@@ -726,7 +974,7 @@ with st.expander("Raw data"):
              "net_imbalance_volume", "price_derivation_code", "replacement_price"]]
         .sort_values(["settlement_date", "settlement_period"], ascending=False)
         .reset_index(drop=True),
-        use_container_width=True,
+        width="stretch",
         height=300,
     )
     st.download_button(

@@ -1,0 +1,155 @@
+name: Daily Forecast Pipeline
+
+on:
+  schedule:
+    # 12:30 UTC daily — Elexon Initial Settlement (D+1) is published by ~12:00 UTC
+    - cron: '30 12 * * *'
+  workflow_dispatch:  # manual trigger from GitHub Actions UI
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to push updated forecast files back to repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install pipeline dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # Cache raw data by ISO week — full history re-fetch once a week,
+      # incremental append on the remaining 6 days.
+      - name: Get ISO week for cache key
+        id: date
+        run: echo "week=$(date -u +%Y-W%V)" >> $GITHUB_OUTPUT
+
+      - name: Restore raw data cache
+        uses: actions/cache@v4
+        id: data-cache
+        with:
+          path: data/raw/
+          key: raw-data-${{ steps.date.outputs.week }}
+          restore-keys: raw-data-
+
+      # ── Full history fetch (cache miss = first run this week) ──────────────
+      - name: Fetch 3-year price history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_elexon.py --start 2021-01-01
+
+      - name: Fetch 3-year weather history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_weather.py --start 2021-01-01
+
+      - name: Fetch 3-year generation mix history
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: python src/data/fetch_generation.py --start 2021-01-01
+
+      # ── Incremental update (cache hit = data already exists) ──────────────
+      - name: Append latest prices
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_elexon.py --append
+
+      - name: Update recent weather
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_weather.py --append
+
+      - name: Append latest generation mix
+        if: steps.data-cache.outputs.cache-hit == 'true'
+        run: python src/data/fetch_generation.py --append
+
+      # ── Always fetch CPI (small monthly dataset) ──────────────────────────
+      - name: Fetch CPI index
+        run: python src/data/fetch_cpi.py
+
+      # ── Fetch today's partial settlement data (SP1-25, near real-time) ────
+      # Used as intraday realized features in the level model — provides a
+      # strong partial-day anchor for the daily mean prediction.
+      - name: Fetch today's intraday prices
+        run: python src/data/fetch_intraday.py
+
+      # ── Build features and train ───────────────────────────────────────────
+      - name: Extend processed dataset
+        run: python src/data/extend_dataset.py
+
+      - name: Rebuild features
+        run: |
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_5yr.csv
+
+      - name: Retrain Phase 3 models
+        run: python src/models/train_phase3.py
+
+      - name: Run H+1 and H+2 forecast
+        run: python src/models/forecast_phase3.py
+
+      # ── Commit outputs back to repo ───────────────────────────────────────
+      # Data files (CSV, pkl) go to the streamlit-data branch only — keeps
+      # code branches clean so PRs don't carry 271k-line data diffs.
+      # Streamlit Cloud is configured to deploy from streamlit-data.
+      - name: Commit and push forecast outputs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # ── 1. Push code-only trigger to phase-3 ──────────────────────────
+          sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
+            src/dashboard/streamlit_app.py
+          git add src/dashboard/streamlit_app.py
+          git diff --staged --quiet || git commit -m "Pipeline ran ${TODAY}"
+          git push
+
+          # ── 2. Push code + all data to streamlit-data ─────────────────────
+          git fetch origin streamlit-data
+          git worktree add /tmp/sd origin/streamlit-data
+
+          # Sync latest source code into the worktree
+          rsync -a --exclude='.git' --exclude='data/raw/' \
+                --exclude='.venv/' --exclude='__pycache__/' \
+                --exclude='data/processed/' --exclude='model_assets/' \
+                . /tmp/sd/
+
+          # Copy generated data files
+          mkdir -p /tmp/sd/data/processed /tmp/sd/model_assets/forecasts
+          cp data/processed/dataset_5yr.csv /tmp/sd/data/processed/
+          cp model_assets/next_day_forecast_phase3.csv \
+             model_assets/day2_forecast_phase3.csv \
+             model_assets/phase3_metrics.json \
+             model_assets/test_predictions_phase3.csv \
+             model_assets/phase3_level_importance.csv \
+             model_assets/phase3_shape_importance.csv \
+             model_assets/level_q10.pkl \
+             model_assets/level_q50.pkl \
+             model_assets/level_q90.pkl \
+             model_assets/shape_q50.pkl \
+             model_assets/shape_h2_q50.pkl \
+             model_assets/neg_day_classifier.pkl \
+             /tmp/sd/model_assets/
+          cp model_assets/forecasts/*.csv /tmp/sd/model_assets/forecasts/ 2>/dev/null || true
+
+          cd /tmp/sd
+          git add -A
+          git add -f data/processed/dataset_5yr.csv model_assets/*.csv \
+                     model_assets/*.pkl model_assets/forecasts/
+          git diff --staged --quiet || git commit -m "Daily data update ${TODAY}"
+          git push origin streamlit-data
+
+          git worktree remove /tmp/sd --force

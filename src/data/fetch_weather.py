@@ -107,20 +107,60 @@ def fetch_uk_weather(start: str, end: str) -> pd.DataFrame:
     return combined
 
 
+def _last_date_in_csv(path: Path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, usecols=["datetime_utc"])
+    if df.empty:
+        return None
+    return pd.to_datetime(df["datetime_utc"]).max().date()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     default_end   = date.today() - timedelta(days=2)   # archive has ~2-day lag
     default_start = date(default_end.year - 5, default_end.month, default_end.day)
-    parser.add_argument("--start",  default=str(default_start))
+    parser.add_argument("--start",  default=None)
     parser.add_argument("--end",    default=str(default_end))
     parser.add_argument("--output", default=str(OUTPUT_FILE))
+    parser.add_argument("--append", action="store_true",
+                        help="Append to existing file instead of overwriting")
     args = parser.parse_args()
 
-    log.info("Fetching UK weather %s → %s", args.start, args.end)
-    df = fetch_uk_weather(args.start, args.end)
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.output, index=False)
-    log.info("Saved %d rows → %s", len(df), args.output)
+    output_path = Path(args.output)
+    end = date.fromisoformat(args.end)
+
+    if args.start is None:
+        if args.append and output_path.exists():
+            last = _last_date_in_csv(output_path)
+            start = (last + timedelta(days=1)) if last else default_start
+        else:
+            start = default_start
+    else:
+        start = date.fromisoformat(args.start)
+
+    if start > end:
+        log.info("Weather already up to date (last: %s). Nothing to fetch.", start - timedelta(days=1))
+        return
+
+    log.info("Fetching UK weather %s → %s", start, end)
+    df = fetch_uk_weather(str(start), str(end))
+
+    if args.append and output_path.exists():
+        existing = pd.read_csv(output_path)
+        existing["datetime_utc"] = pd.to_datetime(existing["datetime_utc"], utc=True)
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+        combined = (
+            pd.concat([existing, df], ignore_index=True)
+            .drop_duplicates(subset=["datetime_utc"])
+            .sort_values("datetime_utc")
+            .reset_index(drop=True)
+        )
+        df = combined
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
+    log.info("Saved %d rows → %s", len(df), output_path)
 
 
 if __name__ == "__main__":
