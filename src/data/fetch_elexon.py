@@ -1,28 +1,32 @@
 """
-Fetch UK electricity system prices (SSP/SBP) from the Elexon Insights API.
+Fetch UK electricity system prices (SSP/SBP) from the Elexon Insights Solution API.
+
+API:    https://data.elexon.co.uk/bmrs/api/v1
+Auth:   none required
+Output: data/raw/system_prices.csv
 
 Usage:
-    python src/data/fetch_elexon.py                          # last 12 months
-    python src/data/fetch_elexon.py --start 2024-01-01       # from date to today
-    python src/data/fetch_elexon.py --start 2024-01-01 --end 2024-06-30
+    python src/data/fetch_elexon.py                          # last 30 days
+    python src/data/fetch_elexon.py --start 2025-01-01 --end 2025-03-31
+    python src/data/fetch_elexon.py --start 2025-01-01 --end 2025-03-31 --append
     python src/data/fetch_elexon.py --months 6               # last N months
-
-Output:
-    data/raw/system_prices.csv
 """
 
 import argparse
+import logging
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import requests
 
 BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
-RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
+RAW_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
+OUTPUT_FILE = RAW_DATA_DIR / "system_prices.csv"
 
-COLUMNS = {
+COLUMN_MAP = {
     "settlementDate": "settlement_date",
     "settlementPeriod": "settlement_period",
     "systemSellPrice": "ssp",
@@ -30,80 +34,133 @@ COLUMNS = {
     "netImbalanceVolume": "net_imbalance_volume",
     "sellPriceAdjustment": "sell_price_adjustment",
     "buyPriceAdjustment": "buy_price_adjustment",
+    "priceDerivationCode": "price_derivation_code",
+    "replacementPrice": "replacement_price",
     "totalSystemAcceptedOfferVolume": "total_accepted_offer_mwh",
     "totalSystemAcceptedBidVolume": "total_accepted_bid_mwh",
 }
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-def fetch_system_prices_for_date(session: requests.Session, settlement_date: date) -> list[dict]:
-    url = f"{BASE_URL}/balancing/settlement/system-prices/{settlement_date.isoformat()}"
+
+def _parse_records(payload) -> list:
+    """Extract the list of records from a variety of API response shapes."""
+    if isinstance(payload, list):
+        return payload
+    for key in ("data", "items", "results"):
+        if key in payload and isinstance(payload[key], list):
+            return payload[key]
+    return []
+
+
+def fetch_day(settlement_date: str, session: requests.Session) -> pd.DataFrame:
+    """Return a DataFrame of system prices for one settlement date (YYYY-MM-DD)."""
+    url = f"{BASE_URL}/balancing/settlement/system-prices/{settlement_date}"
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("data", [])
+
+    records = _parse_records(resp.json())
+    if not records:
+        log.warning("No records returned for %s", settlement_date)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df = df.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns})
+    cols = [c for c in COLUMN_MAP.values() if c in df.columns]
+    df = df[cols].copy()
+
+    if "settlement_date" in df.columns:
+        df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date.astype(str)
+
+    return df.sort_values("settlement_period").reset_index(drop=True)
 
 
-def fetch_range(start: date, end: date, delay: float = 0.3) -> pd.DataFrame:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-
+def fetch_range(start: date, end: date, delay: float = 0.2) -> pd.DataFrame:
+    """Fetch system prices for [start, end] inclusive and return a single DataFrame."""
     session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
-
-    records = []
+    frames: list[pd.DataFrame] = []
     current = start
-    total_days = (end - start).days + 1
-
-    print(f"Fetching system prices: {start} to {end} ({total_days} days)")
 
     while current <= end:
+        date_str = current.strftime("%Y-%m-%d")
+        log.info("Fetching %s", date_str)
         try:
-            daily = fetch_system_prices_for_date(session, current)
-            records.extend(daily)
-            print(f"  {current}  {len(daily)} periods")
-        except requests.HTTPError as e:
-            print(f"  {current}  HTTP error: {e}")
-        except requests.RequestException as e:
-            print(f"  {current}  request failed: {e}")
-
+            df = fetch_day(date_str, session)
+            if not df.empty:
+                frames.append(df)
+        except requests.HTTPError as exc:
+            log.error("HTTP %s for %s — skipping", exc.response.status_code, date_str)
+        except Exception as exc:
+            log.error("Error fetching %s: %s — skipping", date_str, exc)
         current += timedelta(days=1)
         time.sleep(delay)
 
-    if not records:
-        raise RuntimeError("No data returned for the requested date range.")
+    if not frames:
+        return pd.DataFrame(columns=list(COLUMN_MAP.values()))
 
-    df = pd.DataFrame(records)
-
-    rename = {k: v for k, v in COLUMNS.items() if k in df.columns}
-    df = df.rename(columns=rename)
-
-    keep = list(rename.values())
-    df = df[[c for c in keep if c in df.columns]]
-
-    df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
-    df = df.sort_values(["settlement_date", "settlement_period"]).reset_index(drop=True)
-
-    return df
+    return pd.concat(frames, ignore_index=True)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fetch Elexon system prices.")
-    parser.add_argument("--start", type=date.fromisoformat, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", type=date.fromisoformat, help="End date (YYYY-MM-DD, default: today)")
-    parser.add_argument("--months", type=int, default=12, help="Lookback months if --start not given (default: 12)")
-    return parser.parse_args()
+def save(df: pd.DataFrame, path: Path, append: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if append and path.exists():
+        existing = pd.read_csv(path)
+        existing["settlement_date"] = existing["settlement_date"].astype(str)
+        df["settlement_date"] = df["settlement_date"].astype(str)
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["settlement_date", "settlement_period"]
+        ).sort_values(["settlement_date", "settlement_period"])
+        df = combined
+
+    df.to_csv(path, index=False)
+    log.info("Saved %d rows → %s", len(df), path)
 
 
-def main():
-    args = parse_args()
-    today = date.today()
-    end = args.end or today
-    start = args.start or (today - timedelta(days=args.months * 30))
+def _last_date_in_csv(path: Path) -> Optional[date]:
+    """Return the latest settlement_date in an existing CSV, or None if absent."""
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, usecols=["settlement_date"])
+    if df.empty:
+        return None
+    return date.fromisoformat(df["settlement_date"].max())
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch Elexon system prices (SSP/SBP)")
+    default_end = date.today() - timedelta(days=1)
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", default=str(default_end), help="End date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--months", type=int, default=None, help="Lookback months if --start not given")
+    parser.add_argument("--output", default=str(OUTPUT_FILE), help="Output CSV path")
+    parser.add_argument("--append", action="store_true", help="Append to existing CSV, deduplicating on (date, period)")
+    args = parser.parse_args()
+
+    output_path = Path(args.output)
+    end = date.fromisoformat(args.end)
+
+    if args.start is None:
+        last = _last_date_in_csv(output_path)
+        if last:
+            start = last + timedelta(days=1)
+            args.append = True
+        elif args.months:
+            start = end - timedelta(days=args.months * 30)
+        else:
+            start = end - timedelta(days=29)
+    else:
+        start = date.fromisoformat(args.start)
+
+    if start > end:
+        log.info("Data already up to date (last date: %s, end: %s). Nothing to fetch.", start - timedelta(days=1), end)
+        return
+
+    log.info("Fetching %s → %s", start, end)
     df = fetch_range(start, end)
-
-    out_path = RAW_DIR / "system_prices.csv"
-    df.to_csv(out_path, index=False)
-    print(f"\nSaved {len(df)} rows to {out_path}")
-    print(df.head())
+    save(df, output_path, append=args.append)
 
 
 if __name__ == "__main__":

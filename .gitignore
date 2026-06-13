@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.DS_Store
+
+# Large generated files — regenerate with build_features.py
+data/processed/features_5yr.csv
