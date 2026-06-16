@@ -36,7 +36,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+from correctors import AlphaCorrector, Corrector, load_state, save_state, KALMAN_STATE_PATH, get_corrector
 from fetch_generation import fetch_range as _fetch_ci_range
 from fetch_bmrs_forecasts import get_wind_pct_forecast
 
@@ -415,7 +417,14 @@ def build_shape_row_h2(h_idx: int, dt: pd.Timestamp,
 
 # ── Main forecast ─────────────────────────────────────────────────────────────
 
-def run_forecast(target_date: date = None, features_file: str = None) -> pd.DataFrame:
+def run_forecast(
+    target_date: date = None,
+    features_file: str = None,
+    corrector: "Corrector" = None,
+) -> pd.DataFrame:
+    if corrector is None:
+        corrector = get_corrector()
+
     # ── Load models ───────────────────────────────────────────────────────
     level_q10 = joblib.load(ASSETS_DIR / "level_q10.pkl")
     level_q50 = joblib.load(ASSETS_DIR / "level_q50.pkl")
@@ -703,18 +712,25 @@ def run_forecast(target_date: date = None, features_file: str = None) -> pd.Data
     result = pd.DataFrame(records)
     result["is_actual"] = False   # populated below when intraday actuals are available
 
+    # ── Phase 4 PI calibration (no-op until pi_calibration_v1.json exists) ──
+    _pi_path = ASSETS_DIR / "pi_calibration_v1.json"
+    if _pi_path.exists():
+        try:
+            from correctors import apply_pi_calibration  # implemented in Phase 4
+            result = apply_pi_calibration(result, _pi_path)
+            log.info("PI calibration applied from %s", _pi_path.name)
+        except Exception as _e:
+            log.warning("PI calibration skipped: %s", _e)
+
     # ── Intraday post-processing: splice actuals + shape correction ───────
     # Runs only when intraday_prices.csv exists and has data for today.
     #
     # Option 1 — Replace settled SPs with actual prices.
     #   The orange zone on the dashboard shows real prices, not forecasts.
     #
-    # Option 2 — Shape correction for unsettled SPs.
-    #   Mean forecast error over settled SPs → dampened correction applied to
-    #   remaining SPs (α=0.4).  If morning was £10 higher than forecast, the
-    #   afternoon shifts up by £4.  Decays to zero correction when no SPs are
-    #   settled yet (daily pipeline run) so it never degrades the pure forecast.
-    _SHAPE_ALPHA = 0.4   # dampening: don't over-commit to morning signal
+    # Option 2 — Bias correction for unsettled SPs (delegated to corrector).
+    #   Corrector reads carry-over state, applies correction, writes new state.
+    #   AlphaCorrector (default) replicates the original α=0.4 flat-bias shift.
     if not _id_today_all.empty:
         try:
             _pc = "ssp" if "ssp" in _id_today_all.columns else "systemSellPrice"
@@ -724,24 +740,19 @@ def run_forecast(target_date: date = None, features_file: str = None) -> pd.Data
                 _actual[_pc].astype(float),
             ))
             if _actual_map:
-                _settled = set(_actual_map)
-                _unsettled_mask = ~result["settlement_period"].isin(_settled)
+                # Option 2: bias correction BEFORE overwriting with actuals
+                _corr_state = load_state(KALMAN_STATE_PATH)
+                result, _corr_state = corrector(result, _actual_map, _corr_state)
+                save_state(_corr_state, KALMAN_STATE_PATH)
+                log.info(
+                    "Intraday | date=%s n_settled=%d x̂=£%.1f P=£%.0f unsettled=%d",
+                    target_date, len(_actual_map),
+                    _corr_state.get("x_hat", 0.0),
+                    _corr_state.get("P", 0.0),
+                    int((~result["is_actual"]).sum()),
+                )
 
-                # Option 2: compute correction BEFORE overwriting with actuals
-                _settled_rows  = result[result["settlement_period"].isin(_settled)]
-                _actual_vals   = [_actual_map[sp] for sp in _settled_rows["settlement_period"]]
-                _fc_vals       = _settled_rows["ssp_q50"].tolist()
-                _mean_err      = float(np.mean([a - f for a, f in zip(_actual_vals, _fc_vals)]))
-                _correction    = _SHAPE_ALPHA * _mean_err
-                if _unsettled_mask.any() and abs(_correction) > 0.5:
-                    for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
-                        result.loc[_unsettled_mask, _col] = (
-                            result.loc[_unsettled_mask, _col] + _correction
-                        ).round(2)
-                    log.info("Shape correction: mean_err=£%.1f  applied=£%.1f  (%d unsettled SPs)",
-                             _mean_err, _correction, int(_unsettled_mask.sum()))
-
-                # Option 1: replace settled SPs with actuals
+                # Option 1: replace settled SPs with actuals (unchanged)
                 for _sp, _av in _actual_map.items():
                     _m = result["settlement_period"] == _sp
                     if _m.any():

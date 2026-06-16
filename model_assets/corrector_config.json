@@ -1,0 +1,9 @@
+{
+  "corrector": "kalman",
+  "Q": 21.0,
+  "sigma_sp": 35.0,
+  "gamma": 0.966,
+  "z_alpha": 1.28,
+  "sp_bias": false,
+  "z_guardrail": 500.0
+}
