@@ -14,10 +14,10 @@ jobs:
       contents: write   # required to push updated forecast files back to repo
 
     steps:
-      - name: Checkout repository
+      - name: Checkout streamlit-data
         uses: actions/checkout@v4
         with:
-          ref: phase-3   # code lives here until PR is merged to main
+          ref: streamlit-data
           fetch-depth: 1
 
       - name: Set up Python 3.11
@@ -80,9 +80,8 @@ jobs:
         run: python src/data/fetch_cpi.py
 
       # ── Build features and train ───────────────────────────────────────────
-      # dataset_5yr.csv is gitignored and not in the raw-data cache, so it won't
-      # exist on a fresh runner even when raw CSVs are restored from cache.
-      # Check file existence directly: build from scratch if missing, extend if present.
+      # dataset_5yr.csv is committed to streamlit-data so it's always present;
+      # build from scratch only as a fallback if somehow missing.
       - name: Build or extend processed dataset
         run: |
           if [ -f data/processed/dataset_5yr.csv ]; then
@@ -117,55 +116,30 @@ jobs:
       - name: Run H+1 and H+2 forecast
         run: python src/models/forecast_phase3.py
 
-      # ── Commit outputs to streamlit-data branch ───────────────────────────
-      # Data files (CSV, pkl) go to streamlit-data only — keeps code branches
-      # clean so PRs don't carry bulk data diffs. Streamlit Cloud deploys from
-      # streamlit-data. Code branches get only the _LAST_PIPELINE_RUN trigger.
+      # ── Commit all outputs back to streamlit-data ─────────────────────────
       - name: Commit and push forecast outputs
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           TODAY=$(date -u +%Y-%m-%d)
-
-          # ── 1. Push code-only trigger to phase-3 ──────────────────────────
           sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
             src/dashboard/streamlit_app.py
           git add src/dashboard/streamlit_app.py
-          git diff --staged --quiet || git commit -m "Pipeline ran ${TODAY}"
-          git push
-
-          # ── 2. Push code + all data to streamlit-data ─────────────────────
-          git fetch origin streamlit-data
-          git worktree add /tmp/sd origin/streamlit-data
-
-          rsync -a --exclude='.git' --exclude='data/raw/' \
-                --exclude='.venv/' --exclude='__pycache__/' \
-                --exclude='data/processed/' --exclude='model_assets/' \
-                . /tmp/sd/
-
-          mkdir -p /tmp/sd/data/processed /tmp/sd/model_assets/forecasts
-          cp data/processed/dataset_5yr.csv /tmp/sd/data/processed/
-          cp data/processed/features_recent.csv /tmp/sd/data/processed/
-          cp model_assets/next_day_forecast_phase3.csv \
-             model_assets/day2_forecast_phase3.csv \
-             model_assets/phase3_metrics.json \
-             model_assets/test_predictions_phase3.csv \
-             model_assets/phase3_level_importance.csv \
-             model_assets/phase3_shape_importance.csv \
-             model_assets/level_q10.pkl \
-             model_assets/level_q50.pkl \
-             model_assets/level_q90.pkl \
-             model_assets/shape_q50.pkl \
-             model_assets/shape_h2_q50.pkl \
-             model_assets/neg_day_classifier.pkl \
-             /tmp/sd/model_assets/
-          cp model_assets/forecasts/*.csv /tmp/sd/model_assets/forecasts/ 2>/dev/null || true
-
-          cd /tmp/sd
-          git add -A
-          git add -f data/processed/dataset_5yr.csv model_assets/*.csv \
-                     model_assets/*.pkl model_assets/forecasts/
-          git diff --staged --quiet || git commit -m "Daily data update ${TODAY}"
-          git push origin streamlit-data
-
-          git worktree remove /tmp/sd --force
+          git add -f data/processed/dataset_5yr.csv \
+                     data/processed/features_recent.csv
+          git add    model_assets/next_day_forecast_phase3.csv \
+                     model_assets/day2_forecast_phase3.csv \
+                     model_assets/phase3_metrics.json \
+                     model_assets/test_predictions_phase3.csv \
+                     model_assets/phase3_level_importance.csv \
+                     model_assets/phase3_shape_importance.csv \
+                     model_assets/level_q10.pkl \
+                     model_assets/level_q50.pkl \
+                     model_assets/level_q90.pkl \
+                     model_assets/shape_q50.pkl \
+                     model_assets/shape_h2_q50.pkl \
+                     model_assets/neg_day_classifier.pkl \
+                     "model_assets/forecasts/"
+          git diff --staged --quiet || \
+            git commit -m "Daily forecast update ${TODAY}" && \
+            git push origin streamlit-data
