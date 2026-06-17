@@ -182,13 +182,13 @@ def load_live_data(system_prices: pd.DataFrame, delta_map=None) -> pd.DataFrame:
     Load all forecast_phase3_*.csv from model_assets/forecasts/.
     Join with system_prices for actual values.
 
-    The forecast CSVs store RAW model q10/q90 (same treatment as walk_forward_predictions.csv).
-    PI calibration is applied here using delta_map when provided:
-        q10 = ssp_q10 − δ_sp,  q90 = ssp_q90 + δ_sp
+    The forecast CSVs store PI-calibrated q10/q90 (backfilled 2026-06-17).
+    delta_map is accepted for API compatibility but ignored — PI calibration
+    has already been applied to the CSV files.
 
     Handles two file schemas:
       - WITH is_actual column: filter to is_actual=False (Kalman-corrected unsettled SPs)
-      - WITHOUT is_actual column: use all 48 rows (raw q10/q90, pre-Kalman daily forecast)
+      - WITHOUT is_actual column: use all 48 rows (PI-calibrated daily forecast)
     Returns columns: date, sp, q10, q90, q50, actual, is_forecast, file_type, period="live".
     """
     fc_dir = ASSETS_DIR / "forecasts"
@@ -225,13 +225,8 @@ def load_live_data(system_prices: pd.DataFrame, delta_map=None) -> pd.DataFrame:
         fc["sp"]  = fc["settlement_period"].astype(int)
         fc["date"] = fc_date
         fc["q50"] = pd.to_numeric(fc["ssp_q50"], errors="coerce")
-        if delta_map:
-            delta_arr = fc["sp"].map(delta_map).fillna(0.0)
-            fc["q10"] = pd.to_numeric(fc["ssp_q10"], errors="coerce") - delta_arr
-            fc["q90"] = pd.to_numeric(fc["ssp_q90"], errors="coerce") + delta_arr
-        else:
-            fc["q10"] = pd.to_numeric(fc["ssp_q10"], errors="coerce")
-            fc["q90"] = pd.to_numeric(fc["ssp_q90"], errors="coerce")
+        fc["q10"] = pd.to_numeric(fc["ssp_q10"], errors="coerce")
+        fc["q90"] = pd.to_numeric(fc["ssp_q90"], errors="coerce")
         fc["file_type"] = file_type
         fc["is_forecast"] = True
 
@@ -883,8 +878,9 @@ def write_report(
         f"",
         f"Target: {COV_TARGET*100:.1f}% · WARN if < {COV_WARN_LO*100:.1f}% or > {COV_WARN_HI*100:.1f}%  ",
         f"Minimum N for flagging: {COV_MIN_N} SP-rows  ",
-        f"Note: both WF and live forecasts use raw model q10/q90; PI calibration applied post-hoc "
-        f"(`ssp_q10 − δ_sp`, `ssp_q90 + δ_sp`) using `pi_calibration_v1.json`.  ",
+        f"Note: WF baseline has PI calibration applied post-hoc (`ssp_q10 − δ_sp`, `ssp_q90 + δ_sp`). "
+        f"Live forecast CSVs were backfilled with PI calibration on 2026-06-17; pipeline-generated files "
+        f"from 2026-06-17 onwards have calibration applied at generation time.  ",
         f"Live sample is still small ({live_n_days} days × 48 SPs = {live_n_days*48} SP-rows); "
         f"interpret ⚠️ rows with caution.",
         f"",
@@ -1076,7 +1072,7 @@ def main() -> None:
     print(f"  {len(sys_prices)} rows from {sys_prices['date'].nunique()} dates")
 
     print("Loading live forecast files …")
-    live = load_live_data(sys_prices, delta_map)
+    live = load_live_data(sys_prices)  # CSVs already PI-calibrated
 
     if not live.empty:
         print("Computing spike_risk_flag for live dates …")
