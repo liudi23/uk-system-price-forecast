@@ -41,7 +41,7 @@ st.set_page_config(
 )
 
 # Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
-_LAST_PIPELINE_RUN = "2026-06-16T18:13"
+_LAST_PIPELINE_RUN = "2026-06-17T12:34"
 
 
 @st.cache_data(ttl=7200)
