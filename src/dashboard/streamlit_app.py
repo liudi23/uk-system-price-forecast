@@ -18,6 +18,7 @@ PRED_PATH_P3      = ROOT / "model_assets" / "test_predictions_phase3.csv"
 FORECAST_PATH_P3  = ROOT / "model_assets" / "next_day_forecast_phase3.csv"   # H+1 today
 FORECAST_PATH_H2  = ROOT / "model_assets" / "day2_forecast_phase3.csv"       # H+2 tomorrow
 METRICS_P3       = ROOT / "model_assets" / "phase3_metrics.json"
+PI_CAL_JSON      = ROOT / "model_assets" / "pi_calibration_v1.json"
 LEVEL_FEAT_JSON  = ROOT / "model_assets" / "level_feature_cols.json"
 SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
 LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
@@ -114,19 +115,28 @@ st.caption(
 )
 
 # ── Production model banner ───────────────────────────────────────────────────
+import json as _json
 _m = load_p3_metrics()
 _p3 = _m.get("Phase3_P50_two_stage", {})
 _dc = _m.get("decomposition", {})
-_mae_str   = f"£{_p3['MAE']:.2f}/MWh"        if "MAE"           in _p3 else "—"
-_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"  in _dc else "—"
-_corr_str  = f"{_dc['shape_corr_mean']:.3f}"  if "shape_corr_mean" in _dc else "—"
-_peak_str  = f"±{_dc['peak_timing_mae']:.1f} SPs" if "peak_timing_mae" in _dc else "—"
+_mae_str   = f"£{_p3['MAE']:.2f}/MWh"           if "MAE"             in _p3 else "—"
+_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"       in _dc else "—"
+_corr_str  = f"{_dc['shape_corr_mean']:.3f}"     if "shape_corr_mean" in _dc else "—"
+_pi_cov_str = "—"
+if PI_CAL_JSON.exists():
+    _pi = _json.load(open(PI_CAL_JSON))
+    _cov_before = _pi.get("coverage_before", 0)
+    _cov_after  = _pi.get("coverage_after_insample_per_sp", 0)
+    _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
 st.info(
-    "**Phase 3 — Level-Shape Decomposition · CPI-adjusted · 3-year rolling window** · "
-    "Stage 1: daily level HGBR (P10/P50/P90) · Stage 2: intra-day shape HGBR · "
-    "All shape features lag ≥ 48 SPs — zero leakage · "
-    f"**Honest MAE: {_mae_str}** · Level MAE: {_lvl_str} · "
-    f"Shape corr: {_corr_str} · Peak timing: {_peak_str}"
+    "**Phase 3+4 — Level-Shape · Kalman corrector · PI calibration** · "
+    "CPI-adjusted · 3-year rolling window · "
+    "Stage 1: daily level HGBR (P10/P50/P90) · "
+    "Stage 2H+1: shape HGBR lag ≥ 48 SPs · Stage 2H+2: lag ≥ 96 SPs — zero leakage · "
+    "Hourly Kalman bias correction (horizon decay γ=0.966) · "
+    f"**PI coverage: {_pi_cov_str}** (split-conformal, per-SP deltas, 119-day WF) · "
+    f"**Walk-forward MAE: £27.39/MWh** (119 days · 4 seasons) · "
+    f"7-day holdout MAE: {_mae_str} · Level MAE: {_lvl_str} · Shape corr: {_corr_str}"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
