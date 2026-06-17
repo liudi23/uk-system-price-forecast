@@ -76,7 +76,12 @@ st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
-st.sidebar.caption(f"📅 Latest data: **{_latest_date}**\n\nPipeline runs automatically at 12:30 UTC daily after Elexon publishes settlement prices.")
+st.sidebar.caption(
+    f"📅 Latest settled data: **{_latest_date}**\n\n"
+    f"🔄 Last pipeline run: **{_LAST_PIPELINE_RUN} UTC**\n\n"
+    "**Daily** (~12:30 UTC): retrain · H+1 + H+2 day-ahead forecasts · PI calibration applied.\n\n"
+    "**Intraday**: Kalman-corrected H+1 updates as each SP settles throughout the day."
+)
 st.sidebar.divider()
 
 min_date = df["settlement_date"].min().date()
