@@ -1196,6 +1196,342 @@ def _spike_harness_section(
     return lines
 
 
+# ── Phase 6a: spike widening gate evaluation ──────────────────────────────────
+
+def compute_spike_widening_gate(
+    wf: pd.DataFrame,
+    eval_json_path: "Path | str",
+    delta_hi_path:  "Path | str",
+    pi_path:        "Path | str",
+    taus: "list[float] | None" = None,
+    exclude_dates: "set | None" = None,
+) -> dict:
+    """
+    Post-hoc gate evaluation for Phase 6a spike-gated asymmetric PI widening.
+
+    Evaluates coverage improvement from applying δ_hi to Q90 on classifier-flagged
+    days, using PI-calibrated predictions as the baseline (production order:
+    base → PI calibration → spike widening → Kalman).
+
+    Kalman is omitted from this gate: its x̂ is an intraday level shift that
+    averages to ≈0 across many days and is independent of the PI widening.
+
+    Gate conditions (all must pass at chosen τ):
+        G1  : Coverage lift on ELEVATED SPs (actual > £120) within flagged days ≥ +5pp
+        G1b : Coverage on NON-ELEVATED (actual ≤ £120) high-risk SPs within
+              flagged days does not exceed 82% (sharpness: widening isn't gaming
+              coverage by trivially covering already-covered rows)
+        G2  : Coverage on unflagged days changes by ≤ 0.5pp (must not degrade)
+        G3  : Coverage on unflagged days doesn't increase > 0.5pp (sanity: widening
+              shouldn't affect unflagged days at all)
+        G4  : (checked separately via Brier score in train_spike_classifier.py)
+
+    Returns dict with per-τ gate results plus selected τ recommendation.
+    """
+    eval_json_path = Path(eval_json_path)
+    delta_hi_path  = Path(delta_hi_path)
+    pi_path        = Path(pi_path)
+
+    if taus is None:
+        taus = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+
+    # ── Load artifacts ────────────────────────────────────────────────────────
+    if not eval_json_path.exists():
+        return {"error": f"eval JSON not found: {eval_json_path}"}
+    if not delta_hi_path.exists():
+        return {"error": f"delta_hi JSON not found: {delta_hi_path}"}
+    if not pi_path.exists():
+        return {"error": f"PI calibration not found: {pi_path}"}
+
+    with open(eval_json_path) as f:
+        eval_json = json.load(f)
+    with open(delta_hi_path) as f:
+        delta_hi_art = json.load(f)
+    with open(pi_path) as f:
+        pi_art = json.load(f)
+
+    p_spike_by_date = eval_json.get("wf_predictions", {})    # date str → float
+    delta_hi_by_sp  = {int(k): float(v) for k, v in delta_hi_art["delta_hi_effective_by_sp"].items()}
+    delta_pi_by_sp  = {int(k): float(v) for k, v in pi_art.get("delta_by_sp", {}).items()}
+    high_risk_sps   = set(delta_hi_art.get("high_risk_sps", []))
+
+    # ── Prepare WF data ───────────────────────────────────────────────────────
+    df = wf.copy()
+    df = df.dropna(subset=["ssp_q10", "ssp_q90", "ssp_actual"])
+    if exclude_dates:
+        df = df[~df["settlement_date"].isin(exclude_dates)]
+
+    # PI-calibrated predictions
+    delta_pi_arr = df["settlement_period"].map(delta_pi_by_sp).fillna(0.0)
+    df["q90_cal"] = (df["ssp_q90"] + delta_pi_arr).values
+    df["q10_cal"] = (df["ssp_q10"] - delta_pi_arr).values
+
+    # δ_hi per SP (constant, applied only when flagged)
+    df["delta_hi"] = df["settlement_period"].map(delta_hi_by_sp).fillna(0.0)
+
+    # Attach P(spike) per day
+    df["p_spike"] = df["settlement_date"].map(p_spike_by_date).fillna(0.0)
+
+    n_total_days  = df["settlement_date"].nunique()
+    n_total_rows  = len(df)
+
+    # ── Per-τ gate evaluation ─────────────────────────────────────────────────
+    by_tau = {}
+    for tau in taus:
+        flagged_dates   = {d for d, p in p_spike_by_date.items() if p > tau}
+        flagged_mask    = df["settlement_date"].isin(flagged_dates)
+        unflagged_mask  = ~flagged_mask
+
+        # After widening: widen Q90 for flagged-day high-risk SPs only
+        df["q90_wide"] = df["q90_cal"].copy()
+        wide_idx = df.index[flagged_mask & df["settlement_period"].isin(high_risk_sps)]
+        df.loc[wide_idx, "q90_wide"] = (df.loc[wide_idx, "q90_cal"]
+                                        + df.loc[wide_idx, "delta_hi"])
+
+        def _cov(mask):
+            sub = df[mask]
+            if sub.empty:
+                return {"n": 0, "cov_before": float("nan"), "cov_after": float("nan"),
+                        "delta_cov": float("nan")}
+            cb = ((sub["ssp_actual"] >= sub["q10_cal"]) & (sub["ssp_actual"] <= sub["q90_cal"])).mean()
+            ca = ((sub["ssp_actual"] >= sub["q10_cal"]) & (sub["ssp_actual"] <= sub["q90_wide"])).mean()
+            return {"n": int(len(sub)),
+                    "cov_before": round(float(cb) * 100, 2),
+                    "cov_after":  round(float(ca) * 100, 2),
+                    "delta_cov":  round((float(ca) - float(cb)) * 100, 2)}
+
+        # G1: elevated HIGH-RISK SPs within flagged days (the SPs being widened).
+        # Restricting to high-risk SPs avoids dilution from the 41 non-widened SPs:
+        # with only 7/48 SPs widened, measuring all elevated rows limits maximum
+        # achievable lift to ~7/48 × actual-lift ≈ 14.6% of the true signal.
+        elevated_flagged_mask = (flagged_mask
+                                 & (df["ssp_actual"] > 120.0)
+                                 & df["settlement_period"].isin(high_risk_sps))
+        g1_result = _cov(elevated_flagged_mask)
+        g1_pass = (g1_result["n"] > 0) and (g1_result["delta_cov"] >= 5.0)
+
+        # G1b sharpness: non-elevated high-risk SPs within flagged days
+        nonelev_highrisk_mask = (flagged_mask
+                                 & (df["ssp_actual"] <= 120.0)
+                                 & df["settlement_period"].isin(high_risk_sps))
+        g1b_sub   = df[nonelev_highrisk_mask]
+        g1b_n     = len(g1b_sub)
+        if g1b_n > 0:
+            g1b_cov_after = float(
+                ((g1b_sub["ssp_actual"] >= g1b_sub["q10_cal"]) &
+                 (g1b_sub["ssp_actual"] <= g1b_sub["q90_wide"])).mean()
+            ) * 100.0
+        else:
+            g1b_cov_after = float("nan")
+        g1b_pass = (g1b_n == 0) or (g1b_cov_after <= 82.0)
+
+        # G2/G3: unflagged days (widening = 0 by construction, so delta_cov = 0)
+        g2_result = _cov(unflagged_mask)
+        g2_pass = abs(g2_result["delta_cov"]) <= 0.5
+        g3_pass = g2_result["delta_cov"] <= 0.5  # not spuriously higher either
+
+        all_pass = g1_pass and g1b_pass and g2_pass and g3_pass
+
+        by_tau[str(tau)] = {
+            "tau":            tau,
+            "n_flagged_days": int(flagged_mask.any() and df[flagged_mask]["settlement_date"].nunique()),
+            "n_unflagged_days": int(n_total_days - df[flagged_mask]["settlement_date"].nunique()),
+            "g1":  {**g1_result, "threshold": 5.0, "pass": g1_pass,
+                    "description": "Coverage lift on high-risk SP elevated (>£120) rows within flagged days"},
+            "g1b": {"n": int(g1b_n), "cov_after": round(g1b_cov_after, 2) if g1b_n > 0 else None,
+                    "threshold": 82.0, "pass": g1b_pass,
+                    "description": "Sharpness: non-elevated high-risk SPs ≤ 82% coverage"},
+            "g2":  {**g2_result, "threshold": 0.5, "pass": g2_pass,
+                    "description": "Coverage stability on unflagged days"},
+            "g3":  {"pass": g3_pass, "delta_cov": g2_result["delta_cov"],
+                    "description": "No coverage inflation on unflagged days"},
+            "all_pass": all_pass,
+        }
+
+    # ── Select best τ (highest G1 delta_cov that also passes G1b/G2/G3) ──────
+    passing = [(tau, by_tau[str(tau)]["g1"]["delta_cov"])
+               for tau in taus if by_tau[str(tau)]["all_pass"]]
+    if passing:
+        best_tau = max(passing, key=lambda x: x[1])[0]
+    else:
+        # No τ passes all gates — pick τ with highest G1 coverage lift as informational
+        best_tau = max(taus, key=lambda t: by_tau[str(t)]["g1"].get("delta_cov", -999.0))
+
+    return {
+        "by_tau":           by_tau,
+        "best_tau":         best_tau,
+        "any_tau_passes":   bool(passing),
+        "n_total_days":     int(n_total_days),
+        "n_total_rows":     int(n_total_rows),
+        "exclude_dates":    list(exclude_dates) if exclude_dates else [],
+        "delta_hi_block":   delta_hi_art.get("delta_hi_block", 0.0),
+        "high_risk_sps":    list(high_risk_sps),
+    }
+
+
+def plot_spike_widening_gate(gate_result: dict, out_dir: Path) -> Path:
+    """Coverage-lift vs τ for G1/G1b/G2 gate metrics."""
+    by_tau = gate_result.get("by_tau", {})
+    if not by_tau:
+        return out_dir / "spike_widening_gate.png"
+
+    taus  = sorted(float(k) for k in by_tau)
+    g1    = [by_tau[str(t)]["g1"]["delta_cov"]        for t in taus]
+    g1_n  = [by_tau[str(t)]["g1"]["n"]                for t in taus]
+    g1b_c = [by_tau[str(t)]["g1b"].get("cov_after") or float("nan") for t in taus]
+    g2    = [abs(by_tau[str(t)]["g2"]["delta_cov"])    for t in taus]
+
+    colors = ["green" if by_tau[str(t)]["all_pass"] else "red" for t in taus]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+
+    # Left: G1 coverage lift + G1b sharpness
+    ax1.bar(range(len(taus)), g1, color=colors, alpha=0.8, label="G1 Δcoverage")
+    ax1.axhline(5.0, color="forestgreen", ls="--", lw=1.2, label="G1 threshold (+5pp)")
+    ax1b = ax1.twinx()
+    ax1b.plot(range(len(taus)), g1b_c, "s--", color="darkorange", ms=6, label="G1b coverage after")
+    ax1b.axhline(82.0, color="darkorange", ls=":", lw=1.2, label="G1b ceiling 82%")
+    ax1b.set_ylabel("G1b cov (non-elevated high-risk SPs) %", color="darkorange")
+    ax1b.tick_params(axis="y", colors="darkorange")
+    ax1b.set_ylim(50, 105)
+    ax1.set_xticks(range(len(taus)))
+    ax1.set_xticklabels([f"τ={t:.2f}\n(n={n}d)" for t, n in zip(taus, g1_n)])
+    ax1.set_ylabel("G1 Δcoverage on elevated SPs (pp)")
+    ax1.set_title("G1 Coverage Lift on Flagged Elevated SPs\n(green = all gates pass)")
+    ax1.legend(loc="upper left", fontsize=8)
+    ax1b.legend(loc="upper right", fontsize=8)
+
+    # Right: G2 — unflagged coverage stability (should be ≈0)
+    ax2.bar(range(len(taus)), g2, color=["blue"] * len(taus), alpha=0.7)
+    ax2.axhline(0.5, color="red", ls="--", lw=1.2, label="G2 threshold (0.5pp)")
+    ax2.set_xticks(range(len(taus)))
+    ax2.set_xticklabels([f"τ={t:.2f}" for t in taus])
+    ax2.set_ylabel("|Δcoverage| on unflagged days (pp)")
+    ax2.set_title("G2 Unflagged Day Coverage Stability\n(should be ≈ 0)")
+    ax2.legend(fontsize=8)
+
+    plt.tight_layout()
+    out = out_dir / "spike_widening_gate.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+
+def _spike_widening_gate_section(
+    gate_all:  dict,
+    gate_excl: dict,
+    out_dir: Path,
+    plot_path: "Path | None" = None,
+) -> "list[str]":
+    """Markdown lines for §8 spike widening gate report section."""
+    rel = lambda p: str(p.relative_to(out_dir)) if p else None
+
+    def _gate_row(tau_str: str, result: dict, label: str = "") -> str:
+        g1  = result["g1"]
+        g1b = result["g1b"]
+        g2  = result["g2"]
+        g1_mark  = "✅" if g1["pass"]  else "❌"
+        g1b_mark = "✅" if g1b["pass"] else "❌"
+        g2_mark  = "✅" if g2["pass"]  else "❌"
+        all_mark = "✅" if result["all_pass"] else "❌"
+        g1b_val  = f"{g1b['cov_after']:.1f}%" if g1b["cov_after"] is not None else "—"
+        return (
+            f"| τ={float(tau_str):.2f} | {result['n_flagged_days']}d |"
+            f" {g1['cov_before']:.1f}% → {g1['cov_after']:.1f}% "
+            f"(**{g1['delta_cov']:+.1f}pp**) {g1_mark} |"
+            f" {g1b_val} {g1b_mark} |"
+            f" {g2['delta_cov']:+.2f}pp {g2_mark} |"
+            f" {all_mark} {label} |"
+        )
+
+    def _table(gate: dict, title: str) -> "list[str]":
+        if not gate or gate.get("error"):
+            return [f"*{gate.get('error', 'no data')}*", ""]
+        bt   = gate["by_tau"]
+        best = str(gate["best_tau"])
+        taus = sorted(float(k) for k in bt)
+        rows = [_gate_row(str(t), bt[str(t)], "(best)" if str(t) == best else "")
+                for t in taus]
+        return [
+            f"**{title}** (δ_hi=£{gate['delta_hi_block']:.2f}, "
+            f"high-risk SPs: {sorted(gate['high_risk_sps'])})",
+            "",
+            "| τ | Flagged | G1: Elev. coverage (before→after) | G1b: Sharpness | G2: Unflagged Δcov | Pass |",
+            "|---|---|---|---|---|---|",
+        ] + rows + [
+            "",
+            f"*G1 threshold: +5pp lift. G1b threshold: ≤82%. G2 threshold: |Δ|≤0.5pp.*",
+            f"*High-risk SPs {sorted(gate['high_risk_sps'])} only are widened; "
+            f"all other SPs unchanged on flagged days.*",
+            "",
+        ]
+
+    lines = [
+        "",
+        "---",
+        "",
+        "## §8. Phase 6a Gate Evaluation: Spike-Gated Asymmetric PI Widening",
+        "",
+        "Evaluates whether adding δ_hi to Q90 for afternoon-block SPs on classifier-flagged "
+        "days improves coverage on elevated-price SPs without degrading unflagged days.",
+        "",
+        "**Methodology:** PI-calibrated baseline (ssp_q90 + δ_sp per SP). "
+        "Spike widening applied post-hoc: q90_wide = q90_cal + δ_hi for "
+        "high-risk SPs {33,34,35,36,37,38,40} on flagged days (P(spike) > τ). "
+        "Kalman excluded from this gate (x̂ is intraday-only, averages ≈0 across days, "
+        "independent of PI widening).",
+        "",
+        "**Gates:**",
+        "- **G1:** Δcoverage on HIGH-RISK SP elevated rows (actual > £120, SP ∈ {33–40}) "
+        "within flagged days ≥ +5pp (restricted to the 7 widened SPs to avoid dilution "
+        "from the 41 non-widened SPs)",
+        "- **G1b:** Coverage on non-elevated (actual ≤ £120) high-risk SPs ≤ 82% (sharpness)",
+        "- **G2/G3:** Coverage on UNFLAGGED days unchanged (|Δ| ≤ 0.5pp)",
+        "",
+        "### §8.1 Gate sweep (all WF days)",
+        "",
+    ] + _table(gate_all, "WITH 2025-10-13")
+
+    if gate_excl:
+        lines += [
+            "### §8.2 Gate sweep (excluding 2025-10-13)",
+            "",
+        ] + _table(gate_excl, "EXCLUDING 2025-10-13")
+
+    # Verdict
+    passed = gate_all.get("any_tau_passes", False)
+    best   = gate_all.get("best_tau")
+    verdict_lines = [
+        "### §8.3 Verdict",
+        "",
+        (f"**{'✅ GATES PASS' if passed else '❌ GATES NOT YET PASSING'}** "
+         f"at τ = {best:.2f}."),
+    ]
+    if passed:
+        verdict_lines += [
+            f"",
+            f"Recommended action: set `spike_widening: true` and `spike_tau: {best:.2f}` "
+            f"in `model_assets/corrector_config.json`.",
+            f"",
+            f"> ⚠️ **Config is currently `spike_widening: false` (default).** Enable manually "
+            f"after reviewing the gate table above, especially the 2025-10-13 leverage check "
+            f"(§8.1 vs §8.2).",
+        ]
+    else:
+        verdict_lines += [
+            f"",
+            f"No τ passes all gates simultaneously. Best τ={best:.2f} shown above. "
+            f"Review individual gate failures; consider extending the training window "
+            f"(add 2023 regime-weighted) or using a smaller δ_hi quantile (p70 instead of p80).",
+        ]
+
+    if plot_path:
+        verdict_lines += ["", f"![Spike Widening Gate]({rel(plot_path)})", ""]
+
+    lines += verdict_lines
+    return lines
+
+
 def write_report(
     out_dir: Path,
     gate: dict,
@@ -1209,6 +1545,8 @@ def write_report(
     sp_gate=None,
     spike_harness_all: "dict | None" = None,
     spike_harness_excl: "dict | None" = None,
+    spike_widening_gate_all:  "dict | None" = None,
+    spike_widening_gate_excl: "dict | None" = None,
 ) -> Path:
     rel = lambda p: str(p.relative_to(out_dir))
 
@@ -1364,6 +1702,15 @@ def write_report(
             plot_path=plot_paths.get("spike_harness"),
         )
 
+    # Spike widening gate section (§8)
+    if spike_widening_gate_all:
+        lines += _spike_widening_gate_section(
+            spike_widening_gate_all,
+            spike_widening_gate_excl,
+            out_dir,
+            plot_path=plot_paths.get("spike_widening_gate"),
+        )
+
     report_path = out_dir / "report.md"
     report_path.write_text("\n".join(lines))
     return report_path
@@ -1514,6 +1861,31 @@ def main():
     if harness_all:
         plot_paths["spike_harness"] = plot_spike_harness(all_sim, out_dir)
 
+    # ── Phase 6a spike widening gate ───────────────────────────────────────────
+    eval_json_path = ASSETS_DIR / "spike_classifier_v1_eval.json"
+    delta_hi_path  = ASSETS_DIR / "delta_hi_v1.json"
+    pi_path        = ASSETS_DIR / "pi_calibration_v1.json"
+
+    swg_all  = None
+    swg_excl = None
+    if eval_json_path.exists() and delta_hi_path.exists() and pi_path.exists():
+        print("Computing spike widening gate (§8) …")
+        swg_all  = compute_spike_widening_gate(wf, eval_json_path, delta_hi_path, pi_path)
+        swg_excl = compute_spike_widening_gate(
+            wf, eval_json_path, delta_hi_path, pi_path,
+            exclude_dates={SPIKE_EXCLUDE_DATE},
+        )
+        best_tau = swg_all.get("best_tau")
+        bt_str   = str(best_tau)
+        g1_delta = swg_all["by_tau"].get(bt_str, {}).get("g1", {}).get("delta_cov", float("nan"))
+        print(f"  Best τ={best_tau:.2f}  G1 Δcov={g1_delta:+.1f}pp  "
+              f"all_pass={swg_all['any_tau_passes']}")
+        if swg_all and not swg_all.get("error"):
+            plot_paths["spike_widening_gate"] = plot_spike_widening_gate(swg_all, out_dir)
+    else:
+        print("Skipping §8 gate (spike_classifier_v1_eval.json / delta_hi_v1.json / "
+              "pi_calibration_v1.json not found)")
+
     # ── Report ─────────────────────────────────────────────────────────────────
     print("Writing report …")
     report_path = write_report(
@@ -1523,6 +1895,8 @@ def main():
         n_days, plot_paths, sp_gate=sp_gate,
         spike_harness_all=harness_all or None,
         spike_harness_excl=harness_excl or None,
+        spike_widening_gate_all=swg_all or None,
+        spike_widening_gate_excl=swg_excl or None,
     )
 
     print(f"\nDone. Report: {report_path}")

@@ -337,6 +337,45 @@ def apply_pi_calibration(df: pd.DataFrame, pi_path: "Path | str") -> pd.DataFram
     return out
 
 
+# ── Phase 6a: spike-gated asymmetric PI widening ─────────────────────────────
+
+def apply_spike_widening(
+    df: pd.DataFrame,
+    p_spike: float,
+    tau: float,
+    delta_hi_path: "Path | str",
+) -> pd.DataFrame:
+    """Widen Q90 asymmetrically for high-risk afternoon SPs when P(spike) > τ.
+
+    Applied AFTER PI calibration and BEFORE Kalman.  Q10 and Q50 are unchanged —
+    only Q90 is widened for the 7 afternoon-block SPs (33–40 ∩ propensity ≥ 2%).
+
+    Returns df unchanged when p_spike ≤ tau or delta_hi_path does not exist.
+    """
+    if p_spike <= tau:
+        return df
+    delta_hi_path = Path(delta_hi_path)
+    if not delta_hi_path.exists():
+        log.warning("apply_spike_widening: artifact not found at %s", delta_hi_path)
+        return df
+    with open(delta_hi_path) as f:
+        artifact = json.load(f)
+    delta_map = {int(k): float(v) for k, v in artifact["delta_hi_effective_by_sp"].items()}
+    out = df.copy()
+    delta_arr = out["settlement_period"].map(delta_map).fillna(0.0)
+    out["ssp_q90"] = (out["ssp_q90"] + delta_arr).round(2)
+    # Enforce Q50 ≤ Q90 (Q50 unchanged so this is trivially satisfied after widening,
+    # but guard against any edge case where the artifact has delta < 0)
+    out["ssp_q90"] = out[["ssp_q90", "ssp_q50"]].max(axis=1).round(2)
+    log.info(
+        "Spike widening applied: P(spike)=%.3f > τ=%.2f; δ_hi=£%.2f on %d SPs",
+        p_spike, tau,
+        artifact.get("delta_hi_block", 0.0),
+        int((delta_arr > 0).sum()),
+    )
+    return out
+
+
 # ── State persistence ─────────────────────────────────────────────────────────
 
 def load_state(path: Path = KALMAN_STATE_PATH) -> dict:

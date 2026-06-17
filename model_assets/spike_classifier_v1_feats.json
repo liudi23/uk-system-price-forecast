@@ -1,0 +1,12 @@
+[
+  "ssp_raw_daily_max_lag1d",
+  "spike_count_lag1d",
+  "spike_count_roll_7d",
+  "wind_pct_daily_mean_lag1d",
+  "gas_pct_daily_mean_lag1d",
+  "niv_daily_mean_lag1d",
+  "wind_ms_daily_mean_lag1d",
+  "sin_month",
+  "cos_month",
+  "is_business_day"
+]

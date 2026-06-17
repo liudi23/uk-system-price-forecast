@@ -1,6 +1,6 @@
 # Corrector Walk-Forward Backtest Report
 
-**Generated:** 2026-06-17 12:23 UTC  
+**Generated:** 2026-06-17 14:23 UTC  
 **Test window:** 2025-07-01 – 2026-04-30 (119 days, 4 seasonal folds)  
 **Correctors:** Static Base · AlphaCorrector (α=0.4) · KalmanCorrector  
 **Cadence:** 10 hourly steps 08:30–17:30 UTC; metrics on unsettled SPs only
@@ -291,3 +291,59 @@ Code-P is a **market mechanism indicator** (46% of all SPs), NOT a spike label. 
 - **Ex-ante flag has no data leakage.** `spike_risk_flag` uses only D-1 lagged features and calendar month. It cannot be calibrated on tomorrow's realised price.
 - **Any δ_hi regime correction** must be derived from elevated-price conformity scores (actual − q90 where actual > £120), NOT from Code-P scores (Code-P fires at normal prices 46% of the time; see docs/spike-tail-design.md §3 and §5).
 - **2025-10-13 leverage:** If WITH and WITHOUT numbers diverge substantially in the £250+ bucket, the entire bucket signal is driven by this single event and should not be used for calibration without additional data.
+
+
+---
+
+## §8. Phase 6a Gate Evaluation: Spike-Gated Asymmetric PI Widening
+
+Evaluates whether adding δ_hi to Q90 for afternoon-block SPs on classifier-flagged days improves coverage on elevated-price SPs without degrading unflagged days.
+
+**Methodology:** PI-calibrated baseline (ssp_q90 + δ_sp per SP). Spike widening applied post-hoc: q90_wide = q90_cal + δ_hi for high-risk SPs {33,34,35,36,37,38,40} on flagged days (P(spike) > τ). Kalman excluded from this gate (x̂ is intraday-only, averages ≈0 across days, independent of PI widening).
+
+**Gates:**
+- **G1:** Δcoverage on HIGH-RISK SP elevated rows (actual > £120, SP ∈ {33–40}) within flagged days ≥ +5pp (restricted to the 7 widened SPs to avoid dilution from the 41 non-widened SPs)
+- **G1b:** Coverage on non-elevated (actual ≤ £120) high-risk SPs ≤ 82% (sharpness)
+- **G2/G3:** Coverage on UNFLAGGED days unchanged (|Δ| ≤ 0.5pp)
+
+### §8.1 Gate sweep (all WF days)
+
+**WITH 2025-10-13** (δ_hi=£93.49, high-risk SPs: [33, 34, 35, 36, 37, 38, 40])
+
+| τ | Flagged | G1: Elev. coverage (before→after) | G1b: Sharpness | G2: Unflagged Δcov | Pass |
+|---|---|---|---|---|---|
+| τ=0.05 | 72d | 85.1% → 96.1% (**+11.0pp**) ✅ | 77.1% ✅ | +0.00pp ✅ | ✅ (best) |
+| τ=0.10 | 54d | 84.4% → 95.3% (**+10.9pp**) ✅ | 72.4% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.15 | 44d | 85.1% → 94.7% (**+9.7pp**) ✅ | 74.7% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.20 | 35d | 83.0% → 94.0% (**+11.0pp**) ✅ | 71.0% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.25 | 31d | 87.8% → 95.6% (**+7.8pp**) ✅ | 71.7% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.30 | 27d | 93.2% → 100.0% (**+6.8pp**) ✅ | 70.7% ✅ | +0.00pp ✅ | ✅  |
+
+*G1 threshold: +5pp lift. G1b threshold: ≤82%. G2 threshold: |Δ|≤0.5pp.*
+*High-risk SPs [33, 34, 35, 36, 37, 38, 40] only are widened; all other SPs unchanged on flagged days.*
+
+### §8.2 Gate sweep (excluding 2025-10-13)
+
+**EXCLUDING 2025-10-13** (δ_hi=£93.49, high-risk SPs: [33, 34, 35, 36, 37, 38, 40])
+
+| τ | Flagged | G1: Elev. coverage (before→after) | G1b: Sharpness | G2: Unflagged Δcov | Pass |
+|---|---|---|---|---|---|
+| τ=0.05 | 71d | 88.4% → 98.6% (**+10.2pp**) ✅ | 77.1% ✅ | +0.00pp ✅ | ✅ (best) |
+| τ=0.10 | 53d | 88.4% → 98.3% (**+9.9pp**) ✅ | 72.4% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.15 | 43d | 89.7% → 98.1% (**+8.4pp**) ✅ | 74.7% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.20 | 34d | 88.2% → 97.8% (**+9.7pp**) ✅ | 71.0% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.25 | 30d | 94.0% → 100.0% (**+6.0pp**) ✅ | 71.7% ✅ | +0.00pp ✅ | ✅  |
+| τ=0.30 | 27d | 93.2% → 100.0% (**+6.8pp**) ✅ | 70.7% ✅ | +0.00pp ✅ | ✅  |
+
+*G1 threshold: +5pp lift. G1b threshold: ≤82%. G2 threshold: |Δ|≤0.5pp.*
+*High-risk SPs [33, 34, 35, 36, 37, 38, 40] only are widened; all other SPs unchanged on flagged days.*
+
+### §8.3 Verdict
+
+**✅ GATES PASS** at τ = 0.05.
+
+Recommended action: set `spike_widening: true` and `spike_tau: 0.05` in `model_assets/corrector_config.json`.
+
+> ⚠️ **Config is currently `spike_widening: false` (default).** Enable manually after reviewing the gate table above, especially the 2025-10-13 leverage check (§8.1 vs §8.2).
+
+![Spike Widening Gate](spike_widening_gate.png)

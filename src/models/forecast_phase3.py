@@ -38,7 +38,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
-from correctors import AlphaCorrector, Corrector, load_state, save_state, KALMAN_STATE_PATH, get_corrector
+from correctors import (AlphaCorrector, Corrector, load_state, save_state,
+                        KALMAN_STATE_PATH, get_corrector, apply_spike_widening)
 from fetch_generation import fetch_range as _fetch_ci_range
 from fetch_bmrs_forecasts import get_wind_pct_forecast
 
@@ -721,6 +722,29 @@ def run_forecast(
             log.info("PI calibration applied from %s", _pi_path.name)
         except Exception as _e:
             log.warning("PI calibration skipped: %s", _e)
+
+    # ── Phase 6a: spike-gated asymmetric PI widening (config off by default) ─
+    _spike_clf_path   = ASSETS_DIR / "spike_classifier_v1.pkl"
+    _delta_hi_path    = ASSETS_DIR / "delta_hi_v1.json"
+    _spike_feats_path = ASSETS_DIR / "spike_classifier_v1_feats.json"
+    if (cfg.get("spike_widening", False)
+            and _spike_clf_path.exists()
+            and _delta_hi_path.exists()
+            and _spike_feats_path.exists()):
+        try:
+            import joblib as _joblib
+            _spike_clf   = _joblib.load(_spike_clf_path)
+            _spike_feats = json.load(open(_spike_feats_path))
+            _x_spike     = np.array([[lf.get(f, 0.0) for f in _spike_feats]])
+            _p_spike     = float(_spike_clf.predict_proba(_x_spike)[0, 1])
+            _tau         = cfg.get("spike_tau", 0.20)
+            result       = apply_spike_widening(result, _p_spike, _tau, _delta_hi_path)
+            log.info(
+                "Spike widening: P(spike)=%.3f tau=%.2f applied=%s",
+                _p_spike, _tau, _p_spike > _tau,
+            )
+        except Exception as _e:
+            log.warning("Spike widening skipped: %s", _e)
 
     # ── Intraday post-processing: splice actuals + shape correction ───────
     # Runs only when intraday_prices.csv exists and has data for today.

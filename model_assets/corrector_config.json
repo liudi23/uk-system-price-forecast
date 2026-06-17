@@ -5,5 +5,7 @@
   "gamma": 0.966,
   "z_alpha": 1.28,
   "sp_bias": false,
-  "z_guardrail": 500.0
+  "z_guardrail": 500.0,
+  "spike_widening": false,
+  "spike_tau": 0.20
 }
