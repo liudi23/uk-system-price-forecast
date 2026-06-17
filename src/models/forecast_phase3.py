@@ -82,14 +82,18 @@ def _assert_pi_calibrated(df: pd.DataFrame, pi_path: "Path | str", label: str) -
 
     Skipped when fewer than 6 non-settled rows are present (e.g. very late
     intraday run with almost all SPs already settled).
+
+    Caller guarantees pi_path exists before calling.  A read error here means
+    the artifact is corrupt, which is itself an error worth raising.
     """
     try:
         with open(pi_path) as _f:
             _pi = json.load(_f)
         _delta_map = {int(k): float(v) for k, v in _pi.get("delta_by_sp", {}).items()}
     except Exception as _e:
-        log.warning("PI assertion: could not read %s — skipping check (%s)", pi_path, _e)
-        return
+        raise RuntimeError(
+            f"PI assertion [{label}]: could not read {pi_path}: {_e}"
+        ) from _e
 
     # Filter to forecast-only rows (settled SPs have q10=q50=q90=actual)
     if "is_actual" in df.columns:
@@ -763,15 +767,37 @@ def run_forecast(
     result = pd.DataFrame(records)
     result["is_actual"] = False   # populated below when intraday actuals are available
 
-    # ── Phase 4 PI calibration (no-op until pi_calibration_v1.json exists) ──
-    _pi_path = ASSETS_DIR / "pi_calibration_v1.json"
+    # ── Phase 4 PI calibration ────────────────────────────────────────────────
+    # Production sentinel: walk_forward_predictions.csv is generated during WF
+    # evaluation and is the direct prerequisite for computing PI calibration
+    # scores.  Its presence means the system is in a trained state where
+    # pi_calibration_v1.json MUST also exist.  If the PI artifact is absent in
+    # that context, raise rather than silently writing raw bands.
+    _pi_path          = ASSETS_DIR / "pi_calibration_v1.json"
+    _pi_in_production = (ASSETS_DIR / "walk_forward_predictions.csv").exists()
+
     if _pi_path.exists():
         try:
             from correctors import apply_pi_calibration  # implemented in Phase 4
             result = apply_pi_calibration(result, _pi_path)
             log.info("PI calibration applied from %s", _pi_path.name)
         except Exception as _e:
-            log.warning("PI calibration skipped: %s", _e)
+            raise RuntimeError(
+                f"PI calibration failed [{target_date}]: {_e} — "
+                f"raw q10/q90 bands would be written"
+            ) from _e
+    elif _pi_in_production:
+        raise RuntimeError(
+            f"pi_calibration_v1.json absent in production context [{target_date}]: "
+            f"walk_forward_predictions.csv is present (trained system) but "
+            f"pi_calibration_v1.json is missing — raw q10/q90 bands would be "
+            f"written to disk.  Restore model_assets/pi_calibration_v1.json."
+        )
+    else:
+        log.debug(
+            "PI calibration: artifact absent and no trained-model sentinel — "
+            "skipping (pre-Phase-4 dev mode)"
+        )
 
     # ── Phase 6a: spike-gated asymmetric PI widening (config off by default) ─
     _spike_clf_path   = ASSETS_DIR / "spike_classifier_v1.pkl"
@@ -929,16 +955,26 @@ def run_forecast(
 
         result_h2 = pd.DataFrame(h2_records)
 
-        # ── Apply PI calibration to H+2 (same artifact, same path) ───────────
+        # ── Apply PI calibration to H+2 (same artifact, same sentinel) ──────
         if _pi_path.exists():
             try:
                 from correctors import apply_pi_calibration as _apply_pi_h2
                 result_h2 = _apply_pi_h2(result_h2, _pi_path)
                 log.info("H+2 PI calibration applied from %s", _pi_path.name)
             except Exception as _e_h2:
-                log.warning("H+2 PI calibration skipped: %s", _e_h2)
-
+                raise RuntimeError(
+                    f"H+2 PI calibration failed [{h2_date}]: {_e_h2} — "
+                    f"raw q10/q90 bands would be written"
+                ) from _e_h2
             _assert_pi_calibrated(result_h2, _pi_path, f"H+2 {h2_date}")
+        elif _pi_in_production:
+            raise RuntimeError(
+                f"pi_calibration_v1.json absent in production context [{h2_date}]: "
+                f"raw H+2 q10/q90 bands would be written.  "
+                f"Restore model_assets/pi_calibration_v1.json."
+            )
+        else:
+            log.debug("H+2 PI calibration: artifact absent — skipping (pre-Phase-4 dev mode)")
 
         result_h2.to_csv(OUTPUT_FILE_H2, index=False)
         result_h2.to_csv(archive_dir / f"forecast_phase3_{h2_date}.csv", index=False)
