@@ -186,6 +186,20 @@ if _fc_path.exists():
 
     fig_fc = go.Figure()
 
+    # Original day-ahead model prediction (daily pipeline, before intraday Kalman updates)
+    _orig_fc_path = FORECASTS_DIR / f"forecast_phase3_{fc_date}.csv"
+    if _orig_fc_path.exists():
+        fc_orig = pd.read_csv(_orig_fc_path, parse_dates=["settlement_datetime"])
+        _orig_p50 = "ssp_q50" if "ssp_q50" in fc_orig.columns else "ssp_predicted"
+        fig_fc.add_trace(go.Scatter(
+            x=fc_orig["settlement_datetime"], y=fc_orig[_orig_p50],
+            name="Original forecast (daily run)",
+            line=dict(color="#8ab4d4", width=1.5, dash="dash"),
+            opacity=0.8,
+            hovertemplate="SP %{customdata}<br>Original P50 £%{y:.2f}<extra></extra>",
+            customdata=fc_orig["settlement_period"],
+        ))
+
     if has_quantiles and not fc_remaining.empty:
         # P10–P90 band — only over the forecast (non-actual) SPs
         _rem = fc_remaining
@@ -252,7 +266,7 @@ if _fc_path.exists():
             annotation_font=dict(size=10, color="grey"),
         )
 
-    _legend_note = "red = actual · orange = near-term forecast · yellow = forecast horizon"
+    _legend_note = "blue dashed = original daily forecast · red = actual · orange = near-term · yellow = forecast horizon"
     fig_fc.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
         height=340, margin=dict(t=10, b=40), hovermode="x unified",
