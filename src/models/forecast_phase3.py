@@ -71,6 +71,56 @@ COOLING_BASE = 22.0
 HISTORY_DAYS = 40   # rolling window for daily features (28-day max lag + buffer)
 
 
+# ── PI calibration assertion ──────────────────────────────────────────────────
+
+def _assert_pi_calibrated(df: pd.DataFrame, pi_path: "Path | str", label: str) -> None:
+    """Raise RuntimeError if forecast rows in *df* look uncalibrated.
+
+    Detection criterion (same as the W25 monitoring detector):
+      calibrated  ↔  std(spread − 2δ) < 1.5  AND  std(spread) > 3.0
+    where spread = ssp_q90 − ssp_q10 and δ = delta_by_sp[sp].
+
+    Skipped when fewer than 6 non-settled rows are present (e.g. very late
+    intraday run with almost all SPs already settled).
+    """
+    try:
+        with open(pi_path) as _f:
+            _pi = json.load(_f)
+        _delta_map = {int(k): float(v) for k, v in _pi.get("delta_by_sp", {}).items()}
+    except Exception as _e:
+        log.warning("PI assertion: could not read %s — skipping check (%s)", pi_path, _e)
+        return
+
+    # Filter to forecast-only rows (settled SPs have q10=q50=q90=actual)
+    if "is_actual" in df.columns:
+        _fc = df[df["is_actual"] != True]
+    else:
+        _fc = df
+
+    if len(_fc) < 6:
+        log.debug("PI assertion: only %d forecast rows — skipping check", len(_fc))
+        return
+
+    _sp_arr     = _fc["settlement_period"].astype(int)
+    _spread_arr = (_fc["ssp_q90"] - _fc["ssp_q10"]).values
+    _delta_arr  = _sp_arr.map(_delta_map).fillna(0.0).values
+    _std_resid  = float(np.std(_spread_arr - 2.0 * _delta_arr))
+    _std_spread = float(np.std(_spread_arr))
+
+    if _std_resid < 1.5 and _std_spread > 3.0:
+        log.info(
+            "PI calibration assertion PASS [%s]: std(spread-2δ)=%.3f  std(spread)=%.3f",
+            label, _std_resid, _std_spread,
+        )
+    else:
+        raise RuntimeError(
+            f"PI calibration assertion FAILED [{label}]: "
+            f"std(spread-2δ)={_std_resid:.3f}  std(spread)={_std_spread:.3f} — "
+            f"raw q10/q90 bands detected; check that pi_calibration_v1.json exists "
+            f"and apply_pi_calibration executed without exception"
+        )
+
+
 # ── Weather ───────────────────────────────────────────────────────────────────
 
 def fetch_forecast_weather(target_date: date) -> pd.DataFrame:
@@ -787,6 +837,10 @@ def run_forecast(
         except Exception as _e:
             log.warning("Intraday post-processing failed: %s", _e)
 
+    # ── PI calibration assertion (must pass before any CSV is written) ───────
+    if _pi_path.exists():
+        _assert_pi_calibrated(result, _pi_path, f"H+1 {target_date}")
+
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(OUTPUT_FILE, index=False)
     log.info("H+1 forecast saved → %s", OUTPUT_FILE)
@@ -874,6 +928,18 @@ def run_forecast(
             })
 
         result_h2 = pd.DataFrame(h2_records)
+
+        # ── Apply PI calibration to H+2 (same artifact, same path) ───────────
+        if _pi_path.exists():
+            try:
+                from correctors import apply_pi_calibration as _apply_pi_h2
+                result_h2 = _apply_pi_h2(result_h2, _pi_path)
+                log.info("H+2 PI calibration applied from %s", _pi_path.name)
+            except Exception as _e_h2:
+                log.warning("H+2 PI calibration skipped: %s", _e_h2)
+
+            _assert_pi_calibrated(result_h2, _pi_path, f"H+2 {h2_date}")
+
         result_h2.to_csv(OUTPUT_FILE_H2, index=False)
         result_h2.to_csv(archive_dir / f"forecast_phase3_{h2_date}.csv", index=False)
         log.info("H+2 forecast saved → %s  (daily level P50=£%.1f)", OUTPUT_FILE_H2, h2_l50)
