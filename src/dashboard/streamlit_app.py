@@ -186,19 +186,26 @@ if _fc_path.exists():
 
     fig_fc = go.Figure()
 
-    # Original day-ahead model prediction (daily pipeline, before intraday Kalman updates)
+    # Original day-ahead model prediction (daily pipeline snapshot, before intraday updates)
+    # Only draw when the archive differs from the live file — if they're identical it means
+    # intraday updates haven't run yet, so the dashed line would be invisible and misleading.
     _orig_fc_path = FORECASTS_DIR / f"forecast_phase3_{fc_date}.csv"
+    _show_orig = False
     if _orig_fc_path.exists():
         fc_orig = pd.read_csv(_orig_fc_path, parse_dates=["settlement_datetime"])
         _orig_p50 = "ssp_q50" if "ssp_q50" in fc_orig.columns else "ssp_predicted"
-        fig_fc.add_trace(go.Scatter(
-            x=fc_orig["settlement_datetime"], y=fc_orig[_orig_p50],
-            name="Original forecast (daily run)",
-            line=dict(color="#8ab4d4", width=1.5, dash="dash"),
-            opacity=0.8,
-            hovertemplate="SP %{customdata}<br>Original P50 £%{y:.2f}<extra></extra>",
-            customdata=fc_orig["settlement_period"],
-        ))
+        _live_p50_col = "ssp_q50" if "ssp_q50" in fc.columns else "ssp_predicted"
+        _diff_std = (fc_orig[_orig_p50].values - fc[_live_p50_col].values).std()
+        _show_orig = bool(_diff_std > 0.5)   # meaningful divergence from intraday updates
+        if _show_orig:
+            fig_fc.add_trace(go.Scatter(
+                x=fc_orig["settlement_datetime"], y=fc_orig[_orig_p50],
+                name="Original forecast (daily run)",
+                line=dict(color="#8ab4d4", width=1.5, dash="dash"),
+                opacity=0.8,
+                hovertemplate="SP %{customdata}<br>Original P50 £%{y:.2f}<extra></extra>",
+                customdata=fc_orig["settlement_period"],
+            ))
 
     if has_quantiles and not fc_remaining.empty:
         # P10–P90 band — only over the forecast (non-actual) SPs
@@ -266,7 +273,8 @@ if _fc_path.exists():
             annotation_font=dict(size=10, color="grey"),
         )
 
-    _legend_note = "blue dashed = original daily forecast · red = actual · orange = near-term · yellow = forecast horizon"
+    _orig_note = "blue dashed = original daily forecast · " if _show_orig else ""
+    _legend_note = f"{_orig_note}red = actual · orange = near-term · yellow = forecast horizon"
     fig_fc.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
         height=340, margin=dict(t=10, b=40), hovermode="x unified",
@@ -290,47 +298,47 @@ if FORECAST_PATH_H2.exists():
     fc_h2  = pd.read_csv(FORECAST_PATH_H2, parse_dates=["settlement_datetime"])
     h2_date = fc_h2["settlement_date"].iloc[0]
 
-    # Guard: H+2 must be strictly after H+1. If they share a date, the daily
-    # pipeline hasn't run yet for today — show a pending message instead.
     _h1_date = fc["settlement_date"].iloc[0] if _fc_path.exists() else None
-    if _h1_date is not None and h2_date <= _h1_date:
-        st.subheader("Tomorrow Forecast · H+2")
-        st.info(
-            f"H+2 forecast for {_h1_date} + 1 day will be available after the "
-            "12:30 UTC daily pipeline run."
+    _h2_is_stale = _h1_date is not None and h2_date <= _h1_date
+    h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
+    h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
+
+    if _h2_is_stale:
+        _tomorrow = (pd.to_datetime(_h1_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        st.subheader(f"Tomorrow Forecast · H+2 · {_tomorrow}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
+        st.warning(
+            "Today's H+2 forecast will be refreshed after the 12:30 UTC daily pipeline run. "
+            "Showing yesterday's two-day-ahead estimate as a preliminary guide."
         )
     else:
-        h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
-        h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
-
         st.subheader(f"Tomorrow Forecast · H+2 · {h2_date}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
-        st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
+    st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
 
-        h2m1, h2m2, h2m3 = st.columns(3)
-        h2m1.metric("H+2 Date", h2_date)
-        h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
-        h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
+    h2m1, h2m2, h2m3 = st.columns(3)
+    h2m1.metric("H+2 Date", _tomorrow if _h2_is_stale else h2_date)
+    h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
+    h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
 
-        fig_h2 = go.Figure()
-        if "ssp_q10" in fc_h2.columns:
-            fig_h2.add_trace(go.Scatter(
-                x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
-                y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
-                fill="toself", fillcolor="rgba(42,157,143,0.15)",
-                line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
-            ))
+    fig_h2 = go.Figure()
+    if "ssp_q10" in fc_h2.columns:
         fig_h2.add_trace(go.Scatter(
-            x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
-            name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
-            hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
-            customdata=fc_h2["settlement_period"],
+            x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(42,157,143,0.15)",
+            line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
         ))
-        fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
-                         annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
-        fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
-                              height=300, margin=dict(t=10, b=40), hovermode="x unified",
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig_h2)
+    fig_h2.add_trace(go.Scatter(
+        x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
+        name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
+        hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
+        customdata=fc_h2["settlement_period"],
+    ))
+    fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
+                     annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
+    fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
+                          height=300, margin=dict(t=10, b=40), hovermode="x unified",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(fig_h2)
 
 st.divider()
 
