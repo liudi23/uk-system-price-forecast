@@ -49,6 +49,12 @@ Phase 3 splits the forecasting problem into two independent stages, eliminating 
 - Achieved coverage (walk-forward reference): **79.8%** vs raw model coverage ~38%
 - Artifact: `model_assets/pi_calibration_v1.json` · target coverage from `pi_calibration_v1.json` key `achieved_coverage`
 
+**Intraday Nowcast** (Phase 5 · h+1/h+2/h+3 · persistence + empirical bands)
+- Point forecast = last settled SP (pure persistence); 80% empirical bands = P10/P90 of residuals r_h = SSP[t+h−1] − SSP[t−1] from an 18-month trailing window (~26,000 SP pairs)
+- Regime-aware: NP bands (N-code, normal auction — right-skewed, upside spike risk) vs EN bands (P/K-code, formula price — left-skewed, downside risk)
+- Crossover analysis (`docs/persistence-ml-crossover.md`): persistence wins at h+1–h+4; DA+Kalman wins at h+5+; planned blend α·persistence + (1−α)·DA for h+4–h+6 once 6-month forecast archive accumulates (est. Oct 2026)
+- Bands stored in `model_assets/nowcast_bands.json`, built by `src/models/build_nowcast_bands.py`, refreshed monthly
+
 **Final forecast per SP:**
 ```
 H+1:  ssp_q[X][sp] = level_P[X](today)    + shape_H1_deviation[sp]
@@ -139,6 +145,7 @@ src/
     train_phase3.py          Two-stage training + H+2 model + seasonal walk-forward CV
     forecast_phase3.py       Non-recursive H+1 and H+2 inference; PI calibration guard
     correctors.py            Kalman corrector, AlphaCorrector, apply_pi_calibration
+    build_nowcast_bands.py   Build P10/P90 empirical bands for intraday persistence nowcast
     train_spike_classifier.py  Spike classifier training (config-OFF in production)
     evaluate.py              MAE, RMSE, sMAPE, decomposition metrics
   monitoring/
@@ -171,6 +178,7 @@ model_assets/
   pi_calibration_v1.json     Per-SP PI widening deltas (δ by SP, achieved_coverage)
   corrector_config.json      Corrector flags: kalman=true, spike_widening=false
   kalman_state.json          Persisted Kalman state (x̂, P, last_updated)
+  nowcast_bands.json         P10/P90 empirical bands for h+1/h+2/h+3 nowcast (NP + EN regimes)
   test_predictions_phase3.csv  Test window actuals vs predictions
   walk_forward_predictions.csv 119-day seasonal CV predictions (raw q10/q90)
   phase3_level_importance.csv  Level model Spearman importance
@@ -234,7 +242,9 @@ python src/models/forecast_phase3.py             # H+1 (today) + H+2 (tomorrow);
 
 ### Intraday updates
 
-Triggered by the dashboard as each settlement period is confirmed by Elexon. Updates Kalman state with the latest actuals and re-runs the corrected H+1 forecast.
+GitHub Actions runs every 30 minutes around the clock (48 runs/day), fetching the latest Elexon Initial Settlement prices, applying the Kalman corrector, and committing the updated forecast to the repo. The Streamlit dashboard reads these commits directly so it always shows the most current corrected view.
+
+The intraday nowcast panel (h+1/h+2/h+3) is updated each run. Nowcast bands are rebuilt monthly: `python src/models/build_nowcast_bands.py`.
 
 ### Monitoring report
 
@@ -280,6 +290,7 @@ Open [http://localhost:8501](http://localhost:8501)
 |---|---|
 | Today Forecast (H+1) | 48-SP P50 curve with PI-calibrated P10/P90 band; Stage 1 level prediction |
 | Tomorrow Forecast (H+2) | 48-SP P50 with PI-calibrated P10/P90; WINDFOR for tomorrow's date |
+| Intraday Nowcast | h+1/h+2/h+3 persistence nowcast; 80% empirical P10/P90 bands; NP/EN regime-aware; updates every 30 min as SPs settle |
 | Forecast Verification | Archived Phase 3 forecasts vs Elexon actuals — MAE, RMSE, sMAPE, per-SP error |
 | KPIs | Latest SSP, daily average, min/max, spike count |
 | SSP Time Series | Daily average SSP with configurable spike threshold |

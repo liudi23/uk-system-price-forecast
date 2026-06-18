@@ -145,7 +145,9 @@ st.info(
     "Hourly Kalman bias correction (horizon decay γ=0.966) · "
     f"**PI coverage: {_pi_cov_str}** (split-conformal, per-SP deltas, 119-day WF) · "
     f"**Walk-forward MAE: £27.39/MWh** (119 days · 4 seasons) · "
-    f"7-day holdout MAE: {_mae_str} · Level MAE: {_lvl_str} · Shape corr: {_corr_str}"
+    f"7-day holdout MAE: {_mae_str} · Level MAE: {_lvl_str} · Shape corr: {_corr_str} · "
+    "**Intraday Nowcast (h+1/h+2/h+3):** persistence point forecast + 80% empirical P10/P90 bands "
+    "(18-month trailing window · NP/EN regime-aware · updated every 30 min as SPs settle)"
 )
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
