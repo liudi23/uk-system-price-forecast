@@ -55,6 +55,28 @@ The production system covers:
 - Persistence nowcast for h+1/h+2/h+3 with regime-asymmetric empirical bands
 - Active research: spike-tail PI widening (Phase 6a, config-OFF), nowcast model development
 
+### 1.6 Where the Commercial Value Sits by Horizon
+
+Not all forecast horizons are equally actionable. The commercial value of SSP forecasting is concentrated at **h+4 and beyond**, for two mutually reinforcing reasons.
+
+**Reason 1 — this is where the model carries genuine information.** As established in §8, persistence (repeating the last settled SP) is the superior predictor at h+1 through approximately h+4. The DA+Kalman model only overtakes persistence around h+4.5, and by h+5 it beats persistence by roughly 5–6%. Deploying the model at shorter horizons would actively regress accuracy; the short-horizon forecasts in production are persistence-based for this reason. The crossover is not an inconvenience — it is a map of where the forecast adds value.
+
+**Reason 2 — the decision window.** In GB electricity markets, participants can adjust their positions in the intraday market until roughly an hour before delivery. An h+1–h+2 view (30–60 minutes ahead) arrives at or past the point where most positions can be practically changed. A view at h+4 and beyond provides a 2+ hour lead time during which adjustments, trades, and dispatch decisions remain available.
+
+Together, these reasons define four primary use cases where the day-ahead 48-SP forecast (backed by calibrated PIs) delivers actionable value:
+
+1. **Intraday trading and cash-out avoidance.** A participant expecting to be short (or long) at delivery can trade out of — or into — an imbalance position in the intraday market before gate closure. The SSP profile forecast indicates whether the system will be tight (high SSP, expensive to be short) or loose (low or negative SSP, costly to be long), driving the trade direction. The lead time needed to execute this is precisely the h+4+ window.
+
+2. **Battery and flexible-asset dispatch.** Battery operators and flexible-load managers schedule charge/discharge against the expected intraday price profile. This requires the full 48-SP shape (when will SSP be high? when low?) and meaningful lead time for scheduling. The Level–Shape architecture — which produces a day-ahead profile at 30-minute resolution — is specifically suited to this use case, and it is where the model's performance advantage over simple baselines matters most.
+
+3. **Imbalance hedging and risk management.** Risk desks managing exposure to balancing mechanism cash-out need to estimate expected cost and value-at-risk over the remaining settlement periods of the day. This is where the calibrated PI bands (§5) pay off directly: a 79.8% PI is actionable for bounding tail exposure and sizing reserve capital. A raw 38% PI — the uncalibrated output — is systematically narrower than the true distribution and would lead to structural under-hedging.
+
+4. **Flexible generation and BM unit commitment.** Peakers, CCGTs, and demand-response units need to make availability and bid-price decisions that take effect at a future SP. A well-calibrated SSP forecast informs whether it is profitable to be in the BM at a given price and time.
+
+**Contrast: h+1–h+3 as situational awareness.** The persistence nowcast (§8.5) provides an h+1/h+2/h+3 view with regime-asymmetric empirical bands. This is useful for real-time monitoring — watching whether the system is drifting toward a high-price regime, tracking the Kalman state — but it is largely past the point of action for most structured decisions. It is provided as cheap, accurate situational awareness, not as a decision-driving forecast.
+
+This horizon segmentation is what motivates the system's architecture: a DA+Kalman model for the actionable window (h+4+), and a persistence nowcast for the awareness window (h+1–h+3). The crossover analysis in §8 provides the quantitative grounding for this split.
+
 ---
 
 ## 2. Data and the Lag Ceiling
@@ -445,6 +467,8 @@ Over the 30-day archive (2026-05-18 to 2026-06-17, spring/summer only), the DA+K
 - Overnight (00:00–06:00): DA does not cross over until h+7 or later (ACF lag-1 = 0.753; persistence is very accurate)
 
 **Explicit proviso:** These figures are provisional on 30 days from a single spring/summer season. Autumn and winter are unrepresented. The DA+Kalman MAE may be materially different in spike-prone autumn periods. The crossover horizon estimate is directionally reliable; the specific value should not be treated as a stable production parameter until at least 6 months of archive are available (~November 2026).
+
+**Connection to commercial value (see §1.6).** The crossover at h+4.5 maps directly onto where actionable decisions and P&L live in GB markets. Participants can still adjust intraday positions until roughly an hour before delivery; h+4+ is where lead time remains available and the model carries genuine information advantage over persistence. This is why no short-horizon DA model was built: at h+1–h+4 the DA model would regress accuracy against persistence, and the decision window is too narrow for structured action regardless. The crossover result is not a modelling limitation — it is the quantitative reason the architecture is segmented as it is.
 
 A blend analysis found that a horizon-specific blend (α×DA + (1−α)×persistence) beats both pure endpoints by 8–9% MAE at h+4–h+6 — but only on this 30-day sample. The α estimates (0.49 at h+4, 0.60 at h+5) carry ±0.05–0.08 standard error. The practical recommendation for an interim handoff strategy is: persistence for h+1–h+4, DA+Kalman for h+5+.
 
