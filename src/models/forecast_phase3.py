@@ -786,6 +786,8 @@ def run_forecast(
                 f"PI calibration failed [{target_date}]: {_e} — "
                 f"raw q10/q90 bands would be written"
             ) from _e
+        # Assert before Kalman correction widens q10/q90 by uncertainty component
+        _assert_pi_calibrated(result, _pi_path, f"H+1 {target_date}")
     elif _pi_in_production:
         raise RuntimeError(
             f"pi_calibration_v1.json absent in production context [{target_date}]: "
@@ -868,10 +870,6 @@ def run_forecast(
                 log.info("Intraday splice: %d SPs replaced with actuals", len(_actual_map))
         except Exception as _e:
             log.warning("Intraday post-processing failed: %s", _e)
-
-    # ── PI calibration assertion (must pass before any CSV is written) ───────
-    if _pi_path.exists():
-        _assert_pi_calibrated(result, _pi_path, f"H+1 {target_date}")
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(OUTPUT_FILE, index=False)
