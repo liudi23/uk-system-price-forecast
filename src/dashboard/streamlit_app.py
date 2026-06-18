@@ -46,7 +46,7 @@ st.set_page_config(
 )
 
 # Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
-_LAST_PIPELINE_RUN = "2026-06-18T18:39"
+_LAST_PIPELINE_RUN = "2026-06-18T22:00"
 
 
 @st.cache_data(ttl=7200)
@@ -334,34 +334,35 @@ if _fc_path.exists():
         _gen_date = _nb.get("generated", "unknown")
         _horizons = _nb["horizons"]
 
-        st.subheader(
-            f"Intraday Nowcast — SP {_last_sp} settled  ·  last actual £{_y0:.1f}/MWh"
-        )
-        _regime_label = {
-            "NP":      "N-code (N price) · upside spike risk",
-            "EN":      "P-code (formula price) · downside risk",
-            "overall": "overall",
-        }.get(_regime, _regime)
-        st.caption(
-            f"Persistence nowcast · empirical 80% bands · "
-            f"regime: {_regime_label} · bands generated: {_gen_date}"
-        )
+        with st.container(border=True):
+            st.subheader(
+                f"Intraday Nowcast — SP {_last_sp} settled  ·  last actual £{_y0:.1f}/MWh"
+            )
+            _regime_label = {
+                "NP":      "N-code (N price) · upside spike risk",
+                "EN":      "P-code (formula price) · downside risk",
+                "overall": "overall",
+            }.get(_regime, _regime)
+            st.caption(
+                f"Persistence nowcast · empirical 80% bands · "
+                f"regime: {_regime_label} · bands generated: {_gen_date}"
+            )
 
-        _nc_cols = st.columns(3)
-        for _h_idx, _h in enumerate([1, 2, 3]):
-            _h_key     = f"h{_h}"
-            _target_sp = _last_sp + _h
-            _col       = _nc_cols[_h_idx]
-            if _target_sp > 48:
-                _col.metric(f"SP+{_h}  (SP {_target_sp})", "—",
-                            help="Beyond today's 48 settlement periods")
-                continue
-            _bnd = _horizons[_h_key].get(_regime, _horizons[_h_key]["overall"])
-            _p10 = round(_y0 + _bnd["p10"])
-            _p90 = round(_y0 + _bnd["p90"])
-            _col.metric(f"SP+{_h}  (SP {_target_sp})", f"£{_y0:.1f}",
-                        help=f"Point = persistence (last settled SSP); 80% band from trailing 18-month residuals")
-            _col.caption(f"80% band: £{_p10} – £{_p90}")
+            _nc_cols = st.columns(3)
+            for _h_idx, _h in enumerate([1, 2, 3]):
+                _h_key     = f"h{_h}"
+                _target_sp = _last_sp + _h
+                _col       = _nc_cols[_h_idx]
+                if _target_sp > 48:
+                    _col.metric(f"SP+{_h}  (SP {_target_sp})", "—",
+                                help="Beyond today's 48 settlement periods")
+                    continue
+                _bnd = _horizons[_h_key].get(_regime, _horizons[_h_key]["overall"])
+                _p10 = round(_y0 + _bnd["p10"])
+                _p90 = round(_y0 + _bnd["p90"])
+                _col.metric(f"SP+{_h}  (SP {_target_sp})", f"£{_y0:.1f}",
+                            help=f"Point = persistence (last settled SSP); 80% band from trailing 18-month residuals")
+                _col.caption(f"80% band: £{_p10} – £{_p90}")
 
     elif NOWCAST_BANDS_JSON.exists() and not _has_actual:
         st.info(
