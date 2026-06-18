@@ -34,6 +34,7 @@ FORECAST_SCRIPT_P3 = ROOT / "src" / "models" / "forecast_phase3.py"
 FORECASTS_DIR     = ROOT / "model_assets"    / "forecasts"
 DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
 FEATURES_5YR      = ROOT / "data" / "processed" / "features_5yr.csv"
+SYSTEM_PRICES_RAW = ROOT / "data" / "raw"       / "system_prices.csv"
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -172,10 +173,30 @@ if _fc_path.exists():
     else:
         fm5.metric("Max P50", f"£{fc[p50_col].max():.1f}")
 
-    # Split by is_actual flag (set by forecast_phase3.py intraday post-processing)
+    # ── Determine settled SPs ────────────────────────────────────────────────
+    # Primary: is_actual column written by the intraday pipeline.
+    # Fallback: join directly from system_prices.csv so settled SPs and their
+    # actual prices are visible even before the intraday pipeline has committed.
     _has_actual = "is_actual" in fc.columns and fc["is_actual"].any()
-    fc_actual    = fc[fc["is_actual"]]   if _has_actual else pd.DataFrame()
-    fc_remaining = fc[~fc["is_actual"]]  if _has_actual else fc
+    _actual_price_col = p50_col   # default: use forecast value
+
+    if not _has_actual and SYSTEM_PRICES_RAW.exists():
+        _sp_raw = pd.read_csv(SYSTEM_PRICES_RAW, parse_dates=["settlement_date"])
+        _sp_today = _sp_raw[
+            _sp_raw["settlement_date"].dt.strftime("%Y-%m-%d") == fc_date
+        ][["settlement_period", "ssp"]].rename(columns={"ssp": "_ssp_actual"})
+        if not _sp_today.empty:
+            fc = fc.merge(_sp_today, on="settlement_period", how="left")
+            fc["is_actual"] = fc["_ssp_actual"].notna()
+            _has_actual = fc["is_actual"].any()
+            _actual_price_col = "_ssp_actual"   # use Elexon actual for settled SPs
+
+    if _has_actual:
+        fc_actual    = fc[fc["is_actual"]].copy()
+        fc_remaining = fc[~fc["is_actual"]].copy()
+    else:
+        fc_actual    = pd.DataFrame()
+        fc_remaining = fc.copy()
 
     # Orange/yellow boundary on remaining (forecast) SPs: now + 2 h
     _now_utc   = pd.Timestamp.utcnow().tz_localize(None)
@@ -230,21 +251,21 @@ if _fc_path.exists():
             customdata=_rem["settlement_period"],
         ))
 
-    # Actual settled prices — dark solid line
+    # Actual settled prices — dark red solid line (Elexon SSP)
     if not fc_actual.empty:
         fig_fc.add_trace(go.Scatter(
-            x=fc_actual["settlement_datetime"], y=fc_actual[p50_col],
+            x=fc_actual["settlement_datetime"], y=fc_actual[_actual_price_col],
             name="Actual SSP", line=dict(color="#c0392b", width=2.5),
             hovertemplate="SP %{customdata}<br>Actual £%{y:.2f}<extra></extra>",
             customdata=fc_actual["settlement_period"],
         ))
 
-    # P50 — orange segment (near-term forecast ≤ now+2h, shape-corrected)
+    # P50 — orange segment (near-term Kalman-nudged forecast ≤ now+2h)
     if not fc_orange.empty:
-        # Connect from last actual if available
-        _x_join = pd.concat([fc_actual["settlement_datetime"].iloc[[-1]], fc_orange["settlement_datetime"]]) if not fc_actual.empty else fc_orange["settlement_datetime"]
-        _y_join = pd.concat([fc_actual[p50_col].iloc[[-1]], fc_orange[p50_col]]) if not fc_actual.empty else fc_orange[p50_col]
-        _sp_join = pd.concat([fc_actual["settlement_period"].iloc[[-1]], fc_orange["settlement_period"]]) if not fc_actual.empty else fc_orange["settlement_period"]
+        # Connect seamlessly from last actual if available
+        _x_join  = pd.concat([fc_actual["settlement_datetime"].iloc[[-1]], fc_orange["settlement_datetime"]]) if not fc_actual.empty else fc_orange["settlement_datetime"]
+        _y_join  = pd.concat([fc_actual[_actual_price_col].iloc[[-1]],     fc_orange[p50_col]])               if not fc_actual.empty else fc_orange[p50_col]
+        _sp_join = pd.concat([fc_actual["settlement_period"].iloc[[-1]],   fc_orange["settlement_period"]])   if not fc_actual.empty else fc_orange["settlement_period"]
         fig_fc.add_trace(go.Scatter(
             x=_x_join, y=_y_join,
             name="P50 (near-term)", line=dict(color="#e05c00", width=2.5),
