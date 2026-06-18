@@ -337,7 +337,11 @@ if _fc_path.exists():
         st.subheader(
             f"Intraday Nowcast — SP {_last_sp} settled  ·  last actual £{_y0:.1f}/MWh"
         )
-        _regime_label = {"NP": "N-code (N price)", "EN": "EN energy network", "overall": "overall"}.get(_regime, _regime)
+        _regime_label = {
+            "NP":      "N-code (N price) · upside spike risk",
+            "EN":      "P-code (formula price) · downside risk",
+            "overall": "overall",
+        }.get(_regime, _regime)
         st.caption(
             f"Persistence nowcast · empirical 80% bands · "
             f"regime: {_regime_label} · bands generated: {_gen_date}"
