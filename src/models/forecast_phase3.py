@@ -905,7 +905,14 @@ def run_forecast(
 
     archive_dir = OUTPUT_FILE.parent / "forecasts"
     archive_dir.mkdir(exist_ok=True)
-    result.to_csv(archive_dir / f"forecast_phase3_{target_date}.csv", index=False)
+    # Only write the archive snapshot when the result is a clean model prediction
+    # (no settled actuals spliced in).  Intraday runs that have is_actual=True rows
+    # would overwrite the original daily forecast with actual values, making the
+    # "original forecast" line on the dashboard invisible (diff_std → 0).
+    _has_actuals = "is_actual" in result.columns and result["is_actual"].any()
+    if not _has_actuals:
+        result.to_csv(archive_dir / f"forecast_phase3_{target_date}.csv", index=False)
+        log.info("Archive snapshot saved → %s", archive_dir / f"forecast_phase3_{target_date}.csv")
 
     # ── H+2: forecast for target_date + 1 (tomorrow) ─────────────────────
     if shape_h2_q50 is not None and shape_h2_feat_cols:
@@ -1009,7 +1016,8 @@ def run_forecast(
             log.debug("H+2 PI calibration: artifact absent — skipping (pre-Phase-4 dev mode)")
 
         result_h2.to_csv(OUTPUT_FILE_H2, index=False)
-        result_h2.to_csv(archive_dir / f"forecast_phase3_{h2_date}.csv", index=False)
+        if not _has_actuals:  # same guard: don't overwrite H+2 archive on intraday runs
+            result_h2.to_csv(archive_dir / f"forecast_phase3_{h2_date}.csv", index=False)
         log.info("H+2 forecast saved → %s  (daily level P50=£%.1f)", OUTPUT_FILE_H2, h2_l50)
     else:
         result_h2 = pd.DataFrame()
