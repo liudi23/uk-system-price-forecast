@@ -24,6 +24,9 @@ SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
 LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
 SHAPE_IMP_CSV    = ROOT / "model_assets" / "phase3_shape_importance.csv"
 
+NOWCAST_BANDS_JSON = ROOT / "model_assets" / "nowcast_bands.json"
+INTRADAY_PRICES    = ROOT / "data" / "raw"   / "intraday_prices.csv"
+
 FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
 FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
 FETCH_CPI         = ROOT / "src" / "data"    / "fetch_cpi.py"
@@ -43,7 +46,7 @@ st.set_page_config(
 )
 
 # Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
-_LAST_PIPELINE_RUN = "2026-06-18"
+_LAST_PIPELINE_RUN = "2026-06-18T17:55"
 
 
 @st.cache_data(ttl=7200)
@@ -307,6 +310,60 @@ if _fc_path.exists():
         )],
     )
     st.plotly_chart(fig_fc)
+
+    # ── Intraday Nowcast Panel ────────────────────────────────────────────────
+    if NOWCAST_BANDS_JSON.exists() and _has_actual and not fc_actual.empty:
+        import json as _json_nc
+        with open(NOWCAST_BANDS_JSON) as _f:
+            _nb = _json_nc.load(_f)
+
+        _settled_sorted  = fc_actual.sort_values("settlement_period")
+        _last_sp_row     = _settled_sorted.iloc[-1]
+        _last_sp         = int(_last_sp_row["settlement_period"])
+        _y0              = float(_last_sp_row[_actual_price_col])
+
+        # Regime from intraday_prices.csv (N → NP / else → EN)
+        _regime = "overall"
+        if INTRADAY_PRICES.exists():
+            _id_df = pd.read_csv(INTRADAY_PRICES, parse_dates=["settlement_date"])
+            _id_today = _id_df[_id_df["settlement_date"].dt.strftime("%Y-%m-%d") == fc_date]
+            _id_last  = _id_today[_id_today["settlement_period"] == _last_sp]
+            if not _id_last.empty and "price_derivation_code" in _id_last.columns:
+                _regime = "NP" if _id_last["price_derivation_code"].iloc[0] == "N" else "EN"
+
+        _gen_date = _nb.get("generated", "unknown")
+        _horizons = _nb["horizons"]
+
+        st.subheader(
+            f"Intraday Nowcast — SP {_last_sp} settled  ·  last actual £{_y0:.1f}/MWh"
+        )
+        _regime_label = {"NP": "N-code (N price)", "EN": "EN energy network", "overall": "overall"}.get(_regime, _regime)
+        st.caption(
+            f"Persistence nowcast · empirical 80% bands · "
+            f"regime: {_regime_label} · bands generated: {_gen_date}"
+        )
+
+        _nc_cols = st.columns(3)
+        for _h_idx, _h in enumerate([1, 2, 3]):
+            _h_key     = f"h{_h}"
+            _target_sp = _last_sp + _h
+            _col       = _nc_cols[_h_idx]
+            if _target_sp > 48:
+                _col.metric(f"SP+{_h}  (SP {_target_sp})", "—",
+                            help="Beyond today's 48 settlement periods")
+                continue
+            _bnd = _horizons[_h_key].get(_regime, _horizons[_h_key]["overall"])
+            _p10 = round(_y0 + _bnd["p10"])
+            _p90 = round(_y0 + _bnd["p90"])
+            _col.metric(f"SP+{_h}  (SP {_target_sp})", f"£{_y0:.1f}",
+                        help=f"Point = persistence (last settled SSP); 80% band from trailing 18-month residuals")
+            _col.caption(f"80% band: £{_p10} – £{_p90}")
+
+    elif NOWCAST_BANDS_JSON.exists() and not _has_actual:
+        st.info(
+            "Awaiting first settled SP of the day — "
+            "intraday nowcast will appear once the intraday pipeline runs."
+        )
 
 
 else:
