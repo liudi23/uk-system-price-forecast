@@ -35,6 +35,7 @@ import math
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -46,6 +47,7 @@ import pandas as pd
 ROOT       = Path(__file__).resolve().parents[2]
 ASSETS_DIR = ROOT / "model_assets"
 DATA_DIR   = ROOT / "data"
+NOWCAST_BANDS_JSON_PATH = ASSETS_DIR / "nowcast_bands.json"
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 COV_TARGET     = 0.798   # WF+PI calibration target coverage
@@ -74,6 +76,12 @@ QUIET_ANNUAL   = 0.10          # annual spike rate < this → "too quiet" (2024 
 STEP3_MIN_AUTUMNS = 2          # GREEN when ≥ this many usable spike-bearing autumns
 
 SPIKE_THR_TRAIN = 150.0        # £/MWh threshold for "spike day" in training data
+
+# Nowcast band monitoring
+NOWCAST_COV_TARGET       = 0.80   # nominal 80% target
+NOWCAST_COV_WARN_LO      = 0.78   # flag 🔴 if overall coverage drifts below this
+NOWCAST_BANDS_STALE_DAYS = 31     # flag 🟡 if nowcast_bands.json older than this
+NOWCAST_H3_MIN_MONTHS    = 6      # H+3 DA-feature readiness: months of forecast archive
 
 
 # ── Wilson confidence interval ─────────────────────────────────────────────────
@@ -483,6 +491,141 @@ def compute_step3_gate() -> dict:
     }
 
 
+# ── Nowcast band monitoring ────────────────────────────────────────────────────
+
+def load_nowcast_bands() -> dict:
+    """Load model_assets/nowcast_bands.json; return {} if absent."""
+    if not NOWCAST_BANDS_JSON_PATH.exists():
+        return {}
+    with open(NOWCAST_BANDS_JSON_PATH) as f:
+        return json.load(f)
+
+
+def compute_nowcast_coverage(system_prices: pd.DataFrame, bands: dict) -> dict:
+    """
+    Compute live coverage of the shipped persistence-nowcast bands from settled actuals.
+
+    For each SP at time t (y0 = actual[t], regime = price_derivation_code[t]) and each
+    horizon h ∈ {1,2,3}, check whether actual[t+h] − y0 ∈ [P10_h, P90_h] from the
+    regime-matched band.  Mirrors the residual definition in build_nowcast_bands.py.
+
+    Uses system_prices.csv (~60-day rolling window).  Returns dict shaped as
+    {h1: {overall, NP, EN}, h2: …, h3: …} or {} if data or bands are unavailable.
+    """
+    if system_prices.empty or not bands or "horizons" not in bands:
+        return {}
+
+    sp      = system_prices.sort_values(["date", "sp"]).reset_index(drop=True)
+    actuals = sp["actual"].values
+    codes   = (sp["price_derivation_code"].values
+               if "price_derivation_code" in sp.columns
+               else np.full(len(sp), "?"))
+
+    result = {}
+    for h in [1, 2, 3]:
+        h_key = f"h{h}"
+        if h_key not in bands["horizons"]:
+            continue
+        h_bands = bands["horizons"][h_key]
+        n = len(sp) - h
+        if n <= 0:
+            continue
+
+        y0   = actuals[:n]
+        yh   = actuals[h : h + n]
+        c0   = codes[:n]
+        valid = np.isfinite(y0) & np.isfinite(yh)
+        r_h  = yh - y0
+
+        sub = {}
+        for regime_key, mask in [
+            ("overall", valid),
+            ("NP",      valid & (c0 == "N")),
+            ("EN",      valid & (c0 != "N")),   # P/K-code → EN regime
+        ]:
+            bnd = h_bands.get(regime_key, h_bands["overall"])
+            p10, p90 = bnd["p10"], bnd["p90"]
+            r_sub = r_h[mask]
+            n_sub = int(mask.sum())
+            hits  = int(((r_sub >= p10) & (r_sub <= p90)).sum())
+            cov   = round(hits / n_sub * 100, 1) if n_sub > 0 else float("nan")
+            lo, hi = wilson_ci(hits, n_sub) if n_sub > 0 else (float("nan"), float("nan"))
+            sub[regime_key] = {
+                "coverage": cov, "n": n_sub, "hits": hits,
+                "ci_lo": round(lo * 100, 1), "ci_hi": round(hi * 100, 1),
+            }
+        result[h_key] = sub
+
+    return result
+
+
+def check_nowcast_bands_staleness(bands: dict) -> dict:
+    """Return staleness metadata for nowcast_bands.json."""
+    if not bands:
+        return {"generated": None, "age_days": None, "stale": True, "status": "🔴"}
+    gen_str = bands.get("generated", "")
+    if not gen_str:
+        return {"generated": None, "age_days": None, "stale": True, "status": "🔴"}
+    try:
+        gen_date = date.fromisoformat(gen_str)
+    except ValueError:
+        return {"generated": gen_str, "age_days": None, "stale": True, "status": "🔴"}
+    age   = (date.today() - gen_date).days
+    stale = age > NOWCAST_BANDS_STALE_DAYS
+    return {
+        "generated": gen_str,
+        "age_days":  age,
+        "stale":     stale,
+        "status":    "🟡" if stale else "🟢",
+    }
+
+
+def compute_nowcast_h3_readiness() -> dict:
+    """
+    Count calendar months of archived forecast_phase3_*.csv files.
+    GREEN when ≥ NOWCAST_H3_MIN_MONTHS months are present — the threshold before the
+    DA-Q50 feature improvement (partial R² ~10% at h+3, Experiment 2) can be validated
+    out-of-sample and merged into production.
+    """
+    fc_dir = ASSETS_DIR / "forecasts"
+    if not fc_dir.exists():
+        return {"n_months": 0, "min_months": NOWCAST_H3_MIN_MONTHS,
+                "green": False, "first_date": None, "last_date": None, "trigger": "—"}
+
+    dates = []
+    for p in fc_dir.glob("forecast_phase3_*.csv"):
+        try:
+            dates.append(date.fromisoformat(p.stem.replace("forecast_phase3_", "")))
+        except ValueError:
+            pass
+
+    if not dates:
+        return {"n_months": 0, "min_months": NOWCAST_H3_MIN_MONTHS,
+                "green": False, "first_date": None, "last_date": None, "trigger": "—"}
+
+    first_date = min(dates)
+    last_date  = max(dates)
+    n_months   = len(set((d.year, d.month) for d in dates))
+    green      = n_months >= NOWCAST_H3_MIN_MONTHS
+
+    # Estimate: the calendar month that is NOWCAST_H3_MIN_MONTHS after first_date
+    y, m = first_date.year, first_date.month
+    for _ in range(NOWCAST_H3_MIN_MONTHS - 1):
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    trigger_str = date(y, m, 1).strftime("%b %Y")
+
+    return {
+        "n_months":   n_months,
+        "min_months": NOWCAST_H3_MIN_MONTHS,
+        "green":      green,
+        "first_date": str(first_date),
+        "last_date":  str(last_date),
+        "trigger":    f"≈ {trigger_str} ({NOWCAST_H3_MIN_MONTHS} calendar months archived)",
+    }
+
+
 # ── Plots ──────────────────────────────────────────────────────────────────────
 
 def plot_coverage_timeline(wf: pd.DataFrame, live: pd.DataFrame, out_path: Path) -> None:
@@ -740,6 +883,10 @@ def write_report(
     gate: dict,
     plot_dir: Path,
     out_path: Path,
+    nowcast_bands: Optional[dict] = None,
+    nowcast_cov: Optional[dict] = None,
+    nowcast_staleness: Optional[dict] = None,
+    nowcast_h3: Optional[dict] = None,
 ) -> None:
     today = date.today()
 
@@ -813,6 +960,29 @@ def write_report(
     resid_st       = _resid_status(resid_live_4w["win_mean"], resid_live_4w["n"])
     step3_st       = "🟢" if gate.get("green") else "🔴"
 
+    # Nowcast band status variables
+    _nb  = nowcast_bands or {}
+    _nc  = nowcast_cov or {}
+    _ns  = nowcast_staleness or {}
+    _nh3 = nowcast_h3 or {}
+
+    def _nc_status(h_key: str) -> tuple[str, str, str]:
+        """Returns (cov_str, n_str, status_emoji) for h_key overall coverage."""
+        if not _nc or h_key not in _nc:
+            return "—", "—", "⚠️"
+        d = _nc[h_key].get("overall", {})
+        cov_pct = d.get("coverage", float("nan"))
+        n       = d.get("n", 0)
+        if np.isnan(cov_pct) or n == 0:
+            return "—", str(n), "⚠️"
+        st = "🟢" if cov_pct / 100 >= NOWCAST_COV_WARN_LO else "🔴"
+        return f"{cov_pct:.1f}%", str(n), st
+
+    _nc_h1_cov, _nc_h1_n, _nc_h1_st = _nc_status("h1")
+    _nc_h3_cov, _nc_h3_n, _nc_h3_st = _nc_status("h3")
+    _stale_st  = _ns.get("status", "⚠️")
+    _h3_rdy_st = "🟢" if _nh3.get("green") else "🔴"
+
     rel = lambda p: p.relative_to(out_path.parent)
 
     def _rel_plot(name):
@@ -863,6 +1033,11 @@ def write_report(
         f"| §6 | Classifier calibration | — | {'ACTIVE' if spike_widening else 'INACTIVE'} | — | {'🟢' if spike_widening else '⬛'} |",
         f"| §7 | Step-3 gate | {gate.get('n_usable_autumns',0)}/{gate.get('min_autumns',2)} aut | "
         f"{'GREEN' if gate.get('green') else 'RED'} | ≥{gate.get('min_autumns',2)} aut | {step3_st} |",
+        f"| §7 | H+3 nowcast readiness | {_nh3.get('n_months',0)}/{_nh3.get('min_months',6)} mo | "
+        f"{'GREEN' if _nh3.get('green') else 'RED'} | ≥{_nh3.get('min_months',6)} mo | {_h3_rdy_st} |",
+        f"| §8 | Nowcast h+1 cov (overall) | {_nc_h1_n} | {_nc_h1_cov} | ≥{NOWCAST_COV_WARN_LO*100:.0f}% | {_nc_h1_st} |",
+        f"| §8 | Nowcast h+3 cov (overall) | {_nc_h3_n} | {_nc_h3_cov} | ≥{NOWCAST_COV_WARN_LO*100:.0f}% | {_nc_h3_st} |",
+        f"| §8 | Nowcast bands age | — | {_ns.get('age_days','—')}d | <{NOWCAST_BANDS_STALE_DAYS}d | {_stale_st} |",
         f"",
         f"**Status key:** 🟢 OK · 🟡 WARN · 🔴 ALERT · ⬛ INACTIVE · ⚠️ low-confidence (N < minimum)",
         f"",
@@ -1026,6 +1201,92 @@ def write_report(
         f"",
         f"![Step-3 Gate]({_rel_plot(out_path.stem + '_step3.png')})",
         f"",
+        f"### H+3 Nowcast Readiness Gate",
+        f"",
+        f"**Purpose:** The DA-Q50 feature improves h+3 persistence nowcast (partial R² ~10%, "
+        f"Experiment 2). This gate tracks when enough forecast archive is available to validate "
+        f"the improvement out-of-sample. GREEN at ≥{NOWCAST_H3_MIN_MONTHS} calendar months archived.",
+        f"",
+        f"| | Value |",
+        f"|---|---|",
+        f"| Forecast archive months available | {_nh3.get('n_months', 0)} |",
+        f"| Required months | {_nh3.get('min_months', NOWCAST_H3_MIN_MONTHS)} |",
+        f"| First archive date | {_nh3.get('first_date', '—')} |",
+        f"| Latest archive date | {_nh3.get('last_date', '—')} |",
+        f"| Gate | {'🟢 **GREEN — validate DA-Q50 feature**' if _nh3.get('green') else '🔴 **RED — archive accumulating**'} |",
+        f"| Trigger | {_nh3.get('trigger', '—')} |",
+        f"",
+        f"---",
+        f"",
+        f"## §8. Nowcast Band Health",
+        f"",
+        f"Nowcast bands (`model_assets/nowcast_bands.json`) ship P10/P90 residual quantiles "
+        f"for the persistence nowcaster (h+1/h+2/h+3).  "
+        f"Target: {NOWCAST_COV_TARGET*100:.0f}% empirical coverage. "
+        f"Flag 🔴 if overall coverage drifts below {NOWCAST_COV_WARN_LO*100:.0f}%.",
+        f"",
+        f"**Bands metadata:** generated={_nb.get('generated', '—')} · "
+        f"fit_window={_nb.get('fit_window', {}).get('start', '—')} → "
+        f"{_nb.get('fit_window', {}).get('end', '—')} "
+        f"({_nb.get('fit_window', {}).get('months', '?')} months, "
+        f"{_nb.get('fit_window', {}).get('n_rows', '?'):,} SP pairs)  " if _nb else
+        "**Bands metadata:** `nowcast_bands.json` not found — run `python src/models/build_nowcast_bands.py`  ",
+        f"",
+        f"### §8a. Live Coverage by Horizon and Regime",
+        f"",
+    ]
+
+    if _nc:
+        nc_header = "| Horizon | Regime | Coverage | 90% CI | N | vs Target | Status |"
+        nc_sep    = "|---|---|---|---|---|---|---|"
+        nc_rows   = [nc_header, nc_sep]
+        for h_key in ["h1", "h2", "h3"]:
+            if h_key not in _nc:
+                continue
+            h_disp = h_key.replace("h", "h+")
+            for regime_key in ["overall", "NP", "EN"]:
+                d = _nc[h_key].get(regime_key, {})
+                cov_val = d.get("coverage", float("nan"))
+                n_val   = d.get("n", 0)
+                ci_lo   = d.get("ci_lo", float("nan"))
+                ci_hi   = d.get("ci_hi", float("nan"))
+                if np.isnan(cov_val) or n_val == 0:
+                    nc_rows.append(f"| {h_disp} | {regime_key} | — | — | {n_val} | — | ⚠️ |")
+                else:
+                    delta = cov_val - NOWCAST_COV_TARGET * 100
+                    st    = "🟢" if cov_val / 100 >= NOWCAST_COV_WARN_LO else "🔴"
+                    nc_rows.append(
+                        f"| {h_disp} | {regime_key} | {cov_val:.1f}% | "
+                        f"[{ci_lo:.1f}%, {ci_hi:.1f}%] | {n_val} | "
+                        f"{delta:+.1f}pp | {st} |"
+                    )
+        lines += nc_rows
+        lines += [
+            f"",
+            f"Coverage computed from `data/raw/system_prices.csv` (~60-day window).  ",
+            f"NP regime = N-code (normal auction); EN regime = P/K-code (formula).  ",
+            f"⚠️ Coverage below {NOWCAST_COV_WARN_LO*100:.0f}% → refresh `nowcast_bands.json` "
+            f"(`python src/models/build_nowcast_bands.py`).",
+        ]
+    else:
+        lines += [
+            f"Coverage data unavailable — either `nowcast_bands.json` is missing or "
+            f"`data/raw/system_prices.csv` has insufficient rows.",
+        ]
+
+    lines += [
+        f"",
+        f"### §8b. Bands Staleness",
+        f"",
+        f"| | Value |",
+        f"|---|---|",
+        f"| Generated | {_ns.get('generated', '—')} |",
+        f"| Age | {_ns.get('age_days', '—')} days |",
+        f"| Stale threshold | {NOWCAST_BANDS_STALE_DAYS} days |",
+        f"| Status | {_stale_st} {'(refresh recommended)' if _ns.get('stale') else '(OK)'} |",
+        f"",
+        f"Refresh command: `python src/models/build_nowcast_bands.py` then commit `model_assets/nowcast_bands.json`.",
+        f"",
         f"---",
         f"",
         f"*Report generated by `src/monitoring/build_monitoring_report.py`.*",
@@ -1085,6 +1346,28 @@ def main() -> None:
     print(f"  Usable autumns: {gate['n_usable_autumns']}/{gate['min_autumns']}  "
           f"gate={'GREEN' if gate['green'] else 'RED'}")
 
+    print("Loading nowcast bands …")
+    nowcast_bands = load_nowcast_bands()
+    if nowcast_bands:
+        print(f"  Loaded bands (generated {nowcast_bands.get('generated','?')})")
+    else:
+        print("  WARNING: nowcast_bands.json not found")
+
+    print("Computing nowcast coverage …")
+    nowcast_cov = compute_nowcast_coverage(sys_prices, nowcast_bands)
+    if nowcast_cov:
+        for h_key, sub in nowcast_cov.items():
+            ov = sub.get("overall", {})
+            print(f"  {h_key}: overall={ov.get('coverage','?'):.1f}%  n={ov.get('n','?')}")
+
+    nowcast_staleness = check_nowcast_bands_staleness(nowcast_bands)
+    print(f"  Bands age: {nowcast_staleness.get('age_days','?')} days  {nowcast_staleness.get('status','?')}")
+
+    print("Computing H+3 nowcast readiness …")
+    nowcast_h3 = compute_nowcast_h3_readiness()
+    print(f"  Archive months: {nowcast_h3['n_months']}/{nowcast_h3['min_months']}  "
+          f"gate={'GREEN' if nowcast_h3['green'] else 'RED'}")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     cov_plot   = plot_dir / f"{week_str}_coverage.png"
     kalman_plot = plot_dir / f"{week_str}_kalman.png"
@@ -1101,7 +1384,11 @@ def main() -> None:
     # ── Report ────────────────────────────────────────────────────────────────
     print("Writing report …")
     write_report(week_str, wf, live if not live.empty else pd.DataFrame(),
-                 gate, plot_dir, report_path)
+                 gate, plot_dir, report_path,
+                 nowcast_bands=nowcast_bands,
+                 nowcast_cov=nowcast_cov,
+                 nowcast_staleness=nowcast_staleness,
+                 nowcast_h3=nowcast_h3)
 
     print(f"\nDone. Report: {report_path}")
 
