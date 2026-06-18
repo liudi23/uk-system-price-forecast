@@ -800,6 +800,12 @@ def run_forecast(
         )
 
     # ── Phase 6a: spike-gated asymmetric PI widening (config off by default) ─
+    _corrector_cfg_path = ASSETS_DIR / "corrector_config.json"
+    try:
+        with open(_corrector_cfg_path) as _f:
+            cfg = json.load(_f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        cfg = {}
     _spike_clf_path   = ASSETS_DIR / "spike_classifier_v1.pkl"
     _delta_hi_path    = ASSETS_DIR / "delta_hi_v1.json"
     _spike_feats_path = ASSETS_DIR / "spike_classifier_v1_feats.json"
