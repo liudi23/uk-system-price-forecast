@@ -1,19 +1,22 @@
 name: Intraday Forecast Update
 
-# Runs 10 times per trading day (08:30–17:30 UTC) to fetch the latest Elexon
+# Runs every 30 minutes around the clock (48 runs/day) to fetch the latest Elexon
 # Initial Settlement prices, apply the Kalman bias corrector, and commit the
 # updated forecast + filter state back to the repo so the Streamlit dashboard
 # always shows the most current corrected 48-SP view.
 #
+# Cost: ~1 min/run (no model training — frozen HGBR + Kalman inference only).
+# 48 runs/day ≈ 1,440 min/month, within the free-tier 2,000 min/month limit.
+# The no-diff guard means idempotent reruns (no new settled SPs) produce no commits.
+#
 # State persistence: commit-back to model_assets/kalman_state.json.
 # Rationale: Actions cache has a 7-day eviction TTL; a cache miss on a bank-holiday
 # Monday would cause a silent cold-start (x̂=0, P=P₀) mid-trading-day.
-# Commit-back is always authoritative, matches the daily_pipeline.yml pattern, and
-# the no-diff guard means idempotent reruns produce no commits.
+# Commit-back is always authoritative, matches the daily_pipeline.yml pattern.
 
 on:
   schedule:
-    - cron: '30 8-17 * * *'   # 08:30–17:30 UTC — 10 runs per day
+    - cron: '*/30 * * * *'    # every 30 minutes, 24 h/day — 48 runs per day
   workflow_dispatch:            # manual re-run / backfill from Actions UI
 
 jobs:
@@ -56,7 +59,7 @@ jobs:
       #   → splice settled actuals → save next_day_forecast_phase3.csv + kalman_state.json
       #
       # Robustness handled inside the script:
-      #   - Daily reset: fires automatically when settlement_date changes (first 08:30 run)
+      #   - Daily reset: fires automatically when settlement_date changes (first run of new day)
       #   - Idempotency: KalmanCorrector skips update if n_settled unchanged since last call
       #   - Guardrail: skips update if |z_t| > 500 £/MWh (data-quality anomaly)
       #   - Missing intraday file: runs base model + carries prior Kalman state unchanged
