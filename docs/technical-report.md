@@ -100,23 +100,7 @@ For the intraday nowcast (predicting SP[t] at horizon h+1 during the current set
 
 ### 3.1 End-to-End Flow
 
-```mermaid
-graph TD
-    A[Elexon/Weather/CPI/WINDFOR fetch] --> B[Feature build]
-    B --> C[HGBR train Level + Shape]
-    C --> D[PI calibration: delta per SP]
-    D --> E[48-SP forecast archive]
-    E --> F[Commit to streamlit-data branch]
-
-    G[Elexon intraday fetch settled SPs] --> H[Kalman update: x_hat, P]
-    H --> I[Corrected 48-SP forecast: q10/q50/q90]
-    I --> J[Splice settled actuals]
-    J --> K[Commit to streamlit-data branch]
-
-    L[Streamlit Cloud] --> M{reads repo}
-    M --> N[Day-Ahead 48-SP panel]
-    M --> O[Intraday Nowcast panel]
-```
+![Pipeline Architecture](../reports/figures/architecture.png)
 
 **Daily pipeline (12:30 UTC, `daily_pipeline.yml`):** Fetches all data sources, builds the feature matrix via `build_features.py`, retrains both HGBR models (level P10/P50/P90, shape H+1 and H+2), runs split-conformal PI calibration and writes `pi_calibration_v1.json`, writes the day-ahead 48-SP forecast archive, and commits all artifacts to the `streamlit-data` branch.
 
