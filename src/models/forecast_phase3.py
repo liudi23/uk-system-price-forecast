@@ -839,6 +839,34 @@ def run_forecast(
     # Option 2 — Bias correction for unsettled SPs (delegated to corrector).
     #   Corrector reads carry-over state, applies correction, writes new state.
     #   AlphaCorrector (default) replicates the original α=0.4 flat-bias shift.
+    #
+    # Fallback — if intraday_prices.csv is not available (e.g., daily pipeline on CI
+    # where the file is .gitignored), preserve any is_actual=True rows already in the
+    # committed forecast CSV.  Prevents the daily run from wiping out actuals that were
+    # committed by a prior intraday run for the same target_date.
+    if _id_today_all.empty and OUTPUT_FILE.exists():
+        try:
+            _prev = pd.read_csv(OUTPUT_FILE)
+            _prev_today = _prev[_prev["settlement_date"].astype(str) == str(target_date)]
+            if "is_actual" in _prev_today.columns and not _prev_today.empty:
+                _prev_act = _prev_today[_prev_today["is_actual"].astype(str).str.lower() == "true"]
+                if not _prev_act.empty:
+                    _pc_prev = "ssp_q50" if "ssp_q50" in _prev_act.columns else "ssp_predicted"
+                    for _, _row in _prev_act.iterrows():
+                        _sp = int(_row["settlement_period"])
+                        _av = float(_row[_pc_prev])
+                        _m  = result["settlement_period"] == _sp
+                        if _m.any():
+                            for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
+                                result.loc[_m, _col] = round(_av, 2)
+                            result.loc[_m, "is_actual"] = True
+                    log.info(
+                        "No intraday_prices.csv — restored %d settled SPs from existing committed CSV",
+                        len(_prev_act),
+                    )
+        except Exception as _e:
+            log.warning("Could not restore actuals from existing CSV: %s", _e)
+
     if not _id_today_all.empty:
         try:
             _pc = "ssp" if "ssp" in _id_today_all.columns else "systemSellPrice"
