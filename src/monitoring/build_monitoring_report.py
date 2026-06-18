@@ -966,17 +966,32 @@ def write_report(
     _ns  = nowcast_staleness or {}
     _nh3 = nowcast_h3 or {}
 
+    def _nc_cov_status(cov_pct: float, ci_hi: float) -> str:
+        """
+        CI-based nowcast coverage status.
+        🔴  CI upper bound is entirely below the 78% floor → genuine under-coverage
+        🟡  Point estimate below 80% target but CI upper bound ≥ 78% floor → watch
+        🟢  Point estimate ≥ 80% target → on-target
+        """
+        warn_lo_pct = NOWCAST_COV_WARN_LO * 100
+        target_pct  = NOWCAST_COV_TARGET  * 100
+        if ci_hi < warn_lo_pct:
+            return "🔴"
+        if cov_pct < target_pct:
+            return "🟡"
+        return "🟢"
+
     def _nc_status(h_key: str) -> tuple[str, str, str]:
         """Returns (cov_str, n_str, status_emoji) for h_key overall coverage."""
         if not _nc or h_key not in _nc:
             return "—", "—", "⚠️"
         d = _nc[h_key].get("overall", {})
         cov_pct = d.get("coverage", float("nan"))
+        ci_hi   = d.get("ci_hi",   float("nan"))
         n       = d.get("n", 0)
         if np.isnan(cov_pct) or n == 0:
             return "—", str(n), "⚠️"
-        st = "🟢" if cov_pct / 100 >= NOWCAST_COV_WARN_LO else "🔴"
-        return f"{cov_pct:.1f}%", str(n), st
+        return f"{cov_pct:.1f}%", str(n), _nc_cov_status(cov_pct, ci_hi)
 
     _nc_h1_cov, _nc_h1_n, _nc_h1_st = _nc_status("h1")
     _nc_h3_cov, _nc_h3_n, _nc_h3_st = _nc_status("h3")
@@ -1254,7 +1269,7 @@ def write_report(
                     nc_rows.append(f"| {h_disp} | {regime_key} | — | — | {n_val} | — | ⚠️ |")
                 else:
                     delta = cov_val - NOWCAST_COV_TARGET * 100
-                    st    = "🟢" if cov_val / 100 >= NOWCAST_COV_WARN_LO else "🔴"
+                    st    = _nc_cov_status(cov_val, ci_hi)
                     nc_rows.append(
                         f"| {h_disp} | {regime_key} | {cov_val:.1f}% | "
                         f"[{ci_lo:.1f}%, {ci_hi:.1f}%] | {n_val} | "
@@ -1265,8 +1280,10 @@ def write_report(
             f"",
             f"Coverage computed from `data/raw/system_prices.csv` (~60-day window).  ",
             f"NP regime = N-code (normal auction); EN regime = P/K-code (formula).  ",
-            f"⚠️ Coverage below {NOWCAST_COV_WARN_LO*100:.0f}% → refresh `nowcast_bands.json` "
-            f"(`python src/models/build_nowcast_bands.py`).",
+            f"Status: 🟢 ≥{NOWCAST_COV_TARGET*100:.0f}% · "
+            f"🟡 <{NOWCAST_COV_TARGET*100:.0f}% but 90% CI upper bound ≥{NOWCAST_COV_WARN_LO*100:.0f}% (watch) · "
+            f"🔴 90% CI upper bound <{NOWCAST_COV_WARN_LO*100:.0f}% (genuine under-coverage — refresh bands).  ",
+            f"To refresh: `python src/models/build_nowcast_bands.py` then commit `model_assets/nowcast_bands.json`.",
         ]
     else:
         lines += [
