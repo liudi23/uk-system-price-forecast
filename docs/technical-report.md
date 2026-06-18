@@ -8,7 +8,7 @@
 
 ## Abstract
 
-This report describes an automated system for forecasting the UK electricity System Sell Price (SSP), the mechanism-derived imbalance price paid by market participants who are short relative to their contracted position in each 30-minute settlement period. The system delivers a 48-SP day-ahead profile forecast updated daily at 12:30 UTC, a live intraday Kalman correction layer updated every 30 minutes, calibrated 80% prediction intervals (PIs), and an intraday persistence nowcast for h+1 through h+3. The primary accuracy benchmark is a walk-forward (WF) MAE of £28.96/MWh over 119 days and 4 seasonal folds. The headline achievement of Phase 4 is PI coverage: split-conformal per-SP calibration lifted the walk-forward coverage from 37.99% (uncalibrated HGBR bands) to 79.82%, representing the difference between unusable and commercially deployable uncertainty quantification. A Kalman level-correction filter replaces a hand-tuned flat-alpha heuristic with principled NIS-auditable bias correction and adds +4.5 percentage points (pp) of PI coverage over the static base. Live PI coverage is 66.0% over 30 days (spring/summer only, N=1,418 SP-rows), 13.8pp below target and under active monitoring. A rigorous persistence-vs-DA crossover analysis found that DA+Kalman adds no value for h+1 to h+4, and the HGBR nowcast prototype was 17% worse than persistence at h+1; neither was shipped. Spike-tail widening (Phase 6a) passes all gating tests but is currently config-OFF pending manual sign-off.
+This report describes an automated system for forecasting the UK electricity System Sell Price (SSP), the mechanism-derived imbalance price paid by market participants who are short relative to their contracted position in each 30-minute settlement period. The system delivers a 48-SP day-ahead profile forecast updated daily at 12:30 UTC, a live intraday Kalman correction layer updated every 30 minutes, calibrated 80% prediction intervals (PIs), and an intraday persistence nowcast for h+1 through h+3. The primary accuracy benchmark is a walk-forward (WF) MAE of £28.96/MWh (StaticBase, raw uncorrected model) over 119 days and 4 seasonal folds; the deployed Kalman corrector achieves £27.68/MWh. The headline achievement of Phase 4 is PI coverage: split-conformal per-SP calibration lifted the walk-forward coverage from 37.99% (uncalibrated HGBR bands) to 79.82%, representing the difference between unusable and commercially deployable uncertainty quantification. A Kalman level-correction filter replaces a hand-tuned flat-alpha heuristic with principled NIS-auditable bias correction and adds +4.5 percentage points (pp) of PI coverage over the static base. Live day-ahead PI coverage is 66.0% over 30 days (spring/summer only, N=1,418 SP-rows), 13.8pp below target and under active monitoring. The intraday persistence nowcast achieves a separate 79.4–79.8% live coverage via regime-asymmetric empirical bands (§8, §12.3). A rigorous persistence-vs-DA crossover analysis found that DA+Kalman adds no value for h+1 to h+4, and the HGBR nowcast prototype was 17% worse than persistence at h+1; neither was shipped. Spike-tail widening (Phase 6a) passes all gating tests but is currently config-OFF pending manual sign-off.
 
 ---
 
@@ -88,7 +88,7 @@ Annual spike rates in the dataset show a dramatic structural regime change:
 | 2024 | 7.7% |
 | 2025 | 22.5% |
 
-The 2022 energy crisis inflates spike frequencies by more than an order of magnitude compared to the 2024 post-crisis regime. Including 2021–2022 data in training would bias the model's mean level forecasts and spike-risk priors toward an aberrant historical regime. The training window is set to 3 years (`TRAIN_YEARS=3`), which currently covers a post-crisis regime from approximately mid-2022 onwards, while the WF evaluation window (2025-07-01 to 2026-04-30) is entirely post-crisis.
+The 2022 energy crisis inflates spike frequencies by more than an order of magnitude compared to the 2024 regime. Including 2021–2022 data would bias the model's mean level and spike-risk priors toward an aberrant historical regime. The training window is therefore set to 3 years (`TRAIN_YEARS=3`), which as of mid-2026 covers approximately mid-2023 onwards. This window excludes the 2021–2022 crisis years but still includes the elevated-volatility 2023 tail (annual spike rate 57.3%); those 2023 rows are present in training and influence the model's uncertainty estimates. The WF evaluation window (2025-07-01 to 2026-04-30) falls entirely within the rolling 3-year window and is used as the PI calibration reference.
 
 ### 2.4 Lag Ceiling for Intraday Nowcasting
 
@@ -248,11 +248,11 @@ Summary statistics: median δ = £22.75; P25/P75 = £19.41/£28.99; global refer
 
 The calibration bug that shipped raw 38% bands prior to 2026-06-17 was closed by adding a runtime assertion `_assert_pi_calibrated()` that checks the spread characteristics of the output forecast CSV before committing. The guard raises `RuntimeError` if the standard deviation of `q90−q10` matches the uncalibrated band pattern. A secondary sentinel in the walk-forward pipeline raises `RuntimeError` if `walk_forward_predictions.csv` is present but `pi_calibration_v1.json` is absent — the calibration step cannot be silently skipped.
 
-The test suite covers 6-scenario (A–H) matrix of PI guard conditions, including the exact failure mode that occurred in production.
+The test suite covers a 6-scenario (A–F) matrix of PI guard conditions, including the exact failure mode that occurred in production.
 
 ### 5.5 Live Coverage
 
-Over the 30 days from 2026-05-18 to 2026-06-17 (1,418 SP-rows), live PI coverage is **66.0%** (90% CI: [63.9%, 68.0%]) — 13.8pp below the WF target of 79.8%. This is a live regression and is classified as an open issue.
+Over the 30 days from 2026-05-18 to 2026-06-17 (1,418 SP-rows), live **day-ahead PI** coverage is **66.0%** (90% CI: [63.9%, 68.0%]) — 13.8pp below the WF target of 79.8%. This is a live regression and is classified as an open issue. This figure is distinct from the intraday nowcast band coverage (79.4–79.8% live across h+1–h+3, reported separately in §8.5 and §12.3); the nowcast uses independently fitted empirical bands, not the HGBR PI.
 
 Caveats: (1) the 30-day live window covers spring/summer only — a period that may have different price dynamics than the autumn/winter folds in the WF calibration; (2) the live CSV files were backfilled with PI calibration applied retroactively on 2026-06-17; files from 2026-06-17 onwards have calibration applied at generation time; (3) the small sample (N=1,418) means the 90% CI spans 4pp, so the true long-run live coverage may differ from the 30-day estimate. Investigated in the weekly monitoring loop.
 
@@ -340,9 +340,11 @@ The spring fold is much harder: the filter is over-confident (innovations are sm
 
 | Corrector | MAE | PI Coverage |
 |-----------|-----|-------------|
-| StaticBase (raw model) | £28.96 | 37.7% |
+| StaticBase (raw model) | £28.96 | 37.7%¹ |
 | AlphaCorrector (α=0.4) | £27.63 | 38.9% |
 | KalmanCorrector (deployed) | £27.68 | 42.2% |
+
+¹ The corrector backtest measures 37.7% on unsettled SPs only (the subset evaluated in the corrector harness). `model_assets/pi_calibration_v1.json` records 37.99% over all 5,709 WF rows — a 0.3pp difference from evaluation scope, not a methodological discrepancy. Both figures are pre-calibration.
 
 **Honest framing:** Kalman and Alpha are statistically tied on point-forecast MAE (£27.68 vs £27.63, a difference of £0.05 — less than 0.2%, within noise). The backtest gate at Section 1 of the corrector report is therefore labelled HOLD on point-accuracy grounds. **Do not interpret Kalman as improving point accuracy over Alpha.**
 
@@ -513,7 +515,7 @@ Bands are refreshed monthly. The current version was generated 2026-06-18 and is
 |------|-----------|----------------|
 | `tests/test_correctors.py` | 22 | AlphaCorrector byte-identical to inline block; Kalman bias tracking convergence; daily reset; PI widening monotonicity with P |
 | `tests/test_kalman_corrector.py` | 20 | Kalman state evolution, horizon decay, edge cases (cold-start, z-guardrail trigger, idempotency guard, daily reset across forecast dates) |
-| `tests/test_pi_calibration_guard.py` | 13 | 6-scenario matrix: (A) no WF sentinel → no guard; (B) WF present, no PI JSON → RuntimeError; (C) calibrated → pass; (D) uncalibrated bands → RuntimeError; and two additional edge cases |
+| `tests/test_pi_calibration_guard.py` | 13 | 6-scenario (A–F) matrix: (A) no WF sentinel → no guard; (B) WF present, no PI JSON → RuntimeError; (C) calibrated → pass; (D) uncalibrated bands → RuntimeError; and two additional edge cases (E–F) |
 | `tests/test_build_dataset.py` | 11 | Dataset cleaning, Tukey winsorisation, incremental append safety |
 | **Total** | **66** | Full coverage of the corrector interface, Kalman filter scenarios, PI guard scenarios, and dataset integrity |
 
@@ -578,7 +580,7 @@ A weekly monitoring report (`reports/monitoring/2026-W25.md`, generated by `src/
 
 | Item | Gating condition | Estimated trigger |
 |------|-----------------|-------------------|
-| Spike widening enable (`spike_widening: true`, τ=0.05) | Manual sign-off of gate table (gates already pass) | Ready now — decision pending |
+| Spike widening enable (`spike_widening: true`, τ=0.20 per `corrector_config.json`) | Manual sign-off of gate table (gates evaluated at τ=0.05; deployed threshold τ=0.20 as configured) | Ready now — decision pending |
 | H+3 nowcast with DA Q50 feature | 6-month forecast archive (partial R² ~9.9% implies near-gate) | ~Oct 2026 |
 | H+4–H+6 persistence–DA blend | Crossover reconfirmed on ≥2 seasons; α estimated on ≥6 months | ~Nov 2026 |
 | P95/P99 upper-tail quantile head (Step-3) | ≥2 usable non-crisis spike-bearing autumns in training data | ~Dec 2026 (autumn 2026 settled) |
@@ -612,7 +614,7 @@ Critically, the calibration is now fenced by a runtime guard that makes shipping
 
 The N-code (NP) and P/K-code (EN) price derivation mechanisms impose fundamentally different residual distributions. Under N-code (normal auction), prices are right-skewed — the BM stack can spike upward when reserve is exhausted, but prices are bounded below by the physical minimum of accepted bids. Under P/K-code (formula), prices are left-skewed — the formula acts as a ceiling reference and severe renewable oversupply drives prices to large negative values, while upward spikes are structurally capped.
 
-By fitting P10/P90 residual bands separately for each regime from 18 months of data (26,298 SP pairs), the nowcast achieves 79.4–79.8% live coverage across h+1–h+3 without any ML model. The bands are interpretable, fast to compute, and updated monthly. This is a deliberate choice of a simple empirical method over a complex model: the signal-to-noise ratio at these horizons (as established by the partial R² analysis) does not justify the complexity of a trained quantile model.
+By fitting P10/P90 residual bands separately for each regime from 18 months of data (26,298 SP pairs), the nowcast achieves **79.4–79.8% live coverage** across h+1–h+3 without any ML model. This is the intraday nowcast band coverage — distinct from the day-ahead PI coverage of 66.0% reported in §5.5, which applies to the HGBR-generated q10/q90 intervals for the following day's 48 SPs. The bands are interpretable, fast to compute, and updated monthly. This is a deliberate choice of a simple empirical method over a complex model: the signal-to-noise ratio at these horizons (as established by the partial R² analysis) does not justify the complexity of a trained quantile model.
 
 ### 12.4 The Discipline of Not Shipping: Evidence-Based "Don't Build" Decisions
 
