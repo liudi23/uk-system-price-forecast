@@ -49,9 +49,23 @@ def _intraday_staleness():
     status:
       'ok'           — pipeline healthy; message is the last-update line for the sidebar
       'stale'        — in active window (07:00-22:00 UTC) and last Kalman update > 90 min ago
-      'daily_missed' — forecast_date is not today and it is past 14:00 UTC
+      'daily_missed' — forecast CSV date is not today and it is past 14:00 UTC
       'unknown'      — kalman_state.json absent or unreadable
     """
+    # Use forecast CSV date for daily_missed: the base model (daily pipeline) writes this
+    # even when no intraday SPs are available on the runner, so it correctly reflects
+    # whether the daily retrain has run today — unlike kalman_state.json.forecast_date,
+    # which only advances when the Kalman processes the first settled SP of the day.
+    _fc_csv_date = None
+    if FORECAST_PATH_P3.exists():
+        try:
+            _fc_csv_date = str(
+                pd.read_csv(FORECAST_PATH_P3, usecols=["settlement_date"], nrows=1)
+                ["settlement_date"].iloc[0]
+            )
+        except Exception:
+            pass
+
     if not KALMAN_STATE_JSON.exists():
         return "unknown", None
     try:
@@ -67,17 +81,21 @@ def _intraday_staleness():
         _age_min = (_now - _last_dt).total_seconds() / 60
         _today = str(_now.date())
         _in_window = 7 <= _now.hour < 22
-        # daily_missed: daily pipeline did not advance forecast_date to today.
+        # daily_missed: today's forecast CSV hasn't been generated yet.
+        # Uses _fc_csv_date (from next_day_forecast_phase3.csv), NOT kalman_state.json.forecast_date:
+        # after the daily retrain the Kalman state still shows yesterday's date until the
+        # first intraday run of the day processes a settled SP.
         # Fires only after 14:00 UTC (well past expected 12:30 + ~1h completion).
-        if _fc_date and _fc_date < _today and _now.hour >= 14:
+        if _fc_csv_date and _fc_csv_date < _today and _now.hour >= 14:
             return "daily_missed", (
                 f"🔴 Daily pipeline has not refreshed today's forecast "
-                f"(last forecast_date: **{_fc_date}**). "
+                f"(last forecast_date: **{_fc_csv_date}**). "
                 f"Expected by ~13:30 UTC — check GitHub Actions."
             )
-        # stale: today's forecast exists but the Kalman hasn't updated in >90 min.
-        # Requires fc_date == today; if fc_date < today we are in the expected
-        # overnight/morning gap (before the 12:30 UTC daily run) — stay silent.
+        # stale: Kalman hasn't updated for today's forecast in >90 min.
+        # Requires kalman_state.json.forecast_date == today, which only becomes true after the
+        # first settled SP of the day is processed — so this stays silent during the
+        # overnight/morning gap (before first intraday run processes today's SPs).
         if _fc_date == _today and _in_window and _age_min > 90:
             return "stale", (
                 f"🔴 Intraday pipeline stale — last Kalman update "
@@ -133,9 +151,10 @@ st.sidebar.title("⚡ Filters")
 st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
 _stal_status, _stal_msg = _intraday_staleness()
-_pipeline_line = _stal_msg if _stal_msg else f"Last pipeline: **{_LAST_PIPELINE_RUN} UTC**"
+_pipeline_line = _stal_msg if _stal_msg else "Last intraday: —"
 st.sidebar.caption(
     f"📅 Latest settled data: **{_latest_date}**\n\n"
+    f"📆 Daily run: **{_LAST_PIPELINE_RUN}**\n\n"
     f"🔄 {_pipeline_line}\n\n"
     "**Daily** (~12:30 UTC): retrain · H+1 + H+2 day-ahead forecasts · PI calibration applied.\n\n"
     "**Intraday**: Kalman-corrected H+1 updates as each SP settles throughout the day."
