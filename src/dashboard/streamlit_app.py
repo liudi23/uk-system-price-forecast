@@ -136,6 +136,11 @@ st.caption(
     f"Data: Elexon BMRS · {start_date} → {end_date} · "
     f"{len(dff):,} settlement periods"
 )
+st.caption(
+    "Settlement period reference: SP *n* starts at (*n*−1)×30 min after 00:00 UK local time "
+    "(GMT in winter, BST in summer) · SP 1 = 00:00 · SP 17 = 08:00 · SP 25 = 12:00 · "
+    "SP 33 = 16:00 · SP 48 = 23:30"
+)
 
 # ── Production model banner ───────────────────────────────────────────────────
 _m = load_p3_metrics()
@@ -317,6 +322,20 @@ if _fc_path.exists():
             annotation_font=dict(size=10, color="grey"),
         )
 
+    # Shade the nowcast zone (next 3 SPs after the last settled SP)
+    if not fc_actual.empty:
+        _nc_last = int(fc_actual["settlement_period"].max())
+        _nc_zone = fc[fc["settlement_period"].between(_nc_last + 1, _nc_last + 3)]
+        if not _nc_zone.empty:
+            _nc_x0 = _nc_zone["settlement_datetime"].min()
+            _nc_x1 = _nc_zone["settlement_datetime"].max() + pd.Timedelta(minutes=30)
+            fig_fc.add_vrect(
+                x0=_nc_x0, x1=_nc_x1,
+                fillcolor="rgba(42,157,143,0.10)", layer="below", line_width=0,
+                annotation_text="nowcast zone", annotation_position="top left",
+                annotation_font=dict(size=9, color="#2a9d8f"),
+            )
+
     _orig_note = "blue dashed = original daily forecast · " if _show_orig else ""
     _legend_note = f"{_orig_note}red = actual · orange = near-term · yellow = forecast horizon"
     fig_fc.update_layout(
@@ -367,21 +386,35 @@ if _fc_path.exists():
                 f"regime: {_regime_label} · bands generated: {_gen_date}"
             )
 
+            # Build SP→local-clock lookup from the forecast CSV (handles DST correctly)
+            _sp_to_time = dict(
+                zip(fc["settlement_period"].astype(int),
+                    fc["settlement_datetime"].dt.strftime("%H:%M"))
+            )
+
             _nc_cols = st.columns(3)
             for _h_idx, _h in enumerate([1, 2, 3]):
                 _h_key     = f"h{_h}"
                 _target_sp = _last_sp + _h
                 _col       = _nc_cols[_h_idx]
+                _sp_time   = _sp_to_time.get(_target_sp, "")
+                _sp_header = f"SP+{_h} · SP {_target_sp}" + (f" · {_sp_time}" if _sp_time else "")
                 if _target_sp > 48:
-                    _col.metric(f"SP+{_h}  (SP {_target_sp})", "—",
+                    _col.metric(_sp_header, "—",
                                 help="Beyond today's 48 settlement periods")
                     continue
                 _bnd = _horizons[_h_key].get(_regime, _horizons[_h_key]["overall"])
                 _p10 = round(_y0 + _bnd["p10"])
                 _p90 = round(_y0 + _bnd["p90"])
-                _col.metric(f"SP+{_h}  (SP {_target_sp})", f"£{_y0:.1f}",
-                            help=f"Point = persistence (last settled SSP); 80% band from trailing 18-month residuals")
+                _col.metric(_sp_header, f"£{_y0:.1f}",
+                            help="Point = persistence (last settled SSP); 80% band from trailing 18-month residuals")
                 _col.caption(f"80% band: £{_p10} – £{_p90}")
+
+            st.caption(
+                "Persistence is the operative forecast for the next 1–3 SPs "
+                "(≈2× more accurate than the day-ahead model under 90 min, per the crossover analysis). "
+                "The day-ahead near-term (orange) is shown for reference and becomes more reliable from ~h+4."
+            )
 
     elif NOWCAST_BANDS_JSON.exists() and not _has_actual:
         st.info(
