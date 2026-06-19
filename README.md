@@ -6,7 +6,7 @@ Two-day-ahead forecasting of UK electricity System Sell Price (SSP) at 30-minute
 
 **[Live dashboard →](https://uk-system-price-forecast.streamlit.app/)**
 
-![UK SSP Dashboard](demo/uk-ssp-streamlit.png)
+![UK SSP Dashboard](demo/uk-ssp-streamlit.gif)
 
 ---
 
@@ -206,7 +206,7 @@ reports/
 demo/
   demo_phase3.py             Four-panel demonstration figure
   phase3_demo.png
-  uk-ssp-streamlit.png       Dashboard screenshot (page 1 — forecast view)
+  uk-ssp-streamlit.gif       Dashboard walkthrough (5-page animated GIF, 3 s/frame)
 
 Project_Brief/
   phase-3-summary.md         Architecture and seasonal analysis
