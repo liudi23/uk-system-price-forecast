@@ -6,6 +6,12 @@ on:
     - cron: '30 12 * * *'
   workflow_dispatch:  # manual trigger from GitHub Actions UI
 
+# Same group as intraday_update.yml — serialises the daily retrain push against any
+# concurrent intraday commit so both can't hit a non-fast-forward push race.
+concurrency:
+  group: streamlit-data-commit
+  cancel-in-progress: false
+
 jobs:
   forecast:
     runs-on: ubuntu-latest
@@ -120,7 +126,8 @@ jobs:
           git add src/dashboard/streamlit_app.py
           git add -f data/processed/dataset_5yr.csv \
                      data/processed/features_recent.csv
-          git add    model_assets/next_day_forecast_phase3.csv \
+          git add    model_assets/kalman_state.json \
+                     model_assets/next_day_forecast_phase3.csv \
                      model_assets/day2_forecast_phase3.csv \
                      model_assets/phase3_metrics.json \
                      model_assets/test_predictions_phase3.csv \
@@ -133,6 +140,8 @@ jobs:
                      model_assets/shape_h2_q50.pkl \
                      model_assets/neg_day_classifier.pkl \
                      "model_assets/forecasts/"
-          git diff --staged --quiet || \
-            git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" && \
+          git diff --staged --quiet || (
+            git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" &&
+            git pull --rebase origin streamlit-data &&
             git push
+          )

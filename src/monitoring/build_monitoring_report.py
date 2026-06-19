@@ -626,6 +626,78 @@ def compute_nowcast_h3_readiness() -> dict:
     }
 
 
+def compute_pipeline_health() -> dict:
+    """
+    Assess intraday pipeline health as of report-generation time.
+
+    Returns
+    -------
+    dict with keys:
+      last_update        - ISO string from kalman_state.json, or None
+      forecast_date      - ISO string, or None
+      n_settled          - int, SPs settled on the last Kalman update
+      x_hat              - float, last Kalman state estimate
+      age_hours          - float, hours since last_update (None if unknown)
+      days_with_actuals  - int, archive days that have at least one is_actual=True row
+      days_total         - int, total archive days
+      status             - 'ok' | 'stale' | 'unknown'
+      status_emoji       - '🟢' | '🔴' | '⚠️'
+    """
+    from datetime import datetime, timezone
+
+    result: dict = {
+        "last_update": None,
+        "forecast_date": None,
+        "n_settled": 0,
+        "x_hat": float("nan"),
+        "age_hours": None,
+        "days_with_actuals": 0,
+        "days_total": 0,
+        "status": "unknown",
+        "status_emoji": "⚠️",
+    }
+
+    ks_path = ASSETS_DIR / "kalman_state.json"
+    if ks_path.exists():
+        try:
+            with open(ks_path) as _f:
+                ks = json.load(_f)
+            result["last_update"]   = ks.get("last_update")
+            result["forecast_date"] = ks.get("forecast_date")
+            result["n_settled"]     = int(ks.get("last_n_settled", 0))
+            result["x_hat"]         = float(ks.get("x_hat", float("nan")))
+            if result["last_update"]:
+                last_dt = datetime.fromisoformat(result["last_update"]).replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                result["age_hours"] = (now_utc - last_dt).total_seconds() / 3600
+        except Exception:
+            pass
+
+    fc_dir = ASSETS_DIR / "forecasts"
+    if fc_dir.exists():
+        for p in fc_dir.glob("forecast_phase3_*.csv"):
+            result["days_total"] += 1
+            try:
+                df_tmp = pd.read_csv(p, usecols=lambda c: c == "is_actual")
+                if "is_actual" in df_tmp.columns and df_tmp["is_actual"].any():
+                    result["days_with_actuals"] += 1
+            except Exception:
+                pass
+
+    age_h = result["age_hours"]
+    if age_h is None:
+        result["status"] = "unknown"
+        result["status_emoji"] = "⚠️"
+    elif age_h > 4:
+        result["status"] = "stale"
+        result["status_emoji"] = "🔴"
+    else:
+        result["status"] = "ok"
+        result["status_emoji"] = "🟢"
+
+    return result
+
+
 # ── Plots ──────────────────────────────────────────────────────────────────────
 
 def plot_coverage_timeline(wf: pd.DataFrame, live: pd.DataFrame, out_path: Path) -> None:
@@ -887,6 +959,7 @@ def write_report(
     nowcast_cov: Optional[dict] = None,
     nowcast_staleness: Optional[dict] = None,
     nowcast_h3: Optional[dict] = None,
+    pipeline_health: Optional[dict] = None,
 ) -> None:
     today = date.today()
 
@@ -1053,6 +1126,13 @@ def write_report(
         f"| §8 | Nowcast h+1 cov (overall) | {_nc_h1_n} | {_nc_h1_cov} | ≥{NOWCAST_COV_WARN_LO*100:.0f}% | {_nc_h1_st} |",
         f"| §8 | Nowcast h+3 cov (overall) | {_nc_h3_n} | {_nc_h3_cov} | ≥{NOWCAST_COV_WARN_LO*100:.0f}% | {_nc_h3_st} |",
         f"| §8 | Nowcast bands age | — | {_ns.get('age_days','—')}d | <{NOWCAST_BANDS_STALE_DAYS}d | {_stale_st} |",
+    ]
+
+    _ph_exec = pipeline_health if pipeline_health is not None else {}
+    _ph_age_exec = _ph_exec.get("age_hours")
+    _ph_age_exec_str = f"{_ph_age_exec:.1f} h" if _ph_age_exec is not None else "—"
+    lines += [
+        f"| §9 | Pipeline health | — | {_ph_age_exec_str} old | <4 h | {_ph_exec.get('status_emoji', '⚠️')} |",
         f"",
         f"**Status key:** 🟢 OK · 🟡 WARN · 🔴 ALERT · ⬛ INACTIVE · ⚠️ low-confidence (N < minimum)",
         f"",
@@ -1306,6 +1386,42 @@ def write_report(
         f"",
         f"---",
         f"",
+        f"## §9. Pipeline Health",
+        f"",
+        f"Intraday and daily pipeline health as of report generation time.  ",
+        f"Stale = last Kalman update > 4 h ago (indicates missed scheduled runs).  ",
+        f"Archive coverage = fraction of daily forecast files with at least one `is_actual=True` row "
+        f"(proxy for days that received a successful intraday commit).",
+        f"",
+    ]
+
+    _ph = pipeline_health if pipeline_health is not None else {}
+    _ph_last   = _ph.get("last_update", "—")
+    _ph_fdate  = _ph.get("forecast_date", "—")
+    _ph_ns     = _ph.get("n_settled", "—")
+    _ph_xhat   = _ph.get("x_hat", float("nan"))
+    _ph_age    = _ph.get("age_hours")
+    _ph_da     = _ph.get("days_with_actuals", 0)
+    _ph_dt     = _ph.get("days_total", 0)
+    _ph_st     = _ph.get("status_emoji", "⚠️")
+    _ph_age_str = f"{_ph_age:.1f} h" if _ph_age is not None else "—"
+    _ph_xhat_str = f"£{_ph_xhat:+.2f}" if not (isinstance(_ph_xhat, float) and math.isnan(_ph_xhat)) else "—"
+
+    lines += [
+        f"| | Value |",
+        f"|---|---|",
+        f"| Status | {_ph_st} {_ph.get('status', 'unknown')} |",
+        f"| Last Kalman update | {_ph_last} UTC |",
+        f"| Age at report time | {_ph_age_str} |",
+        f"| Active forecast_date | {_ph_fdate} |",
+        f"| SPs settled (last update) | {_ph_ns} |",
+        f"| Kalman x̂ | {_ph_xhat_str}/MWh |",
+        f"| Archive days with intraday actuals | {_ph_da} / {_ph_dt} |",
+        f"",
+        f"*If status is 🔴 stale, check GitHub Actions → Intraday Forecast Update for recent run logs.*",
+        f"",
+        f"---",
+        f"",
         f"*Report generated by `src/monitoring/build_monitoring_report.py`.*",
     ]
 
@@ -1385,6 +1501,15 @@ def main() -> None:
     print(f"  Archive months: {nowcast_h3['n_months']}/{nowcast_h3['min_months']}  "
           f"gate={'GREEN' if nowcast_h3['green'] else 'RED'}")
 
+    print("Checking pipeline health …")
+    pipeline_health = compute_pipeline_health()
+    _age_h = pipeline_health.get("age_hours")
+    print(f"  Status: {pipeline_health['status_emoji']} {pipeline_health['status']}  "
+          f"last_update={pipeline_health.get('last_update', '—')}  "
+          f"age={f'{_age_h:.1f}h' if _age_h is not None else '—'}  "
+          f"n_settled={pipeline_health.get('n_settled', 0)}  "
+          f"archive={pipeline_health.get('days_with_actuals', 0)}/{pipeline_health.get('days_total', 0)} days")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     cov_plot   = plot_dir / f"{week_str}_coverage.png"
     kalman_plot = plot_dir / f"{week_str}_kalman.png"
@@ -1405,7 +1530,8 @@ def main() -> None:
                  nowcast_bands=nowcast_bands,
                  nowcast_cov=nowcast_cov,
                  nowcast_staleness=nowcast_staleness,
-                 nowcast_h3=nowcast_h3)
+                 nowcast_h3=nowcast_h3,
+                 pipeline_health=pipeline_health)
 
     print(f"\nDone. Report: {report_path}")
 

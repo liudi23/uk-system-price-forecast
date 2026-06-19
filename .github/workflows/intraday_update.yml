@@ -19,6 +19,14 @@ on:
     - cron: '*/30 * * * *'    # every 30 minutes, 24 h/day — 48 runs per day
   workflow_dispatch:            # manual re-run / backfill from Actions UI
 
+# Prevent two intraday runs (or an intraday + daily) from pushing simultaneously.
+# cancel-in-progress: false queues the next run rather than cancelling it, so no
+# settled SP data is silently dropped.  The same group name is used in daily_pipeline.yml
+# so daily retrains also serialise against intraday pushes.
+concurrency:
+  group: streamlit-data-commit
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -78,5 +86,6 @@ jobs:
                   "model_assets/forecasts/"
           git diff --staged --quiet || (
             git commit -m "Intraday forecast update $(date -u +%Y-%m-%dT%H:%M)" &&
+            git pull --rebase origin streamlit-data &&
             git push
           )

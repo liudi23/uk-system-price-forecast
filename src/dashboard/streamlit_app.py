@@ -4,6 +4,8 @@ Data source: Elexon BMRS — data/raw/system_prices.csv
 Run: streamlit run src/dashboard/streamlit_app.py
 """
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -24,8 +26,9 @@ SHAPE_FEAT_JSON  = ROOT / "model_assets" / "shape_feature_cols.json"
 LEVEL_IMP_CSV    = ROOT / "model_assets" / "phase3_level_importance.csv"
 SHAPE_IMP_CSV    = ROOT / "model_assets" / "phase3_shape_importance.csv"
 
-NOWCAST_BANDS_JSON = ROOT / "model_assets" / "nowcast_bands.json"
-INTRADAY_PRICES    = ROOT / "data" / "raw"   / "intraday_prices.csv"
+NOWCAST_BANDS_JSON  = ROOT / "model_assets" / "nowcast_bands.json"
+INTRADAY_PRICES     = ROOT / "data" / "raw"   / "intraday_prices.csv"
+KALMAN_STATE_JSON   = ROOT / "model_assets"   / "kalman_state.json"
 
 FETCH_WEATHER     = ROOT / "src" / "data"    / "fetch_weather.py"
 FETCH_GENERATION  = ROOT / "src" / "data"    / "fetch_generation.py"
@@ -38,6 +41,50 @@ FORECASTS_DIR     = ROOT / "model_assets"    / "forecasts"
 DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
 FEATURES_5YR      = ROOT / "data" / "processed" / "features_5yr.csv"
 SYSTEM_PRICES_RAW = ROOT / "data" / "raw"       / "system_prices.csv"
+
+def _intraday_staleness():
+    """
+    Returns (status, message) — never cached so every page render is fresh.
+
+    status:
+      'ok'           — pipeline healthy; message is the last-update line for the sidebar
+      'stale'        — in active window (07:00-22:00 UTC) and last Kalman update > 90 min ago
+      'daily_missed' — forecast_date is not today and it is past 14:00 UTC
+      'unknown'      — kalman_state.json absent or unreadable
+    """
+    if not KALMAN_STATE_JSON.exists():
+        return "unknown", None
+    try:
+        with open(KALMAN_STATE_JSON) as _f:
+            _s = json.load(_f)
+        _lu_str = _s.get("last_update", "")
+        _fc_date = _s.get("forecast_date", "")
+        _n_settled = _s.get("last_n_settled", 0)
+        if not _lu_str:
+            return "unknown", None
+        _last_dt = datetime.fromisoformat(_lu_str).replace(tzinfo=timezone.utc)
+        _now = datetime.now(timezone.utc)
+        _age_min = (_now - _last_dt).total_seconds() / 60
+        _today = str(_now.date())
+        _in_window = 7 <= _now.hour < 22
+        if _fc_date and _fc_date < _today and _now.hour >= 14:
+            return "daily_missed", (
+                f"🔴 Daily pipeline has not refreshed today's forecast "
+                f"(last forecast_date: **{_fc_date}**). "
+                f"Expected by ~13:30 UTC — check GitHub Actions."
+            )
+        if _in_window and _age_min > 90:
+            return "stale", (
+                f"🔴 Intraday pipeline stale — last Kalman update "
+                f"**{_last_dt.strftime('%H:%M UTC')}** ({_age_min:.0f} min ago). "
+                f"Check GitHub Actions → Intraday Forecast Update."
+            )
+        return "ok", (
+            f"Last intraday: **{_lu_str} UTC** · {_n_settled} SPs settled"
+        )
+    except Exception:
+        return "unknown", None
+
 
 st.set_page_config(
     page_title="UK System Price Dashboard",
@@ -80,9 +127,11 @@ st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
+_stal_status, _stal_msg = _intraday_staleness()
+_pipeline_line = _stal_msg if _stal_msg else f"Last pipeline: **{_LAST_PIPELINE_RUN} UTC**"
 st.sidebar.caption(
     f"📅 Latest settled data: **{_latest_date}**\n\n"
-    f"🔄 Last pipeline run: **{_LAST_PIPELINE_RUN} UTC**\n\n"
+    f"🔄 {_pipeline_line}\n\n"
     "**Daily** (~12:30 UTC): retrain · H+1 + H+2 day-ahead forecasts · PI calibration applied.\n\n"
     "**Intraday**: Kalman-corrected H+1 updates as each SP settles throughout the day."
 )
@@ -124,7 +173,6 @@ st.caption(
 )
 
 # ── Production model banner ───────────────────────────────────────────────────
-import json as _json
 _m = load_p3_metrics()
 _p3 = _m.get("Phase3_P50_two_stage", {})
 _dc = _m.get("decomposition", {})
@@ -133,7 +181,7 @@ _lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"       in _dc els
 _corr_str  = f"{_dc['shape_corr_mean']:.3f}"     if "shape_corr_mean" in _dc else "—"
 _pi_cov_str = "—"
 if PI_CAL_JSON.exists():
-    _pi = _json.load(open(PI_CAL_JSON))
+    _pi = json.load(open(PI_CAL_JSON))
     _cov_before = _pi.get("coverage_before", 0)
     _cov_after  = _pi.get("coverage_after_insample_per_sp", 0)
     _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
@@ -149,6 +197,9 @@ st.info(
     "**Intraday Nowcast (h+1/h+2/h+3):** persistence point forecast + 80% empirical P10/P90 bands "
     "(18-month trailing window · NP/EN regime-aware · updated every 30 min as SPs settle)"
 )
+
+if _stal_status in ("stale", "daily_missed"):
+    st.error(_stal_msg)
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
 st.subheader("Day-Ahead Forecast (Phase 3 Level-Shape · P10 / P50 / P90 · 48 Settlement Periods)")
@@ -315,9 +366,8 @@ if _fc_path.exists():
 
     # ── Intraday Nowcast Panel ────────────────────────────────────────────────
     if NOWCAST_BANDS_JSON.exists() and _has_actual and not fc_actual.empty:
-        import json as _json_nc
         with open(NOWCAST_BANDS_JSON) as _f:
-            _nb = _json_nc.load(_f)
+            _nb = json.load(_f)
 
         _settled_sorted  = fc_actual.sort_values("settlement_period")
         _last_sp_row     = _settled_sorted.iloc[-1]
