@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.dashboard._pipeline_health import _compute_pipeline_status
+from _pipeline_health import _compute_pipeline_status
 
 ROOT = Path(__file__).resolve().parents[2]
 # Use full processed history for analytics; system_prices.csv is only a ~50-day rolling window
