@@ -11,8 +11,9 @@ from typing import Optional
 
 import pandas as pd
 
-_STALE_THRESHOLD_MIN = 180   # 3h — calibrated from actual intraday run-gap statistics
-                              # (median gap 176 min, within-day max 304 min, n=23 runs)
+_STALE_THRESHOLD_MIN = 360   # 6h — above P95 of same-day inter-run gaps (304 min, n=17)
+                              # and above the observed same-day max (350 min, n=25 commits).
+                              # 180 min (median) would false-alarm on every second missed slot.
 _ACTIVE_WINDOW_START = 7     # UTC: Kalman updates expected from 07:00
 _ACTIVE_WINDOW_END   = 22    # UTC: Kalman updates expected until 22:00
 _RULE_B_TOL          = 3     # SP tolerance for Rule B: last_actual_sp vs kalman_n_settled

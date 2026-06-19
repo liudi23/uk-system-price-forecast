@@ -95,7 +95,7 @@ def test_health_daily_missed_suppressed_before_14h():
 # ── Health: stale ─────────────────────────────────────────────────────────────
 
 def test_health_stale():
-    """Kalman fc_date == today, in active window, age > 180 min → stale."""
+    """Kalman fc_date == today, in active window, age > 360 min → stale."""
     stale_kalman = {
         **KALMAN_TODAY,
         "last_update": f"{TODAY}T07:00",   # 7h ago at hour=14
@@ -132,8 +132,8 @@ def test_health_stale_outside_window_is_ok():
 
 
 def test_health_not_stale_within_threshold():
-    """Age ≤ 180 min should not trigger stale."""
-    fresh_kalman = {**KALMAN_TODAY, "last_update": f"{TODAY}T11:30"}
+    """Age ≤ 360 min should not trigger stale."""
+    fresh_kalman = {**KALMAN_TODAY, "last_update": f"{TODAY}T08:30"}
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         fc_path = d / "fc.csv"
@@ -143,7 +143,7 @@ def test_health_not_stale_within_threshold():
             for i in range(1, 49)
         ])
         _write_kalman(k_path, fresh_kalman)
-        # 14:00 - 11:30 = 150 min < 180 min threshold
+        # 14:00 - 08:30 = 330 min < 360 min threshold
         ps = _compute_pipeline_status(fc_path, k_path, now_utc=_now(hour=14))
     assert ps["health"] == "ok"
 
