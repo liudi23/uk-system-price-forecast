@@ -13,6 +13,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.dashboard._pipeline_health import _compute_pipeline_status
+
 ROOT = Path(__file__).resolve().parents[2]
 # Use full processed history for analytics; system_prices.csv is only a ~50-day rolling window
 DATA_PATH     = ROOT / "data" / "processed" / "dataset_5yr.csv"
@@ -42,71 +44,10 @@ DATASET_5YR       = ROOT / "data" / "processed" / "dataset_5yr.csv"
 FEATURES_5YR      = ROOT / "data" / "processed" / "features_5yr.csv"
 SYSTEM_PRICES_RAW = ROOT / "data" / "raw"       / "system_prices.csv"
 
-def _intraday_staleness():
-    """
-    Returns (status, message) — never cached so every page render is fresh.
-
-    status:
-      'ok'           — pipeline healthy; message is the last-update line for the sidebar
-      'stale'        — in active window (07:00-22:00 UTC) and last Kalman update > 90 min ago
-      'daily_missed' — forecast CSV date is not today and it is past 14:00 UTC
-      'unknown'      — kalman_state.json absent or unreadable
-    """
-    # Use forecast CSV date for daily_missed: the base model (daily pipeline) writes this
-    # even when no intraday SPs are available on the runner, so it correctly reflects
-    # whether the daily retrain has run today — unlike kalman_state.json.forecast_date,
-    # which only advances when the Kalman processes the first settled SP of the day.
-    _fc_csv_date = None
-    if FORECAST_PATH_P3.exists():
-        try:
-            _fc_csv_date = str(
-                pd.read_csv(FORECAST_PATH_P3, usecols=["settlement_date"], nrows=1)
-                ["settlement_date"].iloc[0]
-            )
-        except Exception:
-            pass
-
-    if not KALMAN_STATE_JSON.exists():
-        return "unknown", None
-    try:
-        with open(KALMAN_STATE_JSON) as _f:
-            _s = json.load(_f)
-        _lu_str = _s.get("last_update", "")
-        _fc_date = _s.get("forecast_date", "")
-        _n_settled = _s.get("last_n_settled", 0)
-        if not _lu_str:
-            return "unknown", None
-        _last_dt = datetime.fromisoformat(_lu_str).replace(tzinfo=timezone.utc)
-        _now = datetime.now(timezone.utc)
-        _age_min = (_now - _last_dt).total_seconds() / 60
-        _today = str(_now.date())
-        _in_window = 7 <= _now.hour < 22
-        # daily_missed: today's forecast CSV hasn't been generated yet.
-        # Uses _fc_csv_date (from next_day_forecast_phase3.csv), NOT kalman_state.json.forecast_date:
-        # after the daily retrain the Kalman state still shows yesterday's date until the
-        # first intraday run of the day processes a settled SP.
-        # Fires only after 14:00 UTC (well past expected 12:30 + ~1h completion).
-        if _fc_csv_date and _fc_csv_date < _today and _now.hour >= 14:
-            return "daily_missed", (
-                f"🔴 Daily pipeline has not refreshed today's forecast "
-                f"(last forecast_date: **{_fc_csv_date}**). "
-                f"Expected by ~13:30 UTC — check GitHub Actions."
-            )
-        # stale: Kalman hasn't updated for today's forecast in >90 min.
-        # Requires kalman_state.json.forecast_date == today, which only becomes true after the
-        # first settled SP of the day is processed — so this stays silent during the
-        # overnight/morning gap (before first intraday run processes today's SPs).
-        if _fc_date == _today and _in_window and _age_min > 90:
-            return "stale", (
-                f"🔴 Intraday pipeline stale — last Kalman update "
-                f"**{_last_dt.strftime('%H:%M UTC')}** ({_age_min:.0f} min ago). "
-                f"Check GitHub Actions → Intraday Forecast Update."
-            )
-        return "ok", (
-            f"Last intraday: **{_lu_str} UTC** · {_n_settled} SPs settled"
-        )
-    except Exception:
-        return "unknown", None
+@st.cache_data(ttl=300)
+def pipeline_status() -> dict:
+    """Cached wrapper around _compute_pipeline_status; refreshes every 5 min."""
+    return _compute_pipeline_status(FORECAST_PATH_P3, KALMAN_STATE_JSON)
 
 
 st.set_page_config(
@@ -150,8 +91,8 @@ st.sidebar.title("⚡ Filters")
 
 st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
-_stal_status, _stal_msg = _intraday_staleness()
-_pipeline_line = _stal_msg if _stal_msg else "Last intraday: —"
+_ps = pipeline_status()
+_pipeline_line = _ps["health_msg"] or "Last intraday: —"
 st.sidebar.caption(
     f"📅 Latest settled data: **{_latest_date}**\n\n"
     f"📆 Daily run: **{_LAST_PIPELINE_RUN}**\n\n"
@@ -222,8 +163,10 @@ st.info(
     "(18-month trailing window · NP/EN regime-aware · updated every 30 min as SPs settle)"
 )
 
-if _stal_status in ("stale", "daily_missed"):
-    st.error(_stal_msg)
+if _ps["health"] in ("stale", "daily_missed"):
+    st.error(_ps["health_msg"])
+if not _ps["consistent"]:
+    st.warning(_ps["inconsistency_msg"])
 
 # ── Next-day forecast panel ───────────────────────────────────────────────────
 st.subheader("Day-Ahead Forecast (Phase 3 Level-Shape · P10 / P50 / P90 · 48 Settlement Periods)")
