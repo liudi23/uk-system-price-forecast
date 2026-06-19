@@ -77,15 +77,30 @@ jobs:
       # Commit the Kalman filter state and corrected forecast back to the repo.
       # The no-diff guard prevents empty commits on idempotent reruns
       # (same actuals → state unchanged → CSV unchanged → nothing to stage).
+      #
+      # day2_forecast_phase3.csv: forecast_phase3.py writes this on every run
+      # (intraday and daily); it is tracked in git, so it must be staged here
+      # to avoid aborting the rebase with "unstaged changes" later.
+      #
+      # --autostash: stashes any residual working-tree changes before rebase
+      # and restores them after — safety net for any untracked-but-tracked file.
+      #
+      # retry loop: handles transient concurrent-push races (exit 1 from push).
       - name: Commit state and forecast
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "=== pre-commit git status ==="
+          git status --porcelain
           git add model_assets/kalman_state.json \
                   model_assets/next_day_forecast_phase3.csv \
+                  model_assets/day2_forecast_phase3.csv \
                   "model_assets/forecasts/"
-          git diff --staged --quiet || (
+          git diff --staged --quiet || {
             git commit -m "Intraday forecast update $(date -u +%Y-%m-%dT%H:%M)" &&
-            git pull --rebase origin streamlit-data &&
-            git push
-          )
+            for _i in 1 2 3; do
+              git pull --rebase --autostash origin streamlit-data && git push && break
+              echo "Push attempt $_i failed — retrying in ${_i}s"
+              [ "$_i" -lt 3 ] && sleep "$_i"
+            done
+          }

@@ -140,8 +140,11 @@ jobs:
                      model_assets/shape_h2_q50.pkl \
                      model_assets/neg_day_classifier.pkl \
                      "model_assets/forecasts/"
-          git diff --staged --quiet || (
+          git diff --staged --quiet || {
             git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" &&
-            git pull --rebase origin streamlit-data &&
-            git push
-          )
+            for _i in 1 2 3; do
+              git pull --rebase --autostash origin streamlit-data && git push && break
+              echo "Push attempt $_i failed — retrying in ${_i}s"
+              [ "$_i" -lt 3 ] && sleep "$_i"
+            done
+          }
