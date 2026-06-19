@@ -28,7 +28,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import joblib
@@ -477,6 +477,7 @@ def run_forecast(
     features_file: str = None,
     corrector: "Corrector" = None,
 ) -> pd.DataFrame:
+    _explicit_date = target_date is not None  # False → will be derived from features history
     if corrector is None:
         corrector = get_corrector()
 
@@ -564,6 +565,25 @@ def run_forecast(
     if target_date is None:
         target_date = (combined_last_dt + pd.Timedelta(minutes=30)).date()
     log.info("Forecasting %s (history ends %s)", target_date, combined_last_dt.date())
+
+    # ── Morning-gap guard ─────────────────────────────────────────────────
+    # features_recent.csv lags by D+1 Initial Settlement publication delay, so
+    # the derived target_date is yesterday until the 12:30 UTC daily pipeline
+    # updates the feature file.  Re-running the base model during this window
+    # produces a "ghost" commit: pred_daily_level drifts from a fresh weather
+    # fetch but no new settled SPs are incorporated, so the commit carries zero
+    # information.  Skip the expensive base-model re-run entirely.
+    # intraday_prices.csv is already updated by fetch_intraday.py (upstream
+    # workflow step) and the nowcast panel reads it directly — no data loss.
+    _today_utc = datetime.now(timezone.utc).date()
+    if not _explicit_date and target_date < _today_utc:
+        log.info(
+            "Morning gap: target_date %s < today %s (UTC) — "
+            "features_recent.csv has not advanced past the D+1 publication lag. "
+            "Skipping base-model re-run and Kalman correction.",
+            target_date, _today_utc,
+        )
+        return None
 
     # ── Fetch BMRS WINDFOR day-ahead wind % forecast ─────────────────────
     wind_pct_forecast = None
@@ -1033,6 +1053,8 @@ def main():
     args = parser.parse_args()
     target = date.fromisoformat(args.date) if args.date else None
     result = run_forecast(target, features_file=args.features if args.features != str(FEATURES_FILE) else None)
+    if result is None:
+        return  # morning-gap skip — nothing to print or commit
     print(f"\nPhase 3 forecast for {result['settlement_date'].iloc[0]} "
           f"(daily level P50 = £{result['pred_daily_level'].iloc[0]:.1f}/MWh):")
     print(result[["settlement_datetime", "settlement_period",

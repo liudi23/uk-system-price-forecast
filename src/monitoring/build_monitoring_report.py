@@ -684,16 +684,30 @@ def compute_pipeline_health() -> dict:
             except Exception:
                 pass
 
-    age_h = result["age_hours"]
+    age_h    = result["age_hours"]
+    fc_date  = result.get("forecast_date") or ""
+    now_utc  = datetime.now(timezone.utc)
+    today    = str(now_utc.date())
+
     if age_h is None:
         result["status"] = "unknown"
         result["status_emoji"] = "⚠️"
-    elif age_h > 4:
-        result["status"] = "stale"
-        result["status_emoji"] = "🔴"
-    else:
+    elif age_h <= 4:
         result["status"] = "ok"
         result["status_emoji"] = "🟢"
+    elif fc_date == today:
+        # Today's forecast exists but Kalman hasn't updated in >4h → true staleness
+        result["status"] = "stale"
+        result["status_emoji"] = "🔴"
+    elif fc_date < today and now_utc.hour >= 14:
+        # Daily pipeline did not advance forecast_date to today despite being
+        # well past its expected 12:30 UTC + ~1h completion time
+        result["status"] = "daily_missed"
+        result["status_emoji"] = "🔴"
+    else:
+        # fc_date < today and hour < 14 → expected overnight/morning gap
+        result["status"] = "morning_gap"
+        result["status_emoji"] = "🟡"
 
     return result
 
@@ -1389,7 +1403,10 @@ def write_report(
         f"## §9. Pipeline Health",
         f"",
         f"Intraday and daily pipeline health as of report generation time.  ",
-        f"Stale = last Kalman update > 4 h ago (indicates missed scheduled runs).  ",
+        f"Status legend: 🟢 ok (updated within 4 h) · "
+        f"🟡 morning_gap (forecast_date < today, before 14:00 UTC — expected daily quiet period) · "
+        f"🔴 stale (forecast_date == today, >4 h without Kalman update) · "
+        f"🔴 daily_missed (forecast_date < today, past 14:00 UTC — daily pipeline may have failed).  ",
         f"Archive coverage = fraction of daily forecast files with at least one `is_actual=True` row "
         f"(proxy for days that received a successful intraday commit).",
         f"",

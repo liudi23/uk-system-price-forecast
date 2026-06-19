@@ -67,13 +67,18 @@ def _intraday_staleness():
         _age_min = (_now - _last_dt).total_seconds() / 60
         _today = str(_now.date())
         _in_window = 7 <= _now.hour < 22
+        # daily_missed: daily pipeline did not advance forecast_date to today.
+        # Fires only after 14:00 UTC (well past expected 12:30 + ~1h completion).
         if _fc_date and _fc_date < _today and _now.hour >= 14:
             return "daily_missed", (
                 f"🔴 Daily pipeline has not refreshed today's forecast "
                 f"(last forecast_date: **{_fc_date}**). "
                 f"Expected by ~13:30 UTC — check GitHub Actions."
             )
-        if _in_window and _age_min > 90:
+        # stale: today's forecast exists but the Kalman hasn't updated in >90 min.
+        # Requires fc_date == today; if fc_date < today we are in the expected
+        # overnight/morning gap (before the 12:30 UTC daily run) — stay silent.
+        if _fc_date == _today and _in_window and _age_min > 90:
             return "stale", (
                 f"🔴 Intraday pipeline stale — last Kalman update "
                 f"**{_last_dt.strftime('%H:%M UTC')}** ({_age_min:.0f} min ago). "
