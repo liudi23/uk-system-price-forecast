@@ -266,6 +266,42 @@ Caveats: (1) the 30-day live window covers spring/summer only — a period that 
 
 ![Coverage by Price Bucket](../reports/figures/coverage_by_bucket.png)
 
+### 5.6 Coverage Is Not Enough — Sharpness and the Interval Score
+
+A band that covers 80% of outcomes but is £1,000 wide in every period is useless. Coverage alone is trivially gameable: an infinitely wide band achieves 100% coverage at the cost of zero information. Forecast intervals are therefore evaluated jointly on **coverage and sharpness** (average band width) via a proper scoring rule that penalises width.
+
+**The interval (Winkler) score** for an 80% PI (α = 0.2) is:
+
+```
+IS = (q90_cal − q10_cal)  +  (2/α) × [max(q10_cal − y, 0) + max(y − q90_cal, 0)]
+   = width  +  10 × violation_penalty
+```
+
+A violation below the lower bound or above the upper bound is penalised at 10× the width cost per unit. This means the score strictly rewards narrower bands that still cover, and punishes bands that are wide but still miss. It is equivalent to twice the sum of the q10 and q90 pinball losses.
+
+**δ(sp) is minimal by construction.** The split-conformal recipe sets δ(sp) to the 80th percentile of the per-SP conformity score distribution. Any smaller δ fails to reach 80% marginal coverage; any larger δ increases width without improving coverage. The 80th percentile is the tightest choice consistent with the coverage target under exchangeability.
+
+**Computed comparison on the walk-forward calibration set** (n = 5,709 SP-rows, 119 days, four seasonal folds):
+
+| Band | Empirical coverage | Mean interval width | Interval score (α=0.2) | Mean pinball (q10+q90) |
+|---|---|---|---|---|
+| **(a) Per-SP δ(sp)** — deployed | **79.8%** | £83.56 | **£125.39** | £12.54 |
+| (b) Single global δ = £24.35 | 80.0% | £83.58 | £127.41 | £12.74 |
+| (c) Fixed-width q50 ± £41.75 | 80.0% | £83.49 | £128.56 | £12.86 |
+| (0) Raw HGBR (no calibration) | 38.0% | £34.89 | £172.85 | — |
+
+Bands (b) and (c) achieve 80.0% coverage — fractionally above the per-SP target. The mean widths of all three calibrated bands are nearly identical (within £0.10), because the global δ (£24.35) is the unweighted mean of the per-SP δ values. The aggregate amount of width added is the same across methods; the difference is how it is allocated.
+
+The per-SP band has the lowest interval score (£125.39 vs £127.41 for global, £128.56 for fixed-width) despite matching mean width. The reason is allocation: δ(sp) concentrates width where violations are likely and removes it where they are not. The global δ of £24.35 **over-widens overnight SPs by £10–21** (wasted width that earns no coverage credit) and **under-widens afternoon peak SPs by £5–31** (insufficient to avoid violations that are penalised at 10×). The fixed-width band commits the same mismatch even more severely by ignoring the HGBR spread variation entirely.
+
+![PI Sharpness by Settlement Period](../reports/figures/pi_sharpness_by_sp.png)
+
+*Figure: top panel — mean interval width by SP for the deployed per-SP band (blue) vs the global δ flat baseline (orange dashed); green shading = global over-widens, red shading = global under-widens. Bottom panel — the δ(sp) profile (£13.95 SP 1 to £39.74 SP 33) vs the global reference line.*
+
+**Kalman widening note.** The Kalman intraday corrector applies an additional uncertainty widening of ±1.28·√P·γ^h where P is the posterior variance and γ^h is the horizon decay factor. Unlike the fixed conformal offset, this widens dynamically as the filter's state uncertainty grows (P increases between settled SPs) and shrinks as each new SP settles and reduces P. It is not a fixed pad — it is proportional to the filter's current epistemic uncertainty and decreases monotonically with the number of settled SPs.
+
+**Honest caveat.** The per-SP conformal band achieves **marginal** 80% coverage under the exchangeability assumption — meaning coverage is ~80% averaged across all SP positions over the calibration distribution. It does not achieve 80% conditional on every subset: the live analysis (§5.5) shows 66% coverage on the 30-day live window, and §7 documents systematic under-coverage in the elevated-price tail (>£120). These are known regime mismatches — the calibration set's seasonal mix may differ from the live window, and the symmetric conformal offset cannot adapt to the right-skew of high-price SPs. The interval score comparison here is on the calibration folds themselves; live IS will differ.
+
 ---
 
 ## 6. Intraday Kalman Level Correction (Phase 4)
@@ -512,6 +548,33 @@ Bands are refreshed monthly. The current version was generated 2026-06-18 and is
 ![Persistence vs DA Crossover](../reports/figures/persistence_vs_da_crossover.png)
 
 ![Nowcast Bands](../reports/figures/nowcast_bands.png)
+
+### 8.6 Reconciling the Nowcast and the Day-Ahead Near-Term
+
+At any point during the trading day, the dashboard simultaneously shows two forecasts for the next few settlement periods: the **persistence nowcast** (point = last settled SP; §8.5) and the **day-ahead near-term** (the Kalman-corrected HGBR q50 for those same SPs; §4–§6). These can differ materially — a settled SP of £120 with a DA q50 of £80 for the next period is not unusual. This is not a system inconsistency; it is a deliberate architectural decision with a quantified basis.
+
+**The disagreement at h+1–h+3 is expected and correctly resolved by the crossover analysis (§8.3; `docs/persistence-ml-crossover.md`).** The key numbers:
+
+| Horizon | Persistence MAE | DA+Kalman MAE | DA/Pers ratio | Operative forecast |
+|---|---|---|---|---|
+| h+1 | £16.38 | £31.00 | 1.76× **worse** | **Persistence** |
+| h+2 | £22.14 | £31.08 | 1.37× worse | Persistence |
+| h+3 | £26.29 | £31.11 | 1.15× worse | Persistence |
+| h+4 | £29.21 | £31.13 | 1.02× worse (tie) | Persistence or blend |
+| h+5 | £31.28 | £31.14 | 0.94× **DA wins** | DA+Kalman |
+
+*(Persistence MAE from 2024+ large-sample data, n ≈ 43,000 pairs; DA+Kalman MAE from 30-day archive, provisional — see §8.3 for caveats.)*
+
+**Why persistence dominates at short horizons.** SSP in the post-crisis regime follows a near-AR(1) process (ACF lag-1 ≈ 0.83, PACF ≈ 0 at all higher lags; §8.1). Persistence — predict SP[t] = SP[t−1] — is the Bayes-optimal linear predictor at h+1 under this structure. The DA+Kalman model produces a structural, diurnal forecast that expects mean reversion toward the day's average level: if the current SP is an outlier (spike or dip), the DA model predicts a return toward the daily profile while persistence predicts the outlier persists. Empirically, **the outlier does persist** long enough that persistence wins for 1–4 SPs (15–120 minutes). The DA model's structural prior only becomes more accurate once the autocorrelation has decayed sufficiently — around h+4.5 on average, and as early as h+3 in the evening when the ACF collapses faster.
+
+**The nowcast and the DA model are not in competition.** They answer different questions:
+
+- **Nowcast (h+1–h+3):** What price is likely *right now*, given the last settled observation? Operative forecast for real-time situational awareness and short-horizon exposure management.
+- **DA near-term (h+4+):** What does the day's structural profile imply for prices over the next few hours, given the daily level and shape forecast? Operative forecast for actionable trading and dispatch decisions with ≥ 2-hour lead time (§1.6).
+
+The two diverge most visibly when a regime transition is occurring — for example, when SPs are settling at spike prices but the DA model expects prices to normalise. Empirically the correct response is to trust persistence until the settled SPs confirm the normalisation; at that point the autocorrelation decays and the DA structural forecast becomes more reliable. The crossover analysis provides the quantitative rule for when to switch.
+
+**Dashboard implementation.** The production dashboard now makes this segmentation explicit: the day-ahead chart shades the h+1–h+3 SPs after the last settled price as a "nowcast zone" with a teal overlay, and a caption below the Intraday Nowcast panel states that persistence is the operative h+1–h+3 forecast and the DA near-term is a structural reference that becomes more reliable from approximately h+4 onwards. This avoids the appearance of a contradiction when the two numbers differ.
 
 ---
 
