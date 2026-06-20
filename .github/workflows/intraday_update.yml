@@ -15,8 +15,10 @@ name: Intraday Forecast Update
 # Commit-back is always authoritative, matches the daily_pipeline.yml pattern.
 
 on:
+  repository_dispatch:
+    types: [intraday-update]    # primary: external cron-job.org at */30 UTC
   schedule:
-    - cron: '*/30 * * * *'    # every 30 minutes, 24 h/day — 48 runs per day
+    - cron: '*/30 * * * *'    # fallback: GitHub native (may fire late on free tier)
   workflow_dispatch:            # manual re-run / backfill from Actions UI
 
 # Prevent two intraday runs (or an intraday + daily) from pushing simultaneously.
