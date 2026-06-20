@@ -1,0 +1,270 @@
+name: Forecast Pipeline — SHADOW (01:00 UTC)
+
+# SHADOW MODE: writes *_shadow.csv outputs only — does NOT touch production
+# forecast files (next_day_forecast_phase3.csv, day2_forecast_phase3.csv,
+# kalman_state.json) or production model PKLs.
+#
+# daily_pipeline.yml stays active until the 2-week shadow validation period
+# passes (see docs/workflow-consolidation-design.md §9).
+#
+# Shadow files committed:
+#   model_assets/next_day_forecast_shadow.csv
+#   model_assets/day2_forecast_shadow.csv
+#   model_assets/forecasts/forecast_phase3_YYYY-MM-DD_shadow.csv
+#   model_assets/pi_calibration_shadow.json    (only when age gate fires)
+#   model_assets/phase3_metrics_shadow.json    (only when age gate fires)
+#
+# Data pipeline outputs ARE committed as production (not shadow) since they
+# are non-model artifacts — features_recent.csv, dataset_5yr.csv, streamlit_app.py.
+#
+# External dispatch trigger (same as early_forecast.yml):
+#   POST https://api.github.com/repos/liudi23/uk-system-price-forecast/dispatches
+#   Authorization: Bearer <EARLY_FORECAST_PAT>
+#   Content-Type: application/json
+#   {"event_type": "early-forecast"}
+
+on:
+  repository_dispatch:
+    types: [early-forecast]
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC fallback (primary = external dispatch above)
+  workflow_dispatch:
+
+concurrency:
+  group: streamlit-data-commit
+  cancel-in-progress: false
+
+jobs:
+  forecast-pipeline-shadow:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout streamlit-data
+        uses: actions/checkout@v4
+        with:
+          ref: streamlit-data
+          fetch-depth: 0   # full history needed for model-age git log check
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install pipeline dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # ── Timestamps ───────────────────────────────────────────────────────────
+      - name: Set date outputs
+        id: date
+        run: |
+          echo "week=$(date -u +%Y-W%V)"  >> $GITHUB_OUTPUT
+          echo "today=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          echo "ts=$(date -u +%Y-%m-%dT%H:%M)"   >> $GITHUB_OUTPUT
+
+      # ── Raw data cache (restore-only; shadow does not save back) ─────────────
+      - name: Restore raw data cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data/raw/
+          key: raw-data-${{ steps.date.outputs.week }}
+          restore-keys: raw-data-
+
+      # ── Data fetch — cache miss: full 3-year history ──────────────────────
+      - name: Fetch 3-year price history (cache miss)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: python src/data/fetch_elexon.py --start 2021-01-01
+
+      - name: Fetch 3-year weather history (cache miss)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: python src/data/fetch_weather.py --start 2021-01-01
+
+      - name: Fetch 3-year generation history (cache miss)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: python src/data/fetch_generation.py --start 2021-01-01
+
+      # ── Data fetch — cache hit: incremental append ────────────────────────
+      - name: Append yesterday's Elexon prices (cache hit)
+        if: steps.cache-restore.outputs.cache-hit == 'true'
+        run: python src/data/fetch_elexon.py --append
+
+      - name: Append latest weather (cache hit)
+        if: steps.cache-restore.outputs.cache-hit == 'true'
+        run: python src/data/fetch_weather.py --append
+
+      - name: Append latest generation mix (cache hit)
+        if: steps.cache-restore.outputs.cache-hit == 'true'
+        run: python src/data/fetch_generation.py --append
+
+      # ── Always fetch CPI (small monthly dataset) ──────────────────────────
+      - name: Fetch CPI index
+        run: python src/data/fetch_cpi.py
+
+      # ── Build processed dataset and features ─────────────────────────────
+      - name: Extend processed dataset
+        run: python src/data/extend_dataset.py
+
+      - name: Rebuild features
+        run: |
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_5yr.csv
+
+      - name: Save recent features for intraday inference
+        run: |
+          python -c "
+          import pandas as pd
+          df = pd.read_csv('data/processed/features_5yr.csv', parse_dates=['settlement_datetime'])
+          cutoff = df['settlement_datetime'].max() - pd.Timedelta(days=50)
+          recent = df[df['settlement_datetime'] > cutoff]
+          recent.to_csv('data/processed/features_recent.csv', index=False)
+          print(f'features_recent.csv: {len(recent)} rows, ends {recent[\"settlement_datetime\"].max()}')
+          "
+
+      # ── Inject yesterday's archive weather into system_prices.csv ─────────
+      - name: Inject yesterday's archive weather
+        run: python src/data/inject_weather_yesterday.py
+
+      # ── Model age gate ────────────────────────────────────────────────────
+      # Retrain when model_assets/level_q50.pkl has not been committed in ≥7 days.
+      # git log needs full history (fetch-depth: 0 above) to find the commit.
+      - name: Check model age (days since last retrain commit)
+        id: model-age
+        run: |
+          LAST=$(git log --format=%aI -1 -- model_assets/level_q50.pkl 2>/dev/null | head -1)
+          if [ -z "$LAST" ]; then
+            AGE=999
+          else
+            NOW=$(date -u +%s)
+            THEN=$(date -d "$LAST" +%s 2>/dev/null || echo 0)
+            AGE=$(( (NOW - THEN) / 86400 ))
+          fi
+          echo "age_days=${AGE}" >> $GITHUB_OUTPUT
+          if [ "$AGE" -ge 7 ]; then
+            echo "should_retrain=true"  >> $GITHUB_OUTPUT
+          else
+            echo "should_retrain=false" >> $GITHUB_OUTPUT
+          fi
+          echo "Model age: ${AGE} days — should_retrain=$([ $AGE -ge 7 ] && echo true || echo false)"
+
+      # ── Retrain (shadow) ─────────────────────────────────────────────────
+      # Runs only when model > 7 days old.  New PKLs + pi_calibration are copied
+      # to shadow names, then production versions are restored from git so that
+      # production inference (step below) uses the existing live model.
+      - name: Retrain Phase 3 models (shadow)
+        if: steps.model-age.outputs.should_retrain == 'true'
+        run: python src/models/train_phase3.py
+
+      - name: Recompute PI calibration (shadow)
+        if: steps.model-age.outputs.should_retrain == 'true'
+        run: python src/models/calibrate_pi.py
+
+      - name: Copy retrained artifacts to shadow names
+        if: steps.model-age.outputs.should_retrain == 'true'
+        run: |
+          for src in \
+            model_assets/level_q10.pkl \
+            model_assets/level_q50.pkl \
+            model_assets/level_q90.pkl \
+            model_assets/shape_q50.pkl \
+            model_assets/shape_h2_q50.pkl \
+            model_assets/neg_day_classifier.pkl \
+            model_assets/phase3_metrics.json \
+            model_assets/test_predictions_phase3.csv \
+            model_assets/phase3_level_importance.csv \
+            model_assets/phase3_shape_importance.csv; do
+            base="${src%.*}"; ext="${src##*.}"
+            [ -f "$src" ] && cp "$src" "${base}_shadow.${ext}" && echo "shadow: ${base}_shadow.${ext}"
+          done
+          cp model_assets/pi_calibration_v1.json model_assets/pi_calibration_shadow.json
+
+      - name: Restore production PKLs and pi_calibration (shadow isolation)
+        if: steps.model-age.outputs.should_retrain == 'true'
+        run: |
+          git checkout -- \
+            model_assets/level_q10.pkl \
+            model_assets/level_q50.pkl \
+            model_assets/level_q90.pkl \
+            model_assets/shape_q50.pkl \
+            model_assets/shape_h2_q50.pkl \
+            model_assets/neg_day_classifier.pkl \
+            model_assets/pi_calibration_v1.json
+
+      # ── Forecast with production models ───────────────────────────────────
+      - name: Run early H+1 and H+2 forecast
+        run: python src/models/forecast_phase3.py
+
+      # ── Shadow isolation: copy forecast outputs, restore production ────────
+      - name: Copy forecast outputs to shadow names
+        run: |
+          TODAY="${{ steps.date.outputs.today }}"
+          cp model_assets/next_day_forecast_phase3.csv model_assets/next_day_forecast_shadow.csv
+          cp model_assets/day2_forecast_phase3.csv     model_assets/day2_forecast_shadow.csv
+          DATED="model_assets/forecasts/forecast_phase3_${TODAY}.csv"
+          [ -f "$DATED" ] && cp "$DATED" "model_assets/forecasts/forecast_phase3_${TODAY}_shadow.csv"
+
+      - name: Restore production forecast files (shadow isolation)
+        run: |
+          git checkout -- \
+            model_assets/next_day_forecast_phase3.csv \
+            model_assets/day2_forecast_phase3.csv \
+            model_assets/kalman_state.json 2>/dev/null || true
+          # Remove the non-shadow daily forecast (not yet in git; shadow copy already saved)
+          TODAY="${{ steps.date.outputs.today }}"
+          rm -f "model_assets/forecasts/forecast_phase3_${TODAY}.csv"
+
+      # ── Touch streamlit_app.py to trigger Streamlit Cloud redeploy ────────
+      # Data files (features_recent.csv) are updated — Streamlit only redeploys
+      # on .py changes, so we touch the app file.  Model outputs are unchanged.
+      - name: Touch streamlit_app.py for Streamlit Cloud redeploy
+        run: |
+          TODAY="${{ steps.date.outputs.today }}"
+          sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
+            src/dashboard/streamlit_app.py
+
+      # ── Commit shadow outputs + data pipeline outputs ─────────────────────
+      - name: Commit and push shadow outputs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add src/dashboard/streamlit_app.py
+          git add -f data/processed/dataset_5yr.csv \
+                     data/processed/features_recent.csv
+
+          # Shadow forecast files
+          git add model_assets/next_day_forecast_shadow.csv \
+                  model_assets/day2_forecast_shadow.csv \
+                  "model_assets/forecasts/"
+
+          # Shadow retrain artifacts (only when retrain ran; git add is a no-op if absent)
+          git add model_assets/level_q10_shadow.pkl \
+                  model_assets/level_q50_shadow.pkl \
+                  model_assets/level_q90_shadow.pkl \
+                  model_assets/shape_q50_shadow.pkl \
+                  model_assets/shape_h2_q50_shadow.pkl \
+                  model_assets/neg_day_classifier_shadow.pkl \
+                  model_assets/pi_calibration_shadow.json \
+                  model_assets/phase3_metrics_shadow.json \
+                  model_assets/test_predictions_phase3_shadow.csv \
+                  model_assets/phase3_level_importance_shadow.csv \
+                  model_assets/phase3_shape_importance_shadow.csv 2>/dev/null || true
+
+          git diff --staged --quiet || {
+            git commit -m "Shadow forecast update ${{ steps.date.outputs.ts }}" &&
+            for _i in 1 2 3; do
+              git pull --rebase --autostash origin streamlit-data && git push && break
+              echo "Push attempt $_i failed — retrying in ${_i}s"
+              [ "$_i" -lt 3 ] && sleep "$_i"
+            done
+          }

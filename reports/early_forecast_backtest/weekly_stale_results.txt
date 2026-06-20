@@ -1,0 +1,40 @@
+====================================================================================================
+WEEKLY-STALE BACKTEST  —  Autumn 2025 Spike Period (Oct 1–28)
+Compare: 7-day stale (retrain at each week start) vs 30-day stale (WF autumn fold)
+Spike week = W2 (Oct 8–14), contains Oct 13 event (max SP = £487)
+====================================================================================================
+
+Sub-fold                Stale      N       MAE     MAE Δ   Coverage     CovΔ     Width   IS score
+────────────────────────────────────────────────────────────────────────────────────────────────────
+W1-Oct01-07             7-day    336     28.45    -0.37      78.9%    +6.2%      86.7      141.4  ← 7-day stale
+W1-Oct01-07            30-day    336     28.82  +   0.37      72.6%    -6.2%      76.2      138.8  ← 30-day stale (WF)
+
+W2-Oct08-14             7-day    336     26.86    -0.02      81.5%    +2.1%      76.5      129.1  ← 7-day stale
+W2-Oct08-14            30-day    336     26.88  +   0.02      79.5%    -2.1%      77.4      136.8  ← 30-day stale (WF)
+
+W3-Oct15-21             7-day    336     23.50    -2.79      88.1%    +7.7%     106.3      127.9  ← 7-day stale
+W3-Oct15-21            30-day    336     26.29  +   2.79      80.4%    -7.7%      73.0      105.9  ← 30-day stale (WF)
+
+W4-Oct22-28             7-day    287     34.67    -4.05      56.8%    +3.1%      81.0      182.7  ← 7-day stale
+W4-Oct22-28            30-day    287     38.72  +   4.05      53.7%    -3.1%      84.0      204.8  ← 30-day stale (WF)
+
+TOTAL                   7-day   1295     28.13    -1.72      77.1%    +4.9%      87.9      143.9  ← 7-day stale
+TOTAL                  30-day   1295     29.85  +   1.72      72.2%    -4.9%      77.4      144.4  ← 30-day stale (WF)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+SHIP GATE — 7-day stale model vs 30-day stale (WF baseline):
+  Overall autumn MAE delta : -1.72 £/MWh  (threshold ≤ +£2.50)  PASS
+  Spike-week (W2) MAE delta: -0.02 £/MWh  (threshold ≤ +£10.00)  PASS
+  Coverage delta (all):      +4.9%  (threshold ±5 pp)  PASS
+
+  DECISION: PASS — weekly retrain validated for consolidated pipeline
+
+Notes:
+  • 7-day W1 uses same Sep 30 cutoff as the 30-day WF fold → W1 MAE difference
+    reflects model variation (random early-stopping, different data subsample).
+  • W3 and W4: 7-day model has seen the Oct 13 spike in training → expected
+    improvement on subsequent spike events (Oct 22).
+  • Daily retrain would be between 7-day and 30-day staleness — bounding the range.
+  • Spike caveat: Oct 13 spike (Tukey upper=£353.7, actual £487) is 1 SP in test
+    period. Autumn 2026 will provide the main spike-robustness signal.
+====================================================================================================
