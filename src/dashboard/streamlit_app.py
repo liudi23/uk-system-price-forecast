@@ -156,16 +156,23 @@ if PI_CAL_JSON.exists():
     _cov_after  = _pi.get("coverage_after_insample_per_sp", 0)
     _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
 st.info(
-    "**Phase 3+4 — Level-Shape · Kalman corrector · PI calibration** · "
-    "CPI-adjusted · 3-year rolling window · "
-    "Stage 1: daily level HGBR (P10/P50/P90) · "
-    "Stage 2H+1: shape HGBR lag ≥ 48 SPs · Stage 2H+2: lag ≥ 96 SPs — zero leakage · "
-    "Hourly Kalman bias correction (horizon decay γ=0.966) · "
-    f"**PI coverage: {_pi_cov_str}** (split-conformal, per-SP deltas, 119-day WF) · "
-    f"**Walk-forward MAE: £27.39/MWh** (119 days · 4 seasons) · "
-    f"7-day holdout MAE: {_mae_str} · Level MAE: {_lvl_str} · Shape corr: {_corr_str} · "
-    "**Intraday Nowcast (h+1/h+2/h+3):** persistence point forecast + 80% empirical P10/P90 bands "
-    "(18-month trailing window · NP/EN regime-aware · updated every 30 min as SPs settle)"
+    "**UK System Sell Price (SSP) forecast** — two-stage level–shape model "
+    "(gradient-boosted HGBR), retrained daily on a rolling 3-year, CPI-adjusted window · "
+    "zero-leakage (every feature lagged ≥ its forecast horizon)\n\n"
+    "· **Stage 1 — level:** daily-mean SSP (P10 / P50 / P90)\n\n"
+    "· **Stage 2 — shape:** per-settlement-period deviation · "
+    "H+1 head uses lags ≥ 48 SPs · H+2 head uses lags ≥ 96 SPs\n\n"
+    "· **Intraday correction:** hourly scalar Kalman bias correction "
+    "(horizon decay γ = 0.966) as settled prices arrive\n\n"
+    f"· **Calibrated uncertainty:** split-conformal per-SP δ lifts "
+    f"80%-band coverage **{_pi_cov_str}** (119-day walk-forward)\n\n"
+    f"· **Accuracy:** WF MAE **£27.39/MWh** (119 days · 4 seasons) · "
+    f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}\n\n"
+    "· **Intraday nowcast** (H+1 / H+2 / H+3, ≈30–90 min): persistence point forecast + "
+    "80% empirical P10/P90 bands (18-month trailing window, NP/EN regime-aware), "
+    "updated every 30 min as SPs settle. "
+    "Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
+    "under 90 min); the day-ahead model takes over from ~H+4."
 )
 
 if _ps["health"] in ("stale", "daily_missed"):
