@@ -102,7 +102,7 @@ jobs:
                   model_assets/day2_forecast_phase3.csv \
                   "model_assets/forecasts/"
           git diff --staged --quiet || {
-            git commit -m "Intraday forecast update $(date -u +%Y-%m-%dT%H:%M)" &&
+            git commit -m "Early forecast update $(date -u +%Y-%m-%dT%H:%M)" &&
             for _i in 1 2 3; do
               git pull --rebase --autostash origin streamlit-data && git push && break
               echo "Push attempt $_i failed — retrying in ${_i}s"
