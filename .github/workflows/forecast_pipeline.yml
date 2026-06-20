@@ -223,29 +223,30 @@ jobs:
           TODAY="${{ steps.date.outputs.today }}"
           rm -f "model_assets/forecasts/forecast_phase3_${TODAY}.csv"
 
-      # ── Touch streamlit_app.py to trigger Streamlit Cloud redeploy ────────
-      # Data files (features_recent.csv) are updated — Streamlit only redeploys
-      # on .py changes, so we touch the app file.  Model outputs are unchanged.
-      - name: Touch streamlit_app.py for Streamlit Cloud redeploy
-        run: |
-          TODAY="${{ steps.date.outputs.today }}"
-          sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
-            src/dashboard/streamlit_app.py
+      # ── Shadow vs production daily comparison ────────────────────────────
+      # Compares YESTERDAY's shadow and production archive files against actuals.
+      # Skips silently on day 1 (no shadow archive for yesterday yet).
+      # Appends one row to reports/shadow_validation/log.csv.
+      - name: Append shadow vs production comparison to log
+        run: python src/monitoring/shadow_comparison.py
 
-      # ── Commit shadow outputs + data pipeline outputs ─────────────────────
+      # ── Commit shadow outputs ONLY (no production data files) ────────────
+      # dataset_5yr.csv / features_recent.csv / streamlit_app.py are NOT committed
+      # here — daily_pipeline.yml is the sole owner of those files during the
+      # shadow period.  Shadow-only commit keeps daily_pipeline as an untouched
+      # control for the 2-week comparison.
       - name: Commit and push shadow outputs
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add src/dashboard/streamlit_app.py
-          git add -f data/processed/dataset_5yr.csv \
-                     data/processed/features_recent.csv
-
           # Shadow forecast files
           git add model_assets/next_day_forecast_shadow.csv \
                   model_assets/day2_forecast_shadow.csv \
                   "model_assets/forecasts/"
+
+          # Daily comparison log
+          git add reports/shadow_validation/log.csv 2>/dev/null || true
 
           # Shadow retrain artifacts (only when retrain ran; git add is a no-op if absent)
           git add model_assets/level_q10_shadow.pkl \
