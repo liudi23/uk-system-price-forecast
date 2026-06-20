@@ -1,0 +1,111 @@
+name: Early Forecast (01:00 UTC)
+
+# Triggered by an external cron service via repository_dispatch.
+# GitHub's own cron can fire 30+ min late or skip on free tier — pair this
+# workflow with an external cron-service (e.g. cron-job.org or AWS EventBridge)
+# that POSTs to the GitHub dispatches API at 01:00 UTC:
+#
+#   POST https://api.github.com/repos/liudi23/uk-system-price-forecast/dispatches
+#   Authorization: Bearer <EARLY_FORECAST_PAT>
+#   Content-Type: application/json
+#   {"event_type": "early-forecast"}
+#
+# The PAT needs  repo  scope (or fine-grained: contents=write, actions=write).
+# Store it as repository secret EARLY_FORECAST_PAT.
+# GitHub fallback schedule (deliberately non-critical; primary = dispatch above):
+on:
+  repository_dispatch:
+    types: [early-forecast]
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC fallback (may fire late on free tier)
+  workflow_dispatch:       # manual trigger from GitHub Actions UI
+
+# Same concurrency group as daily_pipeline.yml and intraday_update.yml so
+# pushes serialize and never create non-fast-forward conflicts.
+concurrency:
+  group: streamlit-data-commit
+  cancel-in-progress: false
+
+jobs:
+  early-forecast:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # required to push updated forecast files back to repo
+
+    steps:
+      - name: Checkout streamlit-data
+        uses: actions/checkout@v4
+        with:
+          ref: streamlit-data
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install pipeline dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # ── Restore raw data from weekly cache ───────────────────────────────────
+      - name: Get ISO week for cache key
+        id: date
+        run: echo "week=$(date -u +%Y-W%V)" >> $GITHUB_OUTPUT
+
+      - name: Restore raw data cache
+        uses: actions/cache@v4
+        with:
+          path: data/raw/
+          key: raw-data-${{ steps.date.outputs.week }}
+          restore-keys: raw-data-
+
+      # ── Append yesterday's prices to system_prices.csv (IIS, all 48 SPs) ─────
+      # At 01:00 UTC on day X, the data cache holds system_prices.csv ending at
+      # X-2 (written by yesterday's 12:30 UTC daily run). fetch_elexon --append
+      # auto-detects the last date and fetches X-1 (yesterday), which is fully
+      # available by ~23:07 UTC. This enables the extra-row extension mechanism
+      # in forecast_phase3.py: 48 X-1 rows push combined_last_dt to X-1 23:30,
+      # so target_date advances to X (today) and the morning-gap guard doesn't fire.
+      - name: Append yesterday's Elexon prices to system_prices.csv
+        run: python src/data/fetch_elexon.py --append
+
+      # ── Inject yesterday's archive weather into system_prices.csv ────────────
+      # Populates _raw_temp_c / _raw_wind_ms / _raw_solar_wm2 / _raw_precip_mm
+      # for X-1 rows so all 9 lag-weather features are non-NaN in the forecast.
+      # Uses same archive API + locations + resampling as training pipeline.
+      - name: Inject yesterday's archive weather
+        run: python src/data/inject_weather_yesterday.py
+
+      # ── Run early forecast ────────────────────────────────────────────────────
+      # forecast_phase3.py detects X-1 rows in system_prices.csv, advances
+      # target_date to X, and produces next_day_forecast_phase3.csv for today.
+      # KalmanCorrector resets automatically: state["forecast_date"] != today
+      # triggers x_hat=0, P=1225, forecast_date=today, last_update="".
+      - name: Run early H+1 and H+2 forecast
+        run: python src/models/forecast_phase3.py
+
+      # ── Commit and push forecast outputs ─────────────────────────────────────
+      - name: Commit and push early forecast
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add model_assets/kalman_state.json \
+                  model_assets/next_day_forecast_phase3.csv \
+                  model_assets/day2_forecast_phase3.csv \
+                  "model_assets/forecasts/"
+          git diff --staged --quiet || {
+            git commit -m "Intraday forecast update $(date -u +%Y-%m-%dT%H:%M)" &&
+            for _i in 1 2 3; do
+              git pull --rebase --autostash origin streamlit-data && git push && break
+              echo "Push attempt $_i failed — retrying in ${_i}s"
+              [ "$_i" -lt 3 ] && sleep "$_i"
+            done
+          }

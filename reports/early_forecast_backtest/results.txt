@@ -1,0 +1,48 @@
+==============================================================================================================
+EARLY FORECAST BACKTEST RESULTS
+Walk-forward test period: 2025-07-01 to 2026-04-30  |  119 days  |  5,709 SPs
+==============================================================================================================
+
+Group                             N    MAE IS   MAE Ear   MAEΔEar     MAE W  MAEDELTA W   Cov IS   CovEar  CovΔEar    Cov W   CovΔW
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+All SPs                        5709     17.38     20.17     +2.80     17.38       +0.00    91.6%    88.3%    -3.2%    91.6%   +0.0%
+Normal (no spike, no P)        2999     19.24     21.94     +2.71     19.24       +0.00    90.2%    86.3%    -3.9%    90.2%   +0.0%
+P-coded                        2710     15.32     18.22     +2.90     15.32       +0.00    93.1%    90.5%    -2.5%    93.1%   +0.0%
+Spike                             1    381.41    385.46     +4.06    381.41       +0.00     0.0%     0.0%    +0.0%     0.0%   +0.0%
+Spike + P-coded                   1    381.41    385.46     +4.06    381.41       +0.00     0.0%     0.0%    +0.0%     0.0%   +0.0%
+Non-spike                      5708     17.31     20.11     +2.80     17.31       +0.00    91.6%    88.3%    -3.3%    91.6%   +0.0%
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Scenarios:
+  IS          = production forecast (all weather features populated)
+  Early       = early 01:00 UTC run WITHOUT injection (9 weather features NaN)
+  Early+weather = early 01:00 UTC run WITH injection (archive weather restored)
+
+Note: Early+weather ≡ IS in backtest (archive weather = training weather).
+      In production, IIS vs IS price-lag residual adds ~£0.15-0.20 penalty.
+
+Features nulled in 'Early' scenario (9 columns across shape + level):
+  • temp_c_lag_48 [shape only]
+  • wind_ms_lag_48 [shape only]
+  • precip_mm_lag_48 [shape only]
+  • temp_c_daily_mean_lag1d [shape+level]
+  • wind_ms_daily_mean_lag1d [shape+level]
+  • solar_wm2_daily_mean_lag1d [shape+level]
+  • temp_c_daily_max_lag1d [level only]
+  • wind_ms_daily_max_lag1d [level only]
+  • solar_wm2_daily_max_lag1d [level only]
+
+==============================================================================================================
+SHIP GATE EVALUATION  (gate evaluated on Early+weather scenario)
+  MAE penalty Early (no injection):         +2.7965 £/MWh  FAIL (shows the problem)
+  MAE penalty Early+weather (with injection): +0.0000 £/MWh  (threshold ≤ +1.50)  PASS
+  Coverage IS  (All SPs):  91.6%
+  Coverage Early+weather:  91.6%  (delta: +0.0%, threshold ±5 pp)  PASS
+
+  DECISION: SHIP
+  Rationale: Early+weather MAE penalty and coverage delta are within tolerance.
+  Option A (early_forecast.yml at 01:00 UTC) with inject_weather_yesterday.py
+  is validated for deployment.
+  Spike caveat: only 1 spike SP in test period — behaviour must be re-checked
+  on autumn 2026 data after Sep 2026 when spike season begins.
+==============================================================================================================

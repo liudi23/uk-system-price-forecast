@@ -1,0 +1,19 @@
+group,n,mae,coverage,mean_width,is_score,variant
+All SPs,5709,17.3778,0.9157,80.903,94.078,IS
+All SPs,5709,20.1743,0.8832,80.5618,98.7783,Early
+All SPs,5709,17.3778,0.9157,80.903,94.078,Early+weather
+"Normal (no spike, no P)",2999,19.2369,0.9023,81.4948,96.9348,IS
+"Normal (no spike, no P)",2999,21.9432,0.8633,81.1008,103.1586,Early
+"Normal (no spike, no P)",2999,19.2369,0.9023,81.4948,96.9348,Early+weather
+P-coded,2710,15.3204,0.9306,80.2482,90.9165,IS
+P-coded,2710,18.2168,0.9052,79.9654,93.931,Early
+P-coded,2710,15.3204,0.9306,80.2482,90.9165,Early+weather
+Spike,1,381.4054,0.0,131.4271,3294.4972,IS
+Spike,1,385.463,0.0,133.113,3305.8508,Early
+Spike,1,381.4054,0.0,131.4271,3294.4972,Early+weather
+Spike + P-coded,1,381.4054,0.0,131.4271,3294.4972,IS
+Spike + P-coded,1,385.463,0.0,133.113,3305.8508,Early
+Spike + P-coded,1,381.4054,0.0,131.4271,3294.4972,Early+weather
+Non-spike,5708,17.314,0.9159,80.8942,93.5173,IS
+Non-spike,5708,20.1103,0.8833,80.5526,98.2165,Early
+Non-spike,5708,17.314,0.9159,80.8942,93.5173,Early+weather
