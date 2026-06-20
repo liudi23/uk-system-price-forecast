@@ -397,12 +397,20 @@ if _fc_path.exists():
                 _h_key     = f"h{_h}"
                 _target_sp = _last_sp + _h
                 _col       = _nc_cols[_h_idx]
-                _sp_time   = _sp_to_time.get(_target_sp, "")
-                _sp_header = f"SP+{_h} · SP {_target_sp}" + (f" · {_sp_time}" if _sp_time else "")
+
+                # Day-rollover: target crosses midnight → next-day SP
                 if _target_sp > 48:
-                    _col.metric(_sp_header, "—",
-                                help="Beyond today's 48 settlement periods")
-                    continue
+                    _nd_sp    = _target_sp - 48
+                    _nd_date  = pd.Timestamp(fc_date) + pd.Timedelta(days=1)
+                    _nd_mins  = (_nd_sp - 1) * 30
+                    _nd_time  = f"{_nd_mins // 60:02d}:{_nd_mins % 60:02d}"
+                    _date_lbl = _nd_date.strftime("%b") + " " + str(_nd_date.day)
+                    _sp_header = f"SP+{_h} · SP {_nd_sp} · {_date_lbl} · {_nd_time}"
+                else:
+                    _sp_time   = _sp_to_time.get(_target_sp, "")
+                    _sp_header = f"SP+{_h} · SP {_target_sp}" + (f" · {_sp_time}" if _sp_time else "")
+
+                # Bands are horizon-keyed (h1/h2/h3), not SP-keyed — valid across midnight
                 _bnd = _horizons[_h_key].get(_regime, _horizons[_h_key]["overall"])
                 _p10 = round(_y0 + _bnd["p10"])
                 _p90 = round(_y0 + _bnd["p90"])
