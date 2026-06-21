@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import logging
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -48,6 +49,28 @@ VARIABLES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+TIMEOUT      = 60   # seconds per attempt
+MAX_RETRIES  = 3
+BACKOFF_BASE = 5    # seconds; delays are 5, 10, 20
+
+
+def _request_with_retry(url: str, params: dict) -> requests.Response:
+    """GET with exponential backoff. Raises on final failure."""
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except (requests.RequestException, OSError) as exc:
+            last_exc = exc
+            wait = BACKOFF_BASE * (2 ** attempt)
+            log.warning("attempt %d/%d failed (%s: %s); retrying in %ds",
+                        attempt + 1, MAX_RETRIES, type(exc).__name__, exc, wait)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+    raise last_exc
+
 
 def fetch_location(name: str, lat: float, lon: float,
                    start: str, end: str) -> pd.DataFrame:
@@ -60,8 +83,7 @@ def fetch_location(name: str, lat: float, lon: float,
         "timezone": "UTC",
         "wind_speed_unit": "ms",
     }
-    resp = requests.get(BASE_URL, params=params, timeout=60)
-    resp.raise_for_status()
+    resp = _request_with_retry(BASE_URL, params)
 
     data = resp.json()
     hourly = data["hourly"]

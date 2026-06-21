@@ -5,16 +5,23 @@ Fetch actual hourly weather from the Open-Meteo archive API for yesterday
 (or --date DATE) and write _raw_temp_c / _raw_wind_ms / _raw_solar_wm2 /
 _raw_precip_mm into data/raw/system_prices.csv for the matching SPs.
 
-Called from early_forecast.yml before forecast_phase3.py runs, so the
+Called from forecast_pipeline.yml before forecast_phase3.py runs, so the
 extra-row extension mechanism in forecast_phase3.py gets weather-populated
 rows and all 9 lag-weather features are non-NaN.
 
 Train/serve alignment: same archive API, locations, variables, and 30-min
 resampling as src/data/fetch_weather.py — no skew introduced.
+
+Resilience:
+  1. Archive API: 3 retries with exponential backoff, 60 s timeout.
+  2. Fallback to Open-Meteo forecast endpoint (near-actual for yesterday).
+  3. If both APIs fail: proceed WITHOUT injection (NaN weather).
+     HGBR handles NaN natively (~£2.80 MAE penalty from backtest).
+     Script always exits 0 — a weather outage must not kill the forecast run.
 """
 
 import argparse
-import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -25,7 +32,12 @@ import requests
 REPO       = Path(__file__).resolve().parents[2]
 RAW_PRICES = REPO / "data" / "raw" / "system_prices.csv"
 
-BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
+ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+TIMEOUT      = 60   # seconds per request attempt
+MAX_RETRIES  = 3
+BACKOFF_BASE = 5    # seconds; delays are 5, 10, 20
 
 UK_LOCATIONS = [
     {"name": "England",  "latitude": 52.5,  "longitude": -1.5,  "weight": 0.6},
@@ -48,7 +60,25 @@ COL_MAP = {
 }
 
 
-def _fetch_one(lat: float, lon: float, date_str: str) -> pd.DataFrame:
+def _request_with_retry(url: str, params: dict) -> requests.Response:
+    """GET with exponential backoff. Raises on final failure."""
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r
+        except (requests.RequestException, OSError) as exc:
+            last_exc = exc
+            wait = BACKOFF_BASE * (2 ** attempt)
+            print(f"[inject_weather] attempt {attempt + 1}/{MAX_RETRIES} failed "
+                  f"({type(exc).__name__}: {exc}); retrying in {wait}s")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+    raise last_exc
+
+
+def _fetch_one(lat: float, lon: float, date_str: str, url: str) -> pd.DataFrame:
     params = {
         "latitude":        lat,
         "longitude":       lon,
@@ -58,25 +88,54 @@ def _fetch_one(lat: float, lon: float, date_str: str) -> pd.DataFrame:
         "timezone":        "UTC",
         "wind_speed_unit": "ms",
     }
-    r = requests.get(BASE_URL, params=params, timeout=30)
-    r.raise_for_status()
+    r = _request_with_retry(url, params)
     h = r.json()["hourly"]
     df = pd.DataFrame(h)
     df["time"] = pd.to_datetime(df["time"])
-    return df.set_index("time").rename(columns=RENAME)
+    df = df.set_index("time").rename(columns=RENAME)
+    # Keep only the target date rows (forecast endpoint may return extra days)
+    target_date = pd.Timestamp(date_str).date()
+    df = df[df.index.date == target_date]
+    return df
 
 
-def fetch_weighted_weather(date_str: str) -> pd.DataFrame:
-    """Weighted average across UK locations, resampled to 30-min."""
+def _fetch_weighted(date_str: str, url: str) -> pd.DataFrame:
+    """Weighted average across UK locations for given URL, resampled to 30-min."""
     combined = None
     for loc in UK_LOCATIONS:
-        df = _fetch_one(loc["latitude"], loc["longitude"], date_str)
+        df = _fetch_one(loc["latitude"], loc["longitude"], date_str, url)
         weighted = df * loc["weight"]
         combined = weighted if combined is None else combined + weighted
-    # Resample to 30-min and ensure all 48 SPs are covered (23:30 needs ffill from 23:00)
     full_idx = pd.date_range(date_str, periods=48, freq="30min")
     combined = combined.resample("30min").ffill().reindex(full_idx).ffill()
-    return combined  # index = UTC datetime, cols = temp_c / wind_ms / solar_wm2 / precip_mm
+    return combined  # index=UTC datetime, cols=temp_c/wind_ms/solar_wm2/precip_mm
+
+
+def fetch_weather_with_fallback(date_str: str):
+    """
+    Try archive API, then forecast API, then give up gracefully.
+
+    Returns (weather_df, source) where source is one of:
+      'archive'  — Open-Meteo archive (ERA5, best accuracy)
+      'forecast' — Open-Meteo forecast model (near-actual, slightly lower accuracy)
+      'none'     — both APIs failed; caller should proceed with NaN weather
+    """
+    # 1. Archive API (with retry)
+    try:
+        df = _fetch_weighted(date_str, ARCHIVE_URL)
+        return df, "archive"
+    except Exception as exc:
+        print(f"[inject_weather] WARNING: archive API unavailable after {MAX_RETRIES} retries: {exc}")
+
+    # 2. Forecast API fallback (near-actual for yesterday, no retry needed here)
+    print("[inject_weather] trying forecast endpoint as fallback …")
+    try:
+        df = _fetch_weighted(date_str, FORECAST_URL)
+        return df, "forecast"
+    except Exception as exc:
+        print(f"[inject_weather] WARNING: forecast API also failed: {exc}")
+
+    return None, "none"
 
 
 def main():
@@ -101,12 +160,23 @@ def main():
     n = mask.sum()
     if n == 0:
         print(f"[inject_weather] WARNING: no rows for {date_str} in system_prices.csv — skipping")
-        sys.exit(0)
-    print(f"[inject_weather] {n} SP rows found for {date_str}")
+        return
 
-    print("[inject_weather] fetching archive weather …")
-    weather = fetch_weighted_weather(date_str)
-    print(f"[inject_weather] {len(weather)} 30-min weather rows")
+    print(f"[inject_weather] {n} SP rows found for {date_str}")
+    print("[inject_weather] fetching weather …")
+
+    weather, source = fetch_weather_with_fallback(date_str)
+
+    if weather is None:
+        # Both APIs failed — NaN injection; HGBR handles missing weather natively.
+        print("[inject_weather] WARNING: all weather sources failed — proceeding WITHOUT "
+              "injection. Weather features will be NaN. "
+              "HGBR handles NaN natively (~£2.80 MAE penalty per backtest).")
+        raw = raw.drop(columns=["_sdt"])
+        raw.to_csv(RAW_PRICES, index=False)
+        return  # exit 0
+
+    print(f"[inject_weather] {len(weather)} 30-min weather rows (source={source})")
 
     for raw_col in COL_MAP.values():
         if raw_col not in raw.columns:
@@ -117,8 +187,8 @@ def main():
         raw.loc[mask, raw_col] = vals.values
 
     n_ok = raw.loc[mask, "_raw_temp_c"].notna().sum()
-    print(f"[inject_weather] filled {n_ok}/{n} rows  (temp_c sample: "
-          f"{raw.loc[mask, '_raw_temp_c'].mean():.1f} °C mean)")
+    print(f"[inject_weather] filled {n_ok}/{n} rows  "
+          f"(source={source}, temp_c mean={raw.loc[mask, '_raw_temp_c'].mean():.1f} °C)")
 
     raw = raw.drop(columns=["_sdt"])
     raw.to_csv(RAW_PRICES, index=False)
