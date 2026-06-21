@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import logging
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -23,15 +24,36 @@ ONS_URL     = "https://www.ons.gov.uk/economy/inflationandpriceindices/timeserie
 RAW_DIR     = Path(__file__).resolve().parents[2] / "data" / "raw"
 OUTPUT_FILE = RAW_DIR / "cpi_uk.csv"
 
+TIMEOUT      = 60
+MAX_RETRIES  = 3
+BACKOFF_BASE = 5   # seconds; delays: 5, 10, 20
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+
+def _request_with_retry(url: str, params=None):
+    """GET with exponential backoff. Raises on final failure."""
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except (requests.RequestException, OSError) as exc:
+            last_exc = exc
+            wait = BACKOFF_BASE * (2 ** attempt)
+            log.warning("attempt %d/%d failed (%s: %s); retrying in %ds",
+                        attempt + 1, MAX_RETRIES, type(exc).__name__, exc, wait)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+    raise last_exc
 
 
 def fetch_cpi() -> pd.DataFrame:
     """Fetch monthly UK CPIH from ONS API and return as DataFrame."""
     log.info("Fetching UK CPIH from ONS API …")
-    resp = requests.get(ONS_URL, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry(ONS_URL)
     data = resp.json()
 
     months = data.get("months", [])
@@ -79,9 +101,23 @@ def main() -> None:
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = fetch_cpi()
-    df.to_csv(path, index=False)
-    log.info("Saved %d rows → %s", len(df), path)
+    try:
+        df = fetch_cpi()
+        df.to_csv(path, index=False)
+        log.info("Saved %d rows → %s", len(df), path)
+    except Exception as exc:
+        log.warning("ONS API failed after %d retries: %s", MAX_RETRIES, exc)
+        if path.exists():
+            log.warning(
+                "Using stale CPI from %s — acceptable (CPI changes monthly, "
+                "1-day-stale data has negligible impact on training)", path
+            )
+        else:
+            log.error(
+                "No stale CPI file at %s — downstream extend_dataset.py may fail "
+                "if CPI join is required", path
+            )
+        # Always exit 0: a CPI API outage must not kill the forecast run.
 
 
 if __name__ == "__main__":

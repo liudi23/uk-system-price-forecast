@@ -21,7 +21,10 @@ from typing import Optional
 import pandas as pd
 import requests
 
-BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
+BASE_URL     = "https://data.elexon.co.uk/bmrs/api/v1"
+TIMEOUT      = 60
+MAX_RETRIES  = 3
+BACKOFF_BASE = 5
 RAW_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 OUTPUT_FILE = RAW_DATA_DIR / "system_prices.csv"
 
@@ -41,6 +44,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
+def _request_with_retry(url: str, params=None, session=None):
+    """GET with exponential backoff. Raises on final failure."""
+    getter = session.get if session is not None else requests.get
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = getter(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except (requests.RequestException, OSError) as exc:
+            last_exc = exc
+            wait = BACKOFF_BASE * (2 ** attempt)
+            log.warning("attempt %d/%d failed (%s: %s); retrying in %ds",
+                        attempt + 1, MAX_RETRIES, type(exc).__name__, exc, wait)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+    raise last_exc
+
+
 def _parse_records(payload) -> list:
     """Extract the list of records from a variety of API response shapes."""
     if isinstance(payload, list):
@@ -54,8 +76,7 @@ def _parse_records(payload) -> list:
 def fetch_day(settlement_date: str, session: requests.Session) -> pd.DataFrame:
     """Return a DataFrame of system prices for one settlement date (YYYY-MM-DD)."""
     url = f"{BASE_URL}/balancing/settlement/system-prices/{settlement_date}"
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry(url, session=session)
 
     records = _parse_records(resp.json())
     if not records:
