@@ -45,7 +45,7 @@
 
 ### 3. Pipeline Architecture
 **Purpose:** Describe the automated end-to-end system from data ingestion to Streamlit dashboard.
-- Two GitHub Actions workflows: `daily_pipeline.yml` (12:30 UTC daily retrain) and `intraday_update.yml` (every 30 min, 48 runs/day, inference only)
+- Two GitHub Actions workflows: `daily_pipeline.yml` (12:30 UTC daily run, weekly model retrain) and `intraday_update.yml` (every 30 min, 48 runs/day, inference only)
 - Data ingestion stack: Elexon BMRS, Open-Meteo weather, BMRS WINDFOR, BMRS TSDF, Elexon generation mix, ONS CPI
 - Feature construction pipeline: `build_features.py`, lag/calendar/weather feature modules; `features_recent.csv` for intraday inference
 - Model artifact persistence: all PKL/JSON model files committed to `streamlit-data` branch; Kalman state persisted via commit-back to avoid cache eviction

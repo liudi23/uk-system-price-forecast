@@ -79,8 +79,9 @@ The code comment in `train_phase3.py` says: *"same base as Phase 2 for fair comp
 **Neg-day classifier:** Binary HGBR (P(≥3 negative-price SPs tomorrow)) used as a level feature
 to handle renewable oversupply. Artifact: `model_assets/neg_day_classifier.pkl`.
 
-**Retraining schedule:** Daily at 12:30 UTC via `daily_pipeline.yml`. Models are frozen between
-daily retrains. The intraday pipeline (`intraday_update.yml`) does **inference only**.
+**Retraining schedule:** Weekly via `daily_pipeline.yml` (model age gate — retrain only when the
+live model is > 7 days old, at the 12:30 UTC run). Models are frozen between retrains. The intraday
+pipeline (`intraday_update.yml`) does **inference only**.
 
 **Holdout performance (last 7 days as of latest run):**
 

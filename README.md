@@ -121,13 +121,13 @@ Bands stored in `model_assets/nowcast_bands.json`, built by `src/models/build_no
 
 Three GitHub Actions workflows — two live (production), one in shadow validation:
 
-### LIVE — daily retrain: `daily_pipeline.yml`
+### LIVE — daily pipeline: `daily_pipeline.yml`
 
 Runs at **12:30 UTC** daily (Elexon Initial Settlement data is published by ~12:00 UTC). Steps:
 
 1. Incremental data fetch from all sources (or full 3-year history if weekly cache is cold)
 2. Extend the cleaned dataset and rebuild the 128-column feature matrix
-3. Retrain Stage 1 + Stage 2 models; recompute PI calibration
+3. Retrain Stage 1 + Stage 2 models **weekly** (model age gate — only when the live model is > 7 days old; held frozen between retrains); recompute PI calibration
 4. Run H+1 and H+2 forecasts; write PI-calibrated outputs
 5. Commit all model artifacts, forecast CSVs, and Streamlit data to the `streamlit-data` branch
 
@@ -145,7 +145,7 @@ Primary trigger: **cron-job.org** sends a `repository_dispatch` event (type `int
 
 ### SHADOW (in validation) — consolidated pipeline: `forecast_pipeline.yml`
 
-Runs at **01:00 UTC** daily. Runs the same full data-fetch + feature-rebuild + forecast pipeline as the daily retrain workflow, but commits only shadow outputs (`*_shadow.csv` files). Immediately after the forecast run, all production artifacts are restored to their committed versions via `git checkout --`, so shadow outputs cannot overwrite the live data.
+Runs at **01:00 UTC** daily. Runs the same full data-fetch + feature-rebuild + forecast pipeline as the daily forecast workflow, but commits only shadow outputs (`*_shadow.csv` files). Immediately after the forecast run, all production artifacts are restored to their committed versions via `git checkout --`, so shadow outputs cannot overwrite the live data.
 
 Key differences from production:
 - **Weekly retrain** (model age gate: retrain only when the live PKL is > 7 days old) rather than daily
@@ -153,7 +153,7 @@ Key differences from production:
 
 Primary trigger: **cron-job.org** sends a `repository_dispatch` event (type `early-forecast`) at 01:00 UTC. GitHub's native `schedule: '0 1 * * *'` is the fallback.
 
-**Not yet in production.** The shadow validation period (2-week minimum) is in progress. Cut-over will retire `daily_pipeline.yml` once shadow metrics pass.
+**Weekly-retrain consolidation validated.** The shadow validation period has passed and weekly age-gated retraining is now the production cadence. Final retirement of `daily_pipeline.yml` is a separate CI change.
 
 ---
 
@@ -365,7 +365,7 @@ Open [http://localhost:8501](http://localhost:8501). The live dashboard at [uk-s
 
 **Kalman corrector.** The scalar filter addresses systematic level bias that persists across the 119-day walk-forward (the model tends to over-predict at low prices, under-predict on high-demand days). The random-walk prior (Q = 21.0 £²) means the filter tracks slowly drifting regime bias rather than per-SP noise. Horizon decay γ = 0.966 per SP means the correction is full strength at h = 0 and halves by approximately h = 20 settlement periods. PI calibration commutes with Kalman correction (both are linear shifts), so the order of application does not affect the archived CSV values.
 
-**Elexon settlement data.** Prices are finalised at Initial Settlement on D+1; the most recent settled data available at 01:00 UTC (shadow pipeline) or 12:30 UTC (daily retrain) is the previous day's 48 settlement periods.
+**Elexon settlement data.** Prices are finalised at Initial Settlement on D+1; the most recent settled data available at 01:00 UTC (shadow pipeline) or 12:30 UTC (daily run) is the previous day's 48 settlement periods.
 
 **Spike classifier (config-OFF).** A binary HGBR trained to flag days with SSP > £150. Evaluated: Brier score 0.1241 (vs base-rate Brier 0.1224; near-zero skill), average precision 0.332. The classifier is built and its gate results verified (classifier-gated spike widening passes G1/G2/G3 at τ = 0.05, adding +11.0 pp coverage on elevated flagged settlement periods in the afternoon block, SP 33–40, with δ_hi = £93.49). Held config-OFF pending wind-skew resolution: the classifier trains on Carbon Intensity wind actuals but is served BMRS WINDFOR forecasts, making it over-flag on low-wind days.
 

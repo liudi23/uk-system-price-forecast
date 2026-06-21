@@ -97,7 +97,7 @@ st.sidebar.caption(
     f"📅 Latest settled data: **{_latest_date}**\n\n"
     f"📆 Daily run: **{_LAST_PIPELINE_RUN}**\n\n"
     f"🔄 {_pipeline_line}\n\n"
-    "**Daily** (~12:30 UTC): retrain · H+1 + H+2 day-ahead forecasts · PI calibration applied.\n\n"
+    "**Daily** (~12:30 UTC): H+1 + H+2 day-ahead forecasts · PI calibration applied · weekly model retrain.\n\n"
     "**Intraday**: Kalman-corrected H+1 updates as each SP settles throughout the day."
 )
 st.sidebar.divider()
@@ -157,7 +157,7 @@ if PI_CAL_JSON.exists():
     _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
 st.info(
     "**UK System Sell Price (SSP) forecast** — two-stage level–shape model "
-    "(gradient-boosted HGBR), retrained daily on a rolling 3-year, CPI-adjusted window · "
+    "(gradient-boosted HGBR), retrained weekly on a rolling 3-year, CPI-adjusted window · "
     "zero-leakage (every feature lagged ≥ its forecast horizon)"
 )
 

@@ -1,7 +1,7 @@
 # Workflow Consolidation Design: 3 → 2 Workflows
 
 **Date:** 2026-06-20  
-**Status:** DESIGN PASS — no implementation  
+**Status:** COMPLETED — weekly-retrain consolidation validated and adopted as the production cadence (CI retirement of `daily_pipeline.yml` tracked as a separate change)  
 **Goal:** Fold `daily_pipeline.yml` into `early_forecast.yml`, leaving two workflows: one consolidated forecast+retrain and the unchanged intraday updater.
 
 ---
