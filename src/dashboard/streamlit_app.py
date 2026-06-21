@@ -161,7 +161,9 @@ st.info(
     "zero-leakage (every feature lagged ≥ its forecast horizon)"
 )
 
-# Compact 2-column methodology reference (tight line spacing, caption-sized text).
+# Compact methodology reference (tight line spacing, caption-sized text).
+# Five short items in a balanced 2-col grid; the long nowcast item spans full
+# width underneath so it doesn't force one column to overrun the other.
 _meth_style = "font-size:0.86em; line-height:1.35; margin:0"
 _meth_item  = "margin:0 0 5px 0"
 _meth_left, _meth_right = st.columns(2)
@@ -183,14 +185,19 @@ with _meth_right:
         f"80%-band coverage <b>{_pi_cov_str}</b> (119-day walk-forward)</p>"
         f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£27.39/MWh</b> (119 days · 4 seasons) · "
         f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}</p>"
-        f"<p style='{_meth_item}'>· <b>Intraday nowcast</b> (H+1 / H+2 / H+3, ≈30–90 min): "
-        f"persistence point forecast + 80% empirical P10/P90 bands (18-month trailing window, "
-        f"NP/EN regime-aware), updated every 30 min as SPs settle. "
-        f"Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
-        f"under 90 min); the day-ahead model takes over from ~H+4.</p>"
         f"</div>",
         unsafe_allow_html=True,
     )
+st.markdown(
+    f"<div style='{_meth_style}'>"
+    f"<p style='{_meth_item}'>· <b>Intraday nowcast</b> (H+1 / H+2 / H+3, ≈30–90 min): "
+    f"persistence point forecast + 80% empirical P10/P90 bands (18-month trailing window, "
+    f"NP/EN regime-aware), updated every 30 min as SPs settle. "
+    f"Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
+    f"under 90 min); the day-ahead model takes over from ~H+4.</p>"
+    f"</div>",
+    unsafe_allow_html=True,
+)
 
 if _ps["health"] in ("stale", "daily_missed"):
     st.error(_ps["health_msg"])
