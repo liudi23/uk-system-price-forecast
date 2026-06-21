@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from data.build_dataset import add_datetime, derive_features, validate
+from data.build_dataset import add_datetime, derive_base_columns, validate
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +32,8 @@ def make_df(n_days=2, periods=48):
                 "net_imbalance_volume": -100.0 + p,
                 "sell_price_adjustment": 0.0,
                 "buy_price_adjustment": 0.0,
+                "price_derivation_code": "N",
+                "replacement_price": None,
             })
     df = pd.DataFrame(rows)
     df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
@@ -97,24 +99,25 @@ class TestAddDatetime:
 
 
 # ---------------------------------------------------------------------------
-# derive_features()
+# derive_base_columns()
 # ---------------------------------------------------------------------------
 
-class TestDeriveFeatures:
-    def test_mid_price_is_average(self):
-        df = make_df(n_days=1, periods=1)
-        df["ssp"] = 80.0
-        df["sbp"] = 100.0
-        result = derive_features(df)
-        assert result.loc[0, "mid_price"] == pytest.approx(90.0)
+class TestDeriveBaseColumns:
+    def test_price_derivation_code_P_is_binary(self):
+        df = make_df(n_days=1, periods=4)
+        df.loc[df["settlement_period"] <= 2, "price_derivation_code"] = "P"
+        result = derive_base_columns(df)
+        assert set(result["price_derivation_code_P"].unique()).issubset({0, 1})
+        assert result.loc[result["settlement_period"] <= 2, "price_derivation_code_P"].eq(1).all()
+        assert result.loc[result["settlement_period"] > 2, "price_derivation_code_P"].eq(0).all()
 
     def test_abs_imbalance_is_positive(self):
         df = make_df(n_days=1, periods=48)
-        result = derive_features(df)
+        result = derive_base_columns(df)
         assert (result["abs_imbalance_volume"] >= 0).all()
 
     def test_abs_imbalance_matches_niv(self):
         df = make_df(n_days=1, periods=48)
-        result = derive_features(df)
+        result = derive_base_columns(df)
         expected = result["net_imbalance_volume"].abs()
         pd.testing.assert_series_equal(result["abs_imbalance_volume"], expected, check_names=False)
