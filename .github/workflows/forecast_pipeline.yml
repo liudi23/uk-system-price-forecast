@@ -219,9 +219,22 @@ jobs:
             model_assets/next_day_forecast_phase3.csv \
             model_assets/day2_forecast_phase3.csv \
             model_assets/kalman_state.json 2>/dev/null || true
-          # Remove the non-shadow daily forecast (not yet in git; shadow copy already saved)
+
           TODAY="${{ steps.date.outputs.today }}"
-          rm -f "model_assets/forecasts/forecast_phase3_${TODAY}.csv"
+
+          # H+1 archive: restore to the git-committed production version.
+          # The shadow run rewrites this file; we must NOT commit that rewrite or
+          # delete it — shadow_comparison.py needs the production archive tomorrow.
+          # git checkout -- restores the committed version; fall back to rm -f when
+          # the file was never committed (cold start, no prior daily run).
+          git checkout -- "model_assets/forecasts/forecast_phase3_${TODAY}.csv" 2>/dev/null || \
+              rm -f "model_assets/forecasts/forecast_phase3_${TODAY}.csv"
+
+          # H+2 archive: forecast_phase3.py also writes forecast_phase3_{TODAY+1}.csv
+          # as a side-effect.  Remove it — daily_pipeline.yml is the authoritative
+          # source for H+2 archives and will commit its own version at 12:30 UTC.
+          TOMORROW=$(date -u -d '+1 day' +%Y-%m-%d)
+          rm -f "model_assets/forecasts/forecast_phase3_${TOMORROW}.csv"
 
       # ── Shadow vs production daily comparison ────────────────────────────
       # Compares YESTERDAY's shadow and production archive files against actuals.
