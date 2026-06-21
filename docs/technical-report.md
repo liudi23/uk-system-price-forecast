@@ -1,7 +1,7 @@
 # UK Electricity System Sell Price Forecasting System: Technical Report
 
 **Branch:** streamlit-data  
-**Date:** 2026-06-18  
+**Date:** 2026-06-21  
 **Status:** Live production system  
 
 ---
@@ -184,9 +184,19 @@ A binary HGBR classifier is trained to predict `P(≥3 negative-price SPs tomorr
 
 **Walk-forward MAE (primary, 119-day WF window, 4 folds):** £28.96 (StaticBase, from the corrector backtest). This is the fair comparison figure — it covers summer, autumn, winter, and spring folds.
 
-**7-day test MAE:** £34.31 (RMSE £43.35, sMAPE 56.0%, n=336 SP-rows). This figure is inflated by the June 4, 2026 extreme renewable oversupply event, which drove midday SSP to approximately −£70/MWh and produced 10 negative-price SPs in a single day. The level model's 7-day MAE of £20.16/day shows the decomposition is working structurally, but the shape model cannot anticipate a once-in-six-months dispatch extreme. WF MAE (£28.96) is the primary performance metric.
+**7-day test MAE: £32.03** (RMSE £42.46, n=336 SP-rows). Source: `model_assets/phase3_metrics.json`. This figure is inflated by the June 4, 2026 extreme renewable oversupply event, which drove midday SSP to approximately −£70/MWh and produced 10 negative-price SPs in a single day. WF MAE (£28.96) is the primary performance metric.
 
-**Seasonal folds (KalmanCorrector, 119-day WF):**
+> **sMAPE caveat.** The sMAPE on this 7-day window is 49.61%. SSP frequently touches near-zero or negative values (as in the June 4 event), which inflates the sMAPE denominator term `(|actual| + |predicted|)/2` toward zero and causes the ratio to explode. sMAPE is not a reliable metric for this price series; it is reported for completeness only. MAE and RMSE are the operative accuracy figures.
+
+Decomposition metrics for the same 7-day window:
+
+| Metric | Value |
+|--------|-------|
+| Level MAE | £18.41/day |
+| Shape correlation (mean) | 0.4275 |
+| Peak timing MAE | 6.71 SPs |
+
+**Seasonal folds (KalmanCorrector, 119-day WF corrector backtest):**
 
 | Fold | MAE |
 |------|-----|
@@ -202,7 +212,7 @@ A binary HGBR classifier is trained to predict `P(≥3 negative-price SPs tomorr
 | Naive (t−48, last observed same SP) | £36.34 |
 | Seasonal naive (t−336, same time last week) | £29.40 |
 | Rolling mean 24h | £26.78 |
-| Phase 3 model (7-day test) | £34.31 |
+| Phase 3 model (7-day test) | £32.03 |
 
 Phase 3 underperforms rolling mean 24h on the 7-day test window due to the June 4 extreme event. The WF corrector backtest (£28.96 vs seasonal naive £29.40) gives the fairer comparison across 119 diverse days.
 
@@ -254,7 +264,7 @@ Summary statistics: median δ = £22.75; P25/P75 = £19.41/£28.99; global refer
 
 The calibration bug that shipped raw 38% bands prior to 2026-06-17 was closed by adding a runtime assertion `_assert_pi_calibrated()` that checks the spread characteristics of the output forecast CSV before committing. The guard raises `RuntimeError` if the standard deviation of `q90−q10` matches the uncalibrated band pattern. A secondary sentinel in the walk-forward pipeline raises `RuntimeError` if `walk_forward_predictions.csv` is present but `pi_calibration_v1.json` is absent — the calibration step cannot be silently skipped.
 
-The test suite covers a 6-scenario (A–F) matrix of PI guard conditions, including the exact failure mode that occurred in production.
+The test suite covers an 8-scenario (A–H) matrix of PI guard conditions, including the exact failure mode that occurred in production.
 
 ### 5.5 Live Coverage
 
@@ -541,6 +551,8 @@ The prototype was not shipped. It is documented here to show that the evidence a
 
 The asymmetry reflects the physical price formation mechanism: NP (normal auction) is right-skewed because imbalance can spike upward when reserve is exhausted; EN (formula) is left-skewed because the formula price acts as a ceiling reference and oversupply drives prices down, not up.
 
+**Day-boundary rollover.** When the current time falls within the last few settlement periods of the trading day (SPs 46–48, i.e. after 22:30), the h+2 and h+3 persistence targets fall on the next calendar day. In these cases the persistence point forecast is still the last confirmed SP, but the denominating day changes: SP 48 + h becomes SP (h−2) of tomorrow. The nowcast panel handles this rollover by tracking the absolute SP index modulo 48 and looking up the appropriate regime bands by horizon (h+1/h+2/h+3), not by absolute SP. The regime flag (NP vs EN) is inherited from the last confirmed SP's price-derivation code; no next-day forecast CSV is required for the nowcast to function across the day boundary.
+
 **Live coverage (2026, N≈3,213–3,215 SP pairs):** h+1 = 79.5%, h+2 = 79.8%, h+3 = 79.4% — all at or near the 80% target, within the 🟡 watch threshold.
 
 Bands are refreshed monthly. The current version was generated 2026-06-18 and is 0 days old.
@@ -582,17 +594,78 @@ The two diverge most visibly when a regime transition is occurring — for examp
 
 ### 9.1 Test Suite
 
-| File | Functions | What it covers |
-|------|-----------|----------------|
+| File | Tests | What it covers |
+|------|-------|----------------|
 | `tests/test_correctors.py` | 22 | AlphaCorrector byte-identical to inline block; Kalman bias tracking convergence; daily reset; PI widening monotonicity with P |
 | `tests/test_kalman_corrector.py` | 20 | Kalman state evolution, horizon decay, edge cases (cold-start, z-guardrail trigger, idempotency guard, daily reset across forecast dates) |
-| `tests/test_pi_calibration_guard.py` | 13 | 6-scenario (A–F) matrix: (A) no WF sentinel → no guard; (B) WF present, no PI JSON → RuntimeError; (C) calibrated → pass; (D) uncalibrated bands → RuntimeError; and two additional edge cases (E–F) |
-| `tests/test_build_dataset.py` | 11 | Dataset cleaning, Tukey winsorisation, incremental append safety |
-| **Total** | **66** | Full coverage of the corrector interface, Kalman filter scenarios, PI guard scenarios, and dataset integrity |
+| `tests/test_pi_calibration_guard.py` | 13 | 8-scenario (A–H) matrix: WF-sentinel absent/present, PI JSON absent/malformed/stale, calibrated bands, and boundary cases on the unsettled-SP count threshold |
+| `tests/test_pipeline_status.py` | 12 | `_compute_pipeline_status()` freshness and self-consistency checks: unknown/missed/stale/ok states, Rule A (Kalman n > 0 but no `is_actual` rows) and Rule B (CSV ahead of Kalman state) |
+| `tests/test_nowcast_rollover.py` | 20 | Day-boundary rollover for SPs 46/47/48; band lookup by horizon not absolute SP; no next-day CSV required |
+| `tests/test_build_dataset.py` | 11 | `validate()`, `add_datetime()`, and `derive_base_columns()`: duplicate dropping, missing-period warning, datetime offsets, price-derivation encoding, imbalance volume |
+| **Total** | **98** | **98 collected / 98 passed** |
 
-Tests run in the GitHub Actions CI pipeline on every push to `streamlit-data`. All 66 functions pass as of 2026-06-18.
+**CI gate:** `.github/workflows/tests.yml` runs `pytest -q` on every push and pull-request to `streamlit-data`. Any collection error (such as the `ImportError` on `derive_features` that silently disabled all 98 tests before 2026-06-21) or test failure fails the build immediately. Install is `numpy pandas pytest` only — no pipeline dependencies — so the gate completes in under 2 minutes including runner spin-up.
 
-### 9.2 Production Safety Mechanisms Summary
+### 9.2 Production Reliability
+
+This section documents the operational hardening applied as the system moved from a one-shot research pipeline to an always-on automated service. Each item traces from a discovered failure to its fix and the general lesson.
+
+**Shadow archive management — two bugs, one commit (`b824bdb`).**
+
+*Bug 1 — production archive deleted by shadow run.* The "Restore production forecast files" step in `forecast_pipeline.yml` originally used `rm -f` to clean up the H+1 archive after copying it to the shadow name. Because the subsequent `git add "model_assets/forecasts/"` staged that deletion, every shadow run silently removed the production archive from the branch. `shadow_comparison.py` the next morning found no production archive and the `log.csv` row was never written. Fix: replaced `rm -f` with `git checkout -- "<file>" 2>/dev/null || rm -f "<file>"`. The `git checkout --` path restores the committed production version; `rm -f` fires only as a cold-start fallback when the file was never committed.
+
+*Bug 2 — H+2 archive leaking into shadow commits.* `forecast_phase3.py` writes two archives per run: `forecast_phase3_{TODAY}.csv` (H+1) and `forecast_phase3_{TOMORROW}.csv` (H+2). The shadow pipeline cleaned up H+1 but not H+2, so the H+2 file leaked into shadow commits as an apparent production file, polluting the archive with unreviewed data from a non-authoritative run. Fix: explicitly remove `forecast_phase3_{TOMORROW}.csv` in the restore step — `daily_pipeline.yml` is the sole authoritative source for H+2 archives.
+
+*General lesson: assert the property at the point of damage.* Both bugs were invisible locally; they only manifested in the GitHub Actions commit context. The fix was not adding more unit tests — it was auditing each `git add` scope and verifying that the committed diff matched intent after a real workflow run. For any pipeline that commits back to the repository, the correct verification is to inspect the actual `git diff --staged` content before the commit, not to infer it from the code path.
+
+**Push race prevention — autostash and retry loop.**
+
+All three committing workflows (daily, intraday, shadow) can fire concurrently (a daily retrain at 12:30 UTC overlapping with an intraday update; two concurrent workflow dispatches). Each uses an identical three-attempt retry with autostash:
+
+```bash
+for _i in 1 2 3; do
+  git pull --rebase --autostash origin streamlit-data && git push && break
+  [ "$_i" -lt 3 ] && sleep "$_i"
+done
+```
+
+`--autostash` stashes any residual working-tree changes (e.g. partially written shadow files) before the rebase and restores them after. The `concurrency: group: streamlit-data-commit` block serialises within a single workflow type; the retry handles races across workflow types.
+
+**Pipeline health monitoring — freshness model and self-consistency assertions.**
+
+`src/dashboard/_pipeline_health.py` provides `_compute_pipeline_status()`, a unified freshness check that the Streamlit dashboard calls on every render. It classifies the pipeline into one of four states: `"ok"`, `"stale"`, `"daily_missed"`, or `"unknown"`. Key thresholds (calibrated against the observed intraday inter-run gap distribution, P95 ≈ 304 min, same-day max ≈ 350 min):
+
+- **Staleness threshold:** 360 minutes. A Kalman state file that has not updated in > 6 hours during the active window (07:00–22:00 UTC) is flagged stale.
+- **Daily-missed threshold:** if `forecast_date < today` at or after 14:00 UTC, the daily retrain is assumed to have failed.
+
+Beyond freshness, the function applies two self-consistency assertions that detect partial failures invisible to simple timestamp checks:
+
+- **Rule A:** Kalman state reports `n_settled > 0` but the forecast CSV contains no `is_actual` rows → the intraday commit wrote the state file but failed before updating the forecast CSV. Status: stale.
+- **Rule B:** Last actual SP in the CSV exceeds `kalman_n_settled + 3` → the CSV has advanced further than the Kalman state, meaning the state file is from an earlier run. Tolerance: 3 SPs (`_RULE_B_TOL`).
+
+These assertions are tested in `tests/test_pipeline_status.py` (12 tests), which constructs synthetic JSON + CSV fixtures and verifies that each rule fires on the correct inputs. The lesson: checking a timestamp tells you the process ran; checking internal consistency tells you the process completed correctly.
+
+**Streamlit Cloud import-path fix.**
+
+The original `streamlit_app.py` imported `_pipeline_health` as:
+
+```python
+from src.dashboard._pipeline_health import _compute_pipeline_status
+```
+
+Streamlit Cloud runs `streamlit run src/dashboard/streamlit_app.py`, which inserts `src/dashboard/` as `sys.path[0]` — not the repo root. The `src.dashboard` qualified path resolved locally but failed on every Cloud deployment with `ModuleNotFoundError`. Fix: bare sibling import `from _pipeline_health import _compute_pipeline_status`, which resolves correctly in all three contexts (Streamlit Cloud, local `streamlit run`, and `cd src/dashboard && python`). The lesson: test imports in the actual launch context, not just `pytest` or `python -c`.
+
+**External cron-job.org triggers replacing unreliable GitHub-native scheduling.**
+
+GitHub's free-tier `schedule:` jobs can be delayed by tens of minutes to hours during high-CI-load periods. For the intraday pipeline (which updates every 30 minutes), a 45-minute delay would cause a 1.5-SP gap in the Kalman state and a visible staleness warning on the dashboard. The fix uses **cron-job.org** to send a `repository_dispatch` event at the scheduled time; the GitHub `schedule:` entry is retained as a fallback:
+
+- `intraday_update.yml`: cron-job.org (`types: [intraday-update]`) is **primary**; `schedule: */30 * * * *` is fallback.
+- `forecast_pipeline.yml` (shadow): cron-job.org (`types: [early-forecast]`) is **primary**; `schedule: 0 1 * * *` is fallback.
+- `daily_pipeline.yml`: GitHub native `schedule: 30 12 * * *` only (no external dispatch). The daily retrain is more tolerant of timing jitter than the intraday pipeline.
+
+The dispatch token for cron-job.org is stored as a repository secret (`EARLY_FORECAST_PAT`) and is the same personal access token used for the early-forecast external dispatch documented in §3.1.
+
+### 9.3 Production Safety Mechanisms Summary
 
 Five safety mechanisms operate in production, each closing a specific failure mode:
 
@@ -611,7 +684,7 @@ Five safety mechanisms operate in production, each closing a specific failure mo
 | Metric | Value | Window |
 |--------|-------|--------|
 | WF MAE (primary) | £28.96 | 119-day WF, 4 seasonal folds |
-| 7-day test MAE | £34.31 | Includes Jun 4 extreme event |
+| 7-day test MAE | £32.03 | Includes Jun 4 extreme event |
 | Seasonal naive MAE (7-day) | £29.40 | Same 7-day window |
 | PI coverage (WF, calibrated) | 79.82% | 119 days, 5,709 SP-rows |
 | PI coverage (live, 30 days) | 66.0% | N=1,418, spring/summer only |
@@ -658,6 +731,7 @@ A weekly monitoring report (`reports/monitoring/2026-W25.md`, generated by `src/
 | Season-conditioned δ(sp, season) | Full autumn 2026 season in live data | ~Jan 2027 |
 | Online learning FALLBACK (warm-start HGBR) | Kalman NIS shows structural misspecification across ≥4 seasonal folds | Not before 2027 |
 | SP-level demand forecast feature (BMRS TSDF) | BMRS TSDF boundary='N' consistently available in pipeline | Ongoing |
+| Shadow pipeline cut-over (`forecast_pipeline.yml` → production) | 2-week shadow validation metrics pass (|mae_delta| ≤ £0.50 · |cov_delta| ≤ 3pp for ≥14 consecutive days); 01:00 UTC early-forecast replaces 12:30 UTC retrain as primary daily run | ~Jul 2026 |
 
 Two time-critical gates are in the monitoring report: the H+3 nowcast archive gate (accumulating 2/6 months) and the Step-3 autumn gate (1/2 autumns). Both require calendar time — no engineering action can accelerate them.
 
