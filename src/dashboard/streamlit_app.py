@@ -158,22 +158,39 @@ if PI_CAL_JSON.exists():
 st.info(
     "**UK System Sell Price (SSP) forecast** — two-stage level–shape model "
     "(gradient-boosted HGBR), retrained daily on a rolling 3-year, CPI-adjusted window · "
-    "zero-leakage (every feature lagged ≥ its forecast horizon)\n\n"
-    "· **Stage 1 — level:** daily-mean SSP (P10 / P50 / P90)\n\n"
-    "· **Stage 2 — shape:** per-settlement-period deviation · "
-    "H+1 head uses lags ≥ 48 SPs · H+2 head uses lags ≥ 96 SPs\n\n"
-    "· **Intraday correction:** hourly scalar Kalman bias correction "
-    "(horizon decay γ = 0.966) as settled prices arrive\n\n"
-    f"· **Calibrated uncertainty:** split-conformal per-SP δ lifts "
-    f"80%-band coverage **{_pi_cov_str}** (119-day walk-forward)\n\n"
-    f"· **Accuracy:** WF MAE **£27.39/MWh** (119 days · 4 seasons) · "
-    f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}\n\n"
-    "· **Intraday nowcast** (H+1 / H+2 / H+3, ≈30–90 min): persistence point forecast + "
-    "80% empirical P10/P90 bands (18-month trailing window, NP/EN regime-aware), "
-    "updated every 30 min as SPs settle. "
-    "Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
-    "under 90 min); the day-ahead model takes over from ~H+4."
+    "zero-leakage (every feature lagged ≥ its forecast horizon)"
 )
+
+# Compact 2-column methodology reference (tight line spacing, caption-sized text).
+_meth_style = "font-size:0.86em; line-height:1.35; margin:0"
+_meth_item  = "margin:0 0 5px 0"
+_meth_left, _meth_right = st.columns(2)
+with _meth_left:
+    st.markdown(
+        f"<div style='{_meth_style}'>"
+        f"<p style='{_meth_item}'>· <b>Stage 1 — level:</b> daily-mean SSP (P10 / P50 / P90)</p>"
+        f"<p style='{_meth_item}'>· <b>Stage 2 — shape:</b> per-settlement-period deviation · "
+        f"H+1 head uses lags ≥ 48 SPs · H+2 head uses lags ≥ 96 SPs</p>"
+        f"<p style='{_meth_item}'>· <b>Intraday correction:</b> hourly scalar Kalman bias correction "
+        f"(horizon decay γ = 0.966) as settled prices arrive</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+with _meth_right:
+    st.markdown(
+        f"<div style='{_meth_style}'>"
+        f"<p style='{_meth_item}'>· <b>Calibrated uncertainty:</b> split-conformal per-SP δ lifts "
+        f"80%-band coverage <b>{_pi_cov_str}</b> (119-day walk-forward)</p>"
+        f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£27.39/MWh</b> (119 days · 4 seasons) · "
+        f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}</p>"
+        f"<p style='{_meth_item}'>· <b>Intraday nowcast</b> (H+1 / H+2 / H+3, ≈30–90 min): "
+        f"persistence point forecast + 80% empirical P10/P90 bands (18-month trailing window, "
+        f"NP/EN regime-aware), updated every 30 min as SPs settle. "
+        f"Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
+        f"under 90 min); the day-ahead model takes over from ~H+4.</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 if _ps["health"] in ("stale", "daily_missed"):
     st.error(_ps["health_msg"])
