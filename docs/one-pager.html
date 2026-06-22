@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SSP Forecasting — One-Page Summary</title>
+<style>
+  @page { size: A4; margin: 11mm 13mm 9mm 13mm; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: #1a1a1a; background: #fdfdfd;
+    font-size: 9.1pt; line-height: 1.32; margin: 0;
+  }
+  h1 { font-size: 15pt; margin: 0 0 1px 0; letter-spacing: -0.2px; }
+  .sub { color: #666; font-size: 8.2pt; margin: 0 0 6px 0; }
+  h2 {
+    font-size: 9.7pt; text-transform: uppercase; letter-spacing: 0.4px;
+    color: #0b3d5c; margin: 8px 0 3px 0;
+    border-bottom: 1px solid #d9d9d9; padding-bottom: 1px;
+  }
+  p { margin: 3px 0; }
+  ul { margin: 3px 0 3px 0; padding-left: 16px; }
+  li { margin: 1px 0; }
+  b, strong { color: #0b0b0b; }
+  code { font-family: Menlo, Monaco, Consolas, monospace; font-size: 8.2pt; background: #f1f1f1; padding: 0 2px; border-radius: 2px; }
+  a { color: #0b6e99; text-decoration: none; }
+  em { color: #555; }
+
+  /* headline metric strip */
+  .strip { display: flex; gap: 6px; margin: 6px 0 2px 0; }
+  .m { flex: 1; border: 1px solid #e2e2e2; border-top: 2px solid #0b3d5c;
+       border-radius: 3px; padding: 4px 6px; background: #fff; }
+  .m .v { font-size: 12.5pt; font-weight: 700; color: #0b3d5c; line-height: 1.1; }
+  .m .l { font-size: 7.0pt; color: #666; text-transform: uppercase; letter-spacing: 0.3px; }
+
+  table { border-collapse: collapse; width: 100%; margin: 4px 0; font-size: 8.7pt; }
+  thead th { text-align: left; border-top: 1px solid #1a1a1a; border-bottom: 1px solid #1a1a1a; padding: 2px 6px; }
+  td { padding: 1.5px 6px; border-bottom: 1px solid #ececec; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 1px solid #1a1a1a; }
+  .note { font-size: 8.2pt; color: #444; margin: 3px 0; }
+  .foot { margin-top: 7px; border-top: 1px solid #d9d9d9; padding-top: 3px; font-size: 8.4pt; }
+</style>
+</head>
+<body>
+
+<h1>UK System Sell Price (SSP) Forecasting — One-Page Summary</h1>
+<p class="sub">Companion to <code>docs/technical-report.md</code> · all figures sourced from that report</p>
+
+<p><b>Objective.</b> Probabilistic day-ahead + intraday forecast of the UK System Sell Price across all 48 half-hourly settlement periods (SPs), with calibrated 80% prediction intervals (PIs).</p>
+
+<div class="strip">
+  <div class="m"><div class="v">£28.96</div><div class="l">WF MAE · StaticBase</div></div>
+  <div class="m"><div class="v">£27.68</div><div class="l">WF MAE · Kalman</div></div>
+  <div class="m"><div class="v">38.0→79.8%</div><div class="l">80% PI coverage</div></div>
+  <div class="m"><div class="v">£32.03</div><div class="l">7-day holdout MAE</div></div>
+  <div class="m"><div class="v">0.4275</div><div class="l">Shape corr (mean)</div></div>
+</div>
+
+<h2>Model — two-stage level–shape HGBR</h2>
+<ul>
+  <li><b>Stage 1 (level):</b> daily price level as quantiles P10/P50/P90 — pinball-loss <code>HistGradientBoostingRegressor</code>, 84 features, CPIH-deflated targets.</li>
+  <li><b>Stage 2 (shape):</b> per-SP deviation from the daily level (separate H+1 and H+2 heads). Day-ahead SP forecast = <code>q50_level + q50_shape</code>; bands from level quantiles + per-SP conformal widening.</li>
+  <li><b>Training:</b> weekly age-gated retrain on a rolling 3-year, CPIH-adjusted window; strict zero-leakage — every feature references data before day D begins, valid for all 48 day-ahead SPs.</li>
+</ul>
+
+<h2>Intraday correction — every 30 min</h2>
+<p>Inference-only (frozen HGBR): fetch newly-settled SPs from Elexon BMRS → splice actuals into the live curve → scalar Kalman level-bias <code>x̂</code> (random-walk prior). Correction decays with horizon: <code>correction(h) = x̂·γ^h</code>, <b>γ = 0.966</b>/SP (halves by ≈SP+20). Uncertainty propagates to the P10–P90 bands via <code>±1.28·√P·γ^h</code> — widening when few SPs have settled, shrinking as posterior variance <code>P</code> falls. Kalman adds <b>+4.5 pp</b> PI coverage over the static base.</p>
+
+<h2>Calibrated uncertainty — split-conformal per-SP δ</h2>
+<p>Per settlement position, <code>δ(sp)</code> = 80th-percentile conformity score over the calibration set; bands widened by <code>δ(sp)</code>. Lifts 80%-band coverage <b>37.99% → 79.82%</b> in-sample over the 119-day, 4-fold walk-forward (5,709 SP-rows) — a calibration gain, not a better point model. <em>Live DA coverage 66.0% over 30 spring/summer days (N=1,418), under active monitoring.</em></p>
+
+<h2>Short-horizon nowcast — persistence</h2>
+<p>SSP is near-AR(1) (ACF lag-1 = 0.828), so persistence (<code>SP[t] = SP[t−1]</code>) is the Bayes-optimal h+1 predictor. DA+Kalman adds no value through ≈h+4 and only overtakes persistence at ≈h+4.5 (≈5–6% better by h+5); an HGBR nowcast prototype was 17% worse than persistence at h+1 and was not shipped. Production serves persistence for h+1–h+3 with regime-asymmetric empirical 80% bands (live coverage 79.4–79.8%).</p>
+
+<h2>Results</h2>
+<table>
+  <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>WF MAE — StaticBase (119 days, 4 seasonal folds)</td><td>£28.96/MWh</td></tr>
+    <tr><td>WF MAE — deployed Kalman corrector</td><td>£27.68/MWh</td></tr>
+    <tr><td>7-day holdout MAE (RMSE £42.46, n=336)</td><td>£32.03/MWh</td></tr>
+    <tr><td>Stage-1 level MAE</td><td>£18.41/day</td></tr>
+    <tr><td>Stage-2 shape correlation (mean)</td><td>0.4275</td></tr>
+    <tr><td>Peak-timing MAE</td><td>6.71 SPs</td></tr>
+    <tr><td>80% PI coverage (in-sample WF)</td><td>37.99% → 79.82%</td></tr>
+  </tbody>
+</table>
+<p class="note">Seasonal WF MAE (Kalman): Summer £25.77 · Autumn £30.50 · Winter £20.27 · Spring £34.28. &nbsp; Baselines: naive t−48 £36.34 · seasonal naive t−336 £29.40 · rolling-mean-24h £26.78.</p>
+
+<div class="foot">
+<b>Status.</b> Day-ahead 48-SP profile published early (~01:00 UTC) to a live Streamlit dashboard; intraday Kalman layer updates every 30 min. CI-tested (pytest on push). The early-publish pipeline is validating against the prior 12:30 UTC daily pipeline before full cut-over. &nbsp; <b>Live dashboard:</b> <a href="https://uk-system-price-forecast.streamlit.app/">uk-system-price-forecast.streamlit.app</a>
+</div>
+
+</body>
+</html>
