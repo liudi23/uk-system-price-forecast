@@ -1,21 +1,31 @@
-name: Forecast Pipeline — SHADOW (01:00 UTC)
+name: Forecast Pipeline — EARLY PUBLISH (01:00 UTC)
 
-# SHADOW MODE: writes *_shadow.csv outputs only — does NOT touch production
-# forecast files (next_day_forecast_phase3.csv, day2_forecast_phase3.csv,
-# kalman_state.json) or production model PKLs.
+# EARLY-PUBLISH MODE (soft cutover): publishes the morning forecast to the
+# production files the dashboard reads (next_day_forecast_phase3.csv,
+# day2_forecast_phase3.csv) AND keeps writing the *_shadow.csv copies + the
+# daily-vs-early comparison log so validation keeps running.
 #
-# daily_pipeline.yml stays active until the 2-week shadow validation period
-# passes (see docs/workflow-consolidation-design.md §9).
+# Does NOT touch kalman_state.json (intraday-owned, restored each run) or
+# production model PKLs (still shadow-isolated; daily_pipeline.yml does the
+# weekly-gated retrain).
 #
-# Shadow files committed:
+# daily_pipeline.yml stays active at 12:30 UTC as the fallback, model
+# refresher, and daily-vs-early comparison control. It is retired only after
+# ~2 weeks of clean log rows (final cutover — see
+# docs/workflow-consolidation-design.md §9).
+#
+# Committed by this pipeline:
+#   model_assets/next_day_forecast_phase3.csv   (PUBLISHED — live dashboard)
+#   model_assets/day2_forecast_phase3.csv       (PUBLISHED — live dashboard)
 #   model_assets/next_day_forecast_shadow.csv
 #   model_assets/day2_forecast_shadow.csv
 #   model_assets/forecasts/forecast_phase3_YYYY-MM-DD_shadow.csv
-#   model_assets/pi_calibration_shadow.json    (only when age gate fires)
-#   model_assets/phase3_metrics_shadow.json    (only when age gate fires)
+#   reports/shadow_validation/log.csv
+#   *_shadow model artifacts                    (only when the age gate fires)
 #
-# Data pipeline outputs ARE committed as production (not shadow) since they
-# are non-model artifacts — features_recent.csv, dataset_5yr.csv, streamlit_app.py.
+# NOT committed here (owned by daily_pipeline.yml, the 12:30 fallback):
+#   dataset_5yr.csv, features_recent.csv, streamlit_app.py, and the prod dated
+#   archive forecast_phase3_YYYY-MM-DD.csv (kept as the comparison control).
 #
 # External dispatch trigger (same as early_forecast.yml):
 #   POST https://api.github.com/repos/liudi23/uk-system-price-forecast/dispatches
@@ -204,7 +214,7 @@ jobs:
       - name: Run early H+1 and H+2 forecast
         run: python src/models/forecast_phase3.py
 
-      # ── Shadow isolation: copy forecast outputs, restore production ────────
+      # ── Copy forecast outputs to shadow names (comparison inputs) ──────────
       - name: Copy forecast outputs to shadow names
         run: |
           TODAY="${{ steps.date.outputs.today }}"
@@ -213,12 +223,12 @@ jobs:
           DATED="model_assets/forecasts/forecast_phase3_${TODAY}.csv"
           [ -f "$DATED" ] && cp "$DATED" "model_assets/forecasts/forecast_phase3_${TODAY}_shadow.csv"
 
-      - name: Restore production forecast files (shadow isolation)
+      - name: Restore Kalman state; keep prod dated archive owned by daily_pipeline
         run: |
-          git checkout -- \
-            model_assets/next_day_forecast_phase3.csv \
-            model_assets/day2_forecast_phase3.csv \
-            model_assets/kalman_state.json 2>/dev/null || true
+          # next_day_forecast_phase3.csv + day2_forecast_phase3.csv are now
+          # PUBLISHED (committed below) — this pipeline is the morning publisher.
+          # kalman_state.json stays owned by the intraday pipeline, so restore it.
+          git checkout -- model_assets/kalman_state.json 2>/dev/null || true
 
           TODAY="${{ steps.date.outputs.today }}"
 
@@ -243,17 +253,22 @@ jobs:
       - name: Append shadow vs production comparison to log
         run: python src/monitoring/shadow_comparison.py
 
-      # ── Commit shadow outputs ONLY (no production data files) ────────────
-      # dataset_5yr.csv / features_recent.csv / streamlit_app.py are NOT committed
-      # here — daily_pipeline.yml is the sole owner of those files during the
-      # shadow period.  Shadow-only commit keeps daily_pipeline as an untouched
-      # control for the 2-week comparison.
-      - name: Commit and push shadow outputs
+      # ── Commit published forecast + shadow outputs ───────────────────────
+      # PUBLISHES next_day/day2 (live dashboard files) and writes the shadow
+      # copies + dated shadow archive + comparison log so the daily-vs-early
+      # comparison keeps running.  dataset_5yr.csv / features_recent.csv /
+      # streamlit_app.py and the prod dated archive remain owned by
+      # daily_pipeline.yml (the 12:30 fallback / comparison control).
+      - name: Commit and push published + shadow outputs
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Shadow forecast files
+          # Published production forecast files (live dashboard reads these)
+          git add model_assets/next_day_forecast_phase3.csv \
+                  model_assets/day2_forecast_phase3.csv
+
+          # Shadow forecast files + dated archives
           git add model_assets/next_day_forecast_shadow.csv \
                   model_assets/day2_forecast_shadow.csv \
                   "model_assets/forecasts/"
@@ -275,7 +290,7 @@ jobs:
                   model_assets/phase3_shape_importance_shadow.csv 2>/dev/null || true
 
           git diff --staged --quiet || {
-            git commit -m "Shadow forecast update ${{ steps.date.outputs.ts }}" &&
+            git commit -m "Early forecast update ${{ steps.date.outputs.ts }}" &&
             for _i in 1 2 3; do
               git pull --rebase --autostash origin streamlit-data && git push && break
               echo "Push attempt $_i failed — retrying in ${_i}s"
