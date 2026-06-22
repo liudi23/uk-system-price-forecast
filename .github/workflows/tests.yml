@@ -18,7 +18,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install test dependencies
-        run: pip install numpy pandas pytest
+        run: pip install numpy pandas pytest requests
 
       - name: Run tests
         run: pytest -q

@@ -20,8 +20,17 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(_SRC))
 sys.path.insert(0, str(_SRC / "data"))
 
-import timeutils          # noqa: E402  (bare name — matches fetch_intraday's import)
-import fetch_intraday     # noqa: E402
+import timeutils          # noqa: E402  (bare name — matches fetch_intraday's import; stdlib-only)
+
+
+@pytest.fixture
+def fetch_intraday_mod():
+    """Import fetch_intraday lazily. It pulls in `requests` (via fetch_elexon),
+    so importorskip keeps a minimal environment from erroring at collection —
+    only the two wiring tests skip; the pure timeutils tests always run."""
+    pytest.importorskip("requests")
+    import fetch_intraday
+    return fetch_intraday
 
 
 def _frozen_datetime(fixed_utc: datetime):
@@ -60,7 +69,7 @@ def test_uk_tzname_summer_winter():
 
 # ── fetch_intraday wiring ───────────────────────────────────────────────────────
 
-def test_fetch_intraday_fetches_uk_local_day_in_bst(monkeypatch):
+def test_fetch_intraday_fetches_uk_local_day_in_bst(monkeypatch, fetch_intraday_mod):
     """A 23:30 UTC run in BST must fetch the new UK-local day, not yesterday."""
     fixed = datetime(2026, 6, 21, 23, 30, tzinfo=timezone.utc)
     monkeypatch.setattr(timeutils, "datetime", _frozen_datetime(fixed))
@@ -71,12 +80,12 @@ def test_fetch_intraday_fetches_uk_local_day_in_bst(monkeypatch):
         captured["day"] = day
         return pd.DataFrame()  # empty → main() returns without writing a file
 
-    monkeypatch.setattr(fetch_intraday, "fetch_day", _fake_fetch_day)
-    fetch_intraday.main()
+    monkeypatch.setattr(fetch_intraday_mod, "fetch_day", _fake_fetch_day)
+    fetch_intraday_mod.main()
     assert captured["day"] == "2026-06-22"
 
 
-def test_fetch_intraday_fetches_same_day_in_winter(monkeypatch):
+def test_fetch_intraday_fetches_same_day_in_winter(monkeypatch, fetch_intraday_mod):
     fixed = datetime(2026, 1, 15, 23, 30, tzinfo=timezone.utc)
     monkeypatch.setattr(timeutils, "datetime", _frozen_datetime(fixed))
 
@@ -86,6 +95,6 @@ def test_fetch_intraday_fetches_same_day_in_winter(monkeypatch):
         captured["day"] = day
         return pd.DataFrame()
 
-    monkeypatch.setattr(fetch_intraday, "fetch_day", _fake_fetch_day)
-    fetch_intraday.main()
+    monkeypatch.setattr(fetch_intraday_mod, "fetch_day", _fake_fetch_day)
+    fetch_intraday_mod.main()
     assert captured["day"] == "2026-01-15"
