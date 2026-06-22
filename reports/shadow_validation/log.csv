@@ -1,0 +1,2 @@
+date,n_sps,shadow_mae,prod_mae,mae_delta,shadow_cov,prod_cov,cov_delta_pp,shadow_width,prod_width,pass_mae,pass_cov,shadow_only
+2026-06-21,48,11.08,11.504,-0.424,1.0,0.9792,2.08,83.51,86.97,True,True,False
