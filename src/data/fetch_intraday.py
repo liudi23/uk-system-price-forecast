@@ -14,13 +14,15 @@ Usage:
 
 import logging
 import sys
-from datetime import date
 from pathlib import Path
 
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetch_elexon import fetch_day
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/ for shared helpers
+from timeutils import uk_today
 
 RAW_DIR     = Path(__file__).resolve().parents[2] / "data" / "raw"
 OUTPUT_FILE = RAW_DIR / "intraday_prices.csv"
@@ -30,7 +32,9 @@ log = logging.getLogger(__name__)
 
 
 def main() -> None:
-    today = str(date.today())
+    # Settlement day is UK-local. Use Europe/London, not the runner's UTC date,
+    # or in the 23:00–00:00 UTC window during BST we'd fetch the previous UK day.
+    today = str(uk_today())
     log.info("Fetching intraday prices for %s", today)
     try:
         df = fetch_day(today, requests.Session())
