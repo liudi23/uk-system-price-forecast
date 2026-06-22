@@ -5,7 +5,8 @@ Run: streamlit run src/dashboard/streamlit_app.py
 """
 
 import json
-from datetime import datetime, timezone
+import sys
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from _pipeline_health import _compute_pipeline_status
+
+# src/ on path for shared helpers (works in the Streamlit Cloud sibling-import
+# context and locally). uk_now/uk_tzname keep SP/day boundaries in Europe/London.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from timeutils import uk_now, uk_tzname
 
 ROOT = Path(__file__).resolve().parents[2]
 # Use full processed history for analytics; system_prices.csv is only a ~50-day rolling window
@@ -95,13 +101,35 @@ st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
 _ps = pipeline_status()
 _pipeline_line = _ps["health_msg"] or "Last intraday: —"
+
+# Append the UK-local clock of the last settled SP to the intraday line. SPs are
+# UK-local (SP n ends at n*30 min past local midnight) but the Kalman stamp is
+# UTC, so spell out the local anchor to prevent a UTC-vs-BST cross-check error.
+_n_settled = _ps.get("kalman_n_settled") or 0
+if _ps.get("health") == "ok" and _n_settled and "Last intraday" in _pipeline_line:
+    _end_min  = (_n_settled * 30) % 1440
+    _sp_clock = f"{_end_min // 60:02d}:{_end_min % 60:02d}"
+    _fc_date_str = _ps.get("fc_date")
+    _tz = uk_tzname(date.fromisoformat(_fc_date_str)) if _fc_date_str else uk_tzname()
+    _pipeline_line += f" · actuals through SP{_n_settled} ({_sp_clock} {_tz})"
+
+# Distinct "latest intraday actual" line — the live partial-day actuals, sourced
+# from the forecast file's is_actual rows. Kept separate from the settlement
+# dataset (Initial Settlement, D+1 lag) so the two can't look contradictory.
+_last_actual_sp = _ps.get("last_actual_sp") or 0
+if _last_actual_sp:
+    _intraday_actual = f"📈 Latest intraday actual: **{_ps.get('fc_date')} · SP{_last_actual_sp}**"
+else:
+    _intraday_actual = "📈 Latest intraday actual: **awaiting first SP of the day**"
+
 # Date of the live forecast, read from whichever pipeline last wrote
 # next_day_forecast_phase3.csv (early 01:00 / daily 12:30 / intraday). Sourcing
 # from the file keeps this in step with the Day-Ahead panel — unlike the old
 # _LAST_PIPELINE_RUN stamp, which only refreshed on the 12:30 daily run.
 _forecast_updated = _ps.get("fc_date") or _LAST_PIPELINE_RUN
 st.sidebar.caption(
-    f"📅 Latest settled data: **{_latest_date}**\n\n"
+    f"📅 Settlement dataset through: **{_latest_date}**\n\n"
+    f"{_intraday_actual}\n\n"
     f"📆 Forecast updated: **{_forecast_updated}**\n\n"
     f"🔄 {_pipeline_line}\n\n"
     "**Daily** (~12:30 UTC): H+1 + H+2 day-ahead forecasts · PI calibration applied · weekly model retrain.\n\n"
@@ -117,6 +145,10 @@ date_range = st.sidebar.date_input(
     value=(min_date, max_date),
     min_value=min_date,
     max_value=max_date,
+)
+st.sidebar.caption(
+    "Bounds the historical settlement dataset (Initial Settlement, ~1-day lag) — "
+    "not the live Day-Ahead forecast or intraday nowcast panels."
 )
 
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
@@ -264,9 +296,11 @@ if _fc_path.exists():
         fc_actual    = pd.DataFrame()
         fc_remaining = fc.copy()
 
-    # Orange/yellow boundary on remaining (forecast) SPs: now + 2 h
-    _now_utc   = pd.Timestamp.utcnow().tz_localize(None)
-    _cutoff_sp = min(int((_now_utc.hour * 60 + _now_utc.minute) / 30) + 1 + 4, 48)
+    # Orange/yellow boundary on remaining (forecast) SPs: now + 2 h.
+    # SPs are UK-local, so derive the current SP from Europe/London — not UTC,
+    # which would shift the near-term zone by an hour (2 SPs) during BST.
+    _now_uk    = uk_now()
+    _cutoff_sp = min(int((_now_uk.hour * 60 + _now_uk.minute) / 30) + 1 + 4, 48)
     fc_orange  = fc_remaining[fc_remaining["settlement_period"] <= _cutoff_sp]
     fc_yellow  = fc_remaining[fc_remaining["settlement_period"] >  _cutoff_sp]
     _boundary  = fc_remaining[fc_remaining["settlement_period"] == _cutoff_sp]
