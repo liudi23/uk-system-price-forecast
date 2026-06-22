@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: streamlit-data
-          fetch-depth: 1
+          fetch-depth: 0   # full history needed for the model-age git log check
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -106,7 +106,17 @@ jobs:
           print(f'features_recent.csv: {len(recent)} rows, ends {recent[\"settlement_datetime\"].max()}')
           "
 
+      # ── Model age gate ────────────────────────────────────────────────────
+      # Retrain only when model_assets/level_q50.pkl is >= 7 days old, so the
+      # daily run still regenerates the forecast every day but retrains weekly.
+      # Same model-age source + threshold as the shadow forecast_pipeline.yml,
+      # via the shared scripts/check_model_age.sh (needs fetch-depth: 0 above).
+      - name: Check model age (days since last retrain commit)
+        id: model-age
+        run: bash scripts/check_model_age.sh
+
       - name: Retrain Phase 3 models
+        if: steps.model-age.outputs.should_retrain == 'true'
         run: python src/models/train_phase3.py
 
       - name: Run H+1 and H+2 forecast
