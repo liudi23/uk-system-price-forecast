@@ -472,6 +472,85 @@ def build_shape_row_h2(h_idx: int, dt: pd.Timestamp,
 
 # ── Main forecast ─────────────────────────────────────────────────────────────
 
+def _splice_actuals_and_correct(result, id_today_all, corrector, target_date):
+    """Kalman-correct the unsettled horizon, then replace settled SPs with actual
+    prices. Shared by the normal forecast path and the morning splice-only path.
+
+    Returns (result, n_settled).
+    """
+    if "is_actual" not in result.columns:
+        result["is_actual"] = False
+    if id_today_all is None or id_today_all.empty:
+        return result, 0
+    _pc = "ssp" if "ssp" in id_today_all.columns else "systemSellPrice"
+    _actual = id_today_all[id_today_all[_pc].notna()].copy()
+    _actual_map = dict(zip(
+        _actual["settlement_period"].astype(int),
+        _actual[_pc].astype(float),
+    ))
+    if not _actual_map:
+        return result, 0
+    # Option 2: bias correction BEFORE overwriting with actuals
+    _corr_state = load_state(KALMAN_STATE_PATH)
+    result, _corr_state = corrector(result, _actual_map, _corr_state)
+    save_state(_corr_state, KALMAN_STATE_PATH)
+    log.info(
+        "Intraday | date=%s n_settled=%d x̂=£%.1f P=£%.0f unsettled=%d",
+        target_date, len(_actual_map),
+        _corr_state.get("x_hat", 0.0),
+        _corr_state.get("P", 0.0),
+        int((~result["is_actual"]).sum()),
+    )
+    # Option 1: replace settled SPs with actuals
+    for _sp, _av in _actual_map.items():
+        _m = result["settlement_period"] == _sp
+        if _m.any():
+            for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
+                result.loc[_m, _col] = round(_av, 2)
+            result.loc[_m, "is_actual"] = True
+    log.info("Intraday splice: %d SPs replaced with actuals", len(_actual_map))
+    return result, len(_actual_map)
+
+
+def _maintain_published_today(today: date, corrector):
+    """Post-cutover morning path: when features lag (the derived target_date is
+    yesterday) but the early 01:00 pipeline has already published *today's*
+    forecast, splice today's settled SPs + Kalman-nudge the unsettled horizon
+    onto that published file — WITHOUT re-running the base model from stale
+    features (which would degrade and overwrite the early forecast).
+
+    Returns the updated frame, or None when no forecast for `today` is published
+    yet (a genuine morning gap — caller should skip).
+    """
+    if not OUTPUT_FILE.exists():
+        return None
+    result = pd.read_csv(OUTPUT_FILE)
+    if "settlement_date" not in result.columns or \
+       not (result["settlement_date"].astype(str) == str(today)).any():
+        return None  # nothing published for today → genuine morning gap
+
+    # Same actuals source as the normal path: today's rows in intraday_prices.csv
+    _id_path = Path(__file__).resolve().parents[2] / "data" / "raw" / "intraday_prices.csv"
+    _id_all = pd.DataFrame()
+    if _id_path.exists():
+        try:
+            _id = pd.read_csv(_id_path)
+            if "settlement_date" in _id.columns:
+                _id = _id[_id["settlement_date"].astype(str) == str(today)]
+            _id_all = _id.copy()
+        except Exception as _e:
+            log.warning("Morning maintain: could not read intraday prices: %s", _e)
+
+    result, _n = _splice_actuals_and_correct(result, _id_all, corrector, today)
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(OUTPUT_FILE, index=False)
+    log.info(
+        "Morning maintain: spliced %d settled SP(s) onto published %s forecast → %s",
+        _n, today, OUTPUT_FILE.name,
+    )
+    return result
+
+
 def run_forecast(
     target_date: date = None,
     features_file: str = None,
@@ -577,10 +656,18 @@ def run_forecast(
     # workflow step) and the nowcast panel reads it directly — no data loss.
     _today_utc = datetime.now(timezone.utc).date()
     if not _explicit_date and target_date < _today_utc:
+        # features_recent.csv lags by the D+1 settlement publication delay, so the
+        # derived target_date is yesterday in the morning. Post soft-cutover the
+        # early 01:00 pipeline already publishes *today's* forecast — so if one is
+        # published, maintain it (splice today's settled SPs + Kalman-nudge the
+        # horizon) instead of skipping. Re-running the base model here from stale
+        # features would only produce a degraded "ghost" forecast.
+        _maintained = _maintain_published_today(_today_utc, corrector)
+        if _maintained is not None:
+            return _maintained
         log.info(
-            "Morning gap: target_date %s < today %s (UTC) — "
-            "features_recent.csv has not advanced past the D+1 publication lag. "
-            "Skipping base-model re-run and Kalman correction.",
+            "Morning gap: target_date %s < today %s (UTC), and no forecast for "
+            "today is published yet — skipping base-model re-run and Kalman correction.",
             target_date, _today_utc,
         )
         return None
@@ -889,33 +976,8 @@ def run_forecast(
 
     if not _id_today_all.empty:
         try:
-            _pc = "ssp" if "ssp" in _id_today_all.columns else "systemSellPrice"
-            _actual = _id_today_all[_id_today_all[_pc].notna()].copy()
-            _actual_map = dict(zip(
-                _actual["settlement_period"].astype(int),
-                _actual[_pc].astype(float),
-            ))
-            if _actual_map:
-                # Option 2: bias correction BEFORE overwriting with actuals
-                _corr_state = load_state(KALMAN_STATE_PATH)
-                result, _corr_state = corrector(result, _actual_map, _corr_state)
-                save_state(_corr_state, KALMAN_STATE_PATH)
-                log.info(
-                    "Intraday | date=%s n_settled=%d x̂=£%.1f P=£%.0f unsettled=%d",
-                    target_date, len(_actual_map),
-                    _corr_state.get("x_hat", 0.0),
-                    _corr_state.get("P", 0.0),
-                    int((~result["is_actual"]).sum()),
-                )
-
-                # Option 1: replace settled SPs with actuals (unchanged)
-                for _sp, _av in _actual_map.items():
-                    _m = result["settlement_period"] == _sp
-                    if _m.any():
-                        for _col in ("ssp_predicted", "ssp_q10", "ssp_q50", "ssp_q90"):
-                            result.loc[_m, _col] = round(_av, 2)
-                        result.loc[_m, "is_actual"] = True
-                log.info("Intraday splice: %d SPs replaced with actuals", len(_actual_map))
+            result, _ = _splice_actuals_and_correct(
+                result, _id_today_all, corrector, target_date)
         except Exception as _e:
             log.warning("Intraday post-processing failed: %s", _e)
 
