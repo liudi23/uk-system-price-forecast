@@ -56,7 +56,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# Updated by CI pipeline on each daily run — forces Streamlit Cloud to redeploy
+# Stamped by daily_pipeline.yml (sed) on each 12:30 run — its .py edit forces a
+# Streamlit Cloud redeploy. No longer the user-facing date label (the sidebar now
+# shows the forecast file's own date); kept as the redeploy trigger + a fallback.
 _LAST_PIPELINE_RUN = "2026-06-21"
 
 
@@ -93,9 +95,14 @@ st.sidebar.divider()
 _latest_date = df["settlement_date"].max().strftime("%Y-%m-%d")
 _ps = pipeline_status()
 _pipeline_line = _ps["health_msg"] or "Last intraday: —"
+# Date of the live forecast, read from whichever pipeline last wrote
+# next_day_forecast_phase3.csv (early 01:00 / daily 12:30 / intraday). Sourcing
+# from the file keeps this in step with the Day-Ahead panel — unlike the old
+# _LAST_PIPELINE_RUN stamp, which only refreshed on the 12:30 daily run.
+_forecast_updated = _ps.get("fc_date") or _LAST_PIPELINE_RUN
 st.sidebar.caption(
     f"📅 Latest settled data: **{_latest_date}**\n\n"
-    f"📆 Daily run: **{_LAST_PIPELINE_RUN}**\n\n"
+    f"📆 Forecast updated: **{_forecast_updated}**\n\n"
     f"🔄 {_pipeline_line}\n\n"
     "**Daily** (~12:30 UTC): H+1 + H+2 day-ahead forecasts · PI calibration applied · weekly model retrain.\n\n"
     "**Intraday**: Kalman-corrected H+1 updates as each SP settles throughout the day."
