@@ -35,10 +35,12 @@ name: Forecast Pipeline — EARLY PUBLISH (01:00 UTC)
 
 on:
   repository_dispatch:
-    types: [early-forecast]
-  schedule:
-    - cron: '0 1 * * *'   # 01:00 UTC fallback (primary = external dispatch above)
-  workflow_dispatch:
+    types: [early-forecast]   # sole auto trigger: external cron-job.org POST at 01:00 UTC
+  workflow_dispatch:          # manual re-run / backfill from the Actions UI
+  # NOTE: no `schedule:` — GitHub's native cron fires late/erratically on the free
+  # tier, and running it alongside the reliable dispatch would double-fire (a late
+  # native run re-publishing mid-morning). daily_pipeline.yml (12:30 UTC) remains
+  # the backup during validation, so dropping the native schedule loses no safety net.
 
 concurrency:
   group: streamlit-data-commit
