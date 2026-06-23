@@ -119,6 +119,13 @@ jobs:
         if: steps.model-age.outputs.should_retrain == 'true'
         run: python src/models/train_phase3.py
 
+      # Regenerate the intraday persistence nowcast bands on the same weekly
+      # cadence as the retrain (they fit a trailing 18-month window, so they only
+      # need a slow refresh). Reads dataset_5yr.csv (built above). Commits below.
+      - name: Regenerate nowcast bands (weekly)
+        if: steps.model-age.outputs.should_retrain == 'true'
+        run: python src/models/build_nowcast_bands.py
+
       - name: Run H+1 and H+2 forecast
         run: python src/models/forecast_phase3.py
 
@@ -139,6 +146,7 @@ jobs:
           git add    model_assets/kalman_state.json \
                      model_assets/next_day_forecast_phase3.csv \
                      model_assets/day2_forecast_phase3.csv \
+                     model_assets/nowcast_bands.json \
                      model_assets/phase3_metrics.json \
                      model_assets/test_predictions_phase3.csv \
                      model_assets/phase3_level_importance.csv \

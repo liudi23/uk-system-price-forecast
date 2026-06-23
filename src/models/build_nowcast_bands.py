@@ -25,10 +25,11 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ROOT     = Path(__file__).resolve().parents[2]
-SP5_FILE = ROOT / "data" / "raw" / "system_prices_5yr.csv"
-SP_RAW   = ROOT / "data" / "raw" / "system_prices.csv"
-OUT_FILE = ROOT / "model_assets" / "nowcast_bands.json"
+ROOT        = Path(__file__).resolve().parents[2]
+DATASET_5YR = ROOT / "data" / "processed" / "dataset_5yr.csv"   # processed full history (CI-built & committed)
+SP5_FILE    = ROOT / "data" / "raw" / "system_prices_5yr.csv"
+SP_RAW      = ROOT / "data" / "raw" / "system_prices.csv"
+OUT_FILE    = ROOT / "model_assets" / "nowcast_bands.json"
 
 # Coverage gate: [LO, HI] at every horizon.
 # Lower bound protects against under-coverage (bands too narrow — the dangerous failure).
@@ -56,9 +57,20 @@ P_LO, P_HI = 0.10, 0.90   # empirical quantiles → 80 % nominal coverage
 # ── Data loading ─────────────────────────────────────────────────────────────
 
 def _load_raw() -> pd.DataFrame:
-    frames = [pd.read_csv(SP5_FILE, parse_dates=["settlement_date"])]
-    if SP_RAW.exists():
-        frames.append(pd.read_csv(SP_RAW, parse_dates=["settlement_date"]))
+    # SSP history sources, in preference order. dataset_5yr.csv is the processed
+    # full-history file the daily pipeline builds and commits, so it is the source
+    # available in CI (the raw *_5yr.csv is not produced there). Raw files are used
+    # too when present; duplicates drop to the first (preferred) source.
+    _cols = ["settlement_date", "settlement_period", "ssp", "price_derivation_code"]
+    frames = []
+    for _src in (DATASET_5YR, SP5_FILE, SP_RAW):
+        if _src.exists():
+            frames.append(pd.read_csv(_src, parse_dates=["settlement_date"])[_cols])
+    if not frames:
+        raise FileNotFoundError(
+            "No SSP history source found (looked for dataset_5yr.csv, "
+            "system_prices_5yr.csv, system_prices.csv)"
+        )
     combined = (
         pd.concat(frames, ignore_index=True)
         .drop_duplicates(["settlement_date", "settlement_period"])
