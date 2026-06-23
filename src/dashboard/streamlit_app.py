@@ -311,6 +311,11 @@ if _fc_path.exists():
     # Only draw when the archive differs from the live file — if they're identical it means
     # intraday updates haven't run yet, so the dashed line would be invisible and misleading.
     _orig_fc_path = FORECASTS_DIR / f"forecast_phase3_{fc_date}.csv"
+    if not _orig_fc_path.exists():
+        # Before the 12:30 daily run the prod dated archive isn't written yet,
+        # but the early (01:00) pipeline's as-published snapshot lives in the
+        # _shadow archive — fall back to it so the baseline line shows from 01:00.
+        _orig_fc_path = FORECASTS_DIR / f"forecast_phase3_{fc_date}_shadow.csv"
     _show_orig = False
     if _orig_fc_path.exists():
         fc_orig = pd.read_csv(_orig_fc_path, parse_dates=["settlement_datetime"])
@@ -321,7 +326,7 @@ if _fc_path.exists():
         if _show_orig:
             fig_fc.add_trace(go.Scatter(
                 x=fc_orig["settlement_datetime"], y=fc_orig[_orig_p50],
-                name="Original forecast (daily run)",
+                name="Original forecast (as published)",
                 line=dict(color="#8ab4d4", width=1.5, dash="dash"),
                 opacity=0.8,
                 hovertemplate="SP %{customdata}<br>Original P50 £%{y:.2f}<extra></extra>",
@@ -408,7 +413,7 @@ if _fc_path.exists():
                 annotation_font=dict(size=9, color="#2a9d8f"),
             )
 
-    _orig_note = "blue dashed = original daily forecast · " if _show_orig else ""
+    _orig_note = "blue dashed = original forecast (as published) · " if _show_orig else ""
     _legend_note = f"{_orig_note}red = actual · orange = near-term · yellow = forecast horizon"
     fig_fc.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
@@ -441,7 +446,10 @@ if _fc_path.exists():
             if not _id_last.empty and "price_derivation_code" in _id_last.columns:
                 _regime = "NP" if _id_last["price_derivation_code"].iloc[0] == "N" else "EN"
 
-        _gen_date = _nb.get("generated", "unknown")
+        # Bands fit on a trailing 18-month window; show the fit-window end (the
+        # data the bands actually cover) rather than the build date, which reads
+        # as stale since regeneration is slow-cadence.
+        _fit_through = (_nb.get("fit_window") or {}).get("end") or _nb.get("generated", "unknown")
         _horizons = _nb["horizons"]
 
         with st.container(border=True):
@@ -455,7 +463,7 @@ if _fc_path.exists():
             }.get(_regime, _regime)
             st.caption(
                 f"Persistence nowcast · empirical 80% bands · "
-                f"regime: {_regime_label} · bands generated: {_gen_date}"
+                f"regime: {_regime_label} · bands fit through: {_fit_through}"
             )
 
             # Build SP→local-clock lookup from the forecast CSV (handles DST correctly)
