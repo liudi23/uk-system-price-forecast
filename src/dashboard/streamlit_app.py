@@ -117,10 +117,20 @@ if _ps.get("health") == "ok" and _n_settled and "Last intraday" in _pipeline_lin
 # from the forecast file's is_actual rows. Kept separate from the settlement
 # dataset (Initial Settlement, D+1 lag) so the two can't look contradictory.
 _last_actual_sp = _ps.get("last_actual_sp") or 0
+_complete_sp    = _ps.get("complete_sp") or 0
 if _last_actual_sp:
-    _intraday_actual = f"📈 Latest intraday actual: **{_ps.get('fc_date')} · SP{_last_actual_sp}**"
+    # One coherent story: newest received SP and the gap-free frontier. On a holey
+    # feed last_actual_sp > complete_sp; the difference is periods still filling in.
+    if _complete_sp and _complete_sp < _last_actual_sp:
+        _pending = _last_actual_sp - _complete_sp
+        _intraday_actual = (
+            f"📈 Intraday actuals: received **SP{_last_actual_sp}** · "
+            f"complete through **SP{_complete_sp}** ({_pending} pending)"
+        )
+    else:
+        _intraday_actual = f"📈 Intraday actuals: complete through **SP{_last_actual_sp}**"
 else:
-    _intraday_actual = "📈 Latest intraday actual: **awaiting first SP of the day**"
+    _intraday_actual = "📈 Intraday actuals: **awaiting first SP of the day**"
 
 # Date of the live forecast, read from whichever pipeline last wrote
 # next_day_forecast_phase3.csv (early 01:00 / daily 12:30 / intraday). Sourcing

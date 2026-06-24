@@ -191,7 +191,7 @@ def test_inconsistent_rule_a():
         ps = _compute_pipeline_status(fc_path, k_path, now_utc=_now(hour=14))
     assert ps["health"] == "ok"
     assert ps["consistent"] is False
-    assert "Rule A" in ps["inconsistency_msg"]
+    assert "out of sync" in ps["inconsistency_msg"]
     assert "15" in ps["inconsistency_msg"]
 
 
@@ -214,13 +214,13 @@ def test_consistent_when_kalman_zero_and_no_actuals():
 # ── Consistency: Rule B ───────────────────────────────────────────────────────
 
 def test_inconsistent_rule_b():
-    """Rule B: CSV has actual SPs > kalman_n_settled + tolerance."""
+    """Catch-up: CSV settled count > kalman_n_settled + tolerance."""
     kalman = {**KALMAN_TODAY, "last_n_settled": 10}
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         fc_path = d / "fc.csv"
         k_path  = d / "k.json"
-        # CSV shows actuals through SP 20, but Kalman only processed 10
+        # CSV has 20 settled SPs, but the bias estimate processed only 10
         _write_fc(fc_path, TODAY, [
             {"settlement_date": TODAY, "settlement_period": i,
              "is_actual": i <= 20}
@@ -228,9 +228,9 @@ def test_inconsistent_rule_b():
         ])
         _write_kalman(k_path, kalman)
         ps = _compute_pipeline_status(fc_path, k_path, now_utc=_now(hour=14))
-    # last_actual_sp=20, kalman_n_settled=10, tol=3 → 20 > 13 → Rule B
+    # n_actual=20 (count), kalman_n_settled=10, tol=3 → 20 > 13 → catch-up flagged
     assert ps["consistent"] is False
-    assert "Rule B" in ps["inconsistency_msg"]
+    assert "catching up" in ps["inconsistency_msg"]
 
 
 def test_consistent_rule_b_within_tolerance():
@@ -325,3 +325,37 @@ def test_health_ok_when_data_fresh():
         ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=14) + __import__("datetime").timedelta(minutes=30))
     assert ps["health"] == "ok"
     assert ps["complete_sp"] == 30
+
+
+# ── Consistency: holey feed must NOT false-alarm (count-vs-count) ───────────────
+
+def test_holey_feed_not_flagged_as_catchup():
+    # Sparse settled set {1..27, 29, 30, 34, 38, 39}: count=32, max_sp=39.
+    # Old rule (max_sp 39 > n_settled 32 + 3) false-alarmed; count-vs-count
+    # (32 vs 32) does not. frontier SP27 (12:30 UTC) at 13:00 UTC → not delayed.
+    settled = set(range(1, 28)) | {29, 30, 34, 38, 39}
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fc, k = d / "fc.csv", d / "k.json"
+        _write_fc(fc, TODAY, _fc_rows(TODAY, settled))
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T12:55", len(settled)))   # 32
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=13))
+    assert ps["last_actual_sp"] == 39
+    assert ps["kalman_n_settled"] == 32
+    assert ps["consistent"] is True
+    assert ps["inconsistency_msg"] is None
+
+
+def test_genuine_catchup_is_flagged_plain_language():
+    # CSV settled through SP39 (count 39) but the bias estimate processed only 30
+    # → genuine lag → flagged, with plain wording (no "Rule B" jargon).
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fc, k = d / "fc.csv", d / "k.json"
+        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 40))))           # 1..39
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T18:50", 30))
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=19))
+    assert ps["consistent"] is False
+    assert "catching up" in ps["inconsistency_msg"]
+    assert "Rule B" not in ps["inconsistency_msg"]
+    assert "39 settled" in ps["inconsistency_msg"] and "30 corrected" in ps["inconsistency_msg"]

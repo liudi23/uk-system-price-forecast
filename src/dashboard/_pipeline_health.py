@@ -23,7 +23,8 @@ _DELAY_THRESHOLD_MIN = 150   # data-recency: how far the contiguous complete-dat
                               # ~60 min margin and would have caught the Jun 24 stall (max 350).
 _ACTIVE_WINDOW_START = 7     # UTC: Kalman updates expected from 07:00
 _ACTIVE_WINDOW_END   = 22    # UTC: Kalman updates expected until 22:00
-_RULE_B_TOL          = 3     # SP tolerance for Rule B: last_actual_sp vs kalman_n_settled
+_RULE_B_TOL          = 3     # tolerance for the catch-up check: n_actual vs kalman_n_settled
+                             # (counts, not max-SP vs count — holey feeds have max_sp >> count)
 
 
 def _compute_pipeline_status(
@@ -170,21 +171,23 @@ def _compute_pipeline_status(
 
     if _health not in ("daily_missed", "unknown") and _kalman_fc_date == _today:
         if _kalman_n_settled > 0 and _n_actual == 0:
-            # Rule A: Kalman claims N settled SPs but forecast CSV has no is_actual rows
-            # → intraday run updated the Kalman state but the commit didn't push the CSV
+            # State recorded settled periods but the forecast CSV shows none — the
+            # intraday commit pushed the Kalman state but not the forecast.
             _consistent = False
             _inconsistency_msg = (
-                f"⚠️ Inconsistency (Rule A): Kalman claims {_kalman_n_settled} SPs settled "
-                f"but forecast CSV has no is_actual rows — intraday commit may have failed."
+                f"⚠️ Intraday data out of sync — the correction state recorded "
+                f"{_kalman_n_settled} settled periods but none are in the published "
+                f"forecast yet (a commit may have failed)."
             )
-        elif _last_actual_sp > _kalman_n_settled + _RULE_B_TOL:
-            # Rule B: forecast CSV has actual SPs well beyond what Kalman has processed
-            # → CSV was committed more recently than Kalman state
+        elif _n_actual > _kalman_n_settled + _RULE_B_TOL:
+            # Count-vs-count: the forecast CSV has more settled periods than the bias
+            # estimate has processed. (Compared as counts, not max-SP vs count — a
+            # holey/out-of-order feed routinely has max_sp >> count without any lag.)
             _consistent = False
             _inconsistency_msg = (
-                f"⚠️ Inconsistency (Rule B): forecast CSV shows actuals through "
-                f"SP {_last_actual_sp} but Kalman only processed {_kalman_n_settled} SPs "
-                f"— Kalman state may be stale."
+                f"⚠️ Intraday correction is catching up — {_n_actual - _kalman_n_settled} "
+                f"settled periods are not yet in the bias estimate "
+                f"({_n_actual} settled, {_kalman_n_settled} corrected)."
             )
 
     return {
