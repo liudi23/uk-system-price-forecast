@@ -268,11 +268,36 @@ if _fc_path.exists():
     has_quantiles = "ssp_q50" in fc.columns
     p50_col = "ssp_q50" if has_quantiles else "ssp_predicted"
 
+    # Headline Min/Avg/Max P50 describe the *model forecast* across the day. The
+    # live file overwrites settled SPs with actuals, so a single settled spike or
+    # trough (e.g. an actual £529 or £10 SP) would otherwise hijack Min/Max P50.
+    # Source from the un-spliced forecast: prefer the dated archive (the dashed
+    # "original forecast"); else this file's un-settled rows; else the full file.
+    def _forecast_p50() -> "pd.Series":
+        for _suffix in ("", "_shadow"):
+            _p = FORECASTS_DIR / f"forecast_phase3_{fc_date}{_suffix}.csv"
+            if _p.exists():
+                try:
+                    _o = pd.read_csv(_p)
+                    _c = "ssp_q50" if "ssp_q50" in _o.columns else "ssp_predicted"
+                    if _c in _o.columns and len(_o):
+                        return _o[_c]
+                except Exception:
+                    pass
+        if "is_actual" in fc.columns:
+            _uns = fc.loc[~fc["is_actual"].astype(bool), p50_col]
+            if len(_uns):
+                return _uns
+        return fc[p50_col]
+
+    _p50 = _forecast_p50()
+    _p50_help = "Model forecast P50 across the 48 SPs (settled actuals are shown on the chart, not folded in)."
+
     fm1, fm2, fm3, fm4, fm5 = st.columns(5)
     fm1.metric("Forecast date", fc_date)
-    fm2.metric("Min P50", f"£{fc[p50_col].min():.1f}")
-    fm3.metric("Avg P50 (daily level)", f"£{fc[p50_col].mean():.1f}")
-    fm4.metric("Max P50", f"£{fc[p50_col].max():.1f}")
+    fm2.metric("Min P50", f"£{_p50.min():.1f}", help=_p50_help)
+    fm3.metric("Avg P50 (daily level)", f"£{_p50.mean():.1f}", help=_p50_help)
+    fm4.metric("Max P50", f"£{_p50.max():.1f}", help=_p50_help)
     if "pred_daily_level" in fc.columns:
         fm5.metric("Predicted daily level", f"£{fc['pred_daily_level'].iloc[0]:.1f}/MWh",
                    help="Stage 1 level model prediction — expected daily average price")
@@ -281,7 +306,7 @@ if _fc_path.exists():
         peak_q90 = fc["ssp_q90"].max()
         fm5.metric("Peak P90 risk", f"£{peak_q90:.0f}  SP {peak_sp}")
     else:
-        fm5.metric("Max P50", f"£{fc[p50_col].max():.1f}")
+        fm5.metric("Max P50", f"£{_p50.max():.1f}", help=_p50_help)
 
     # ── Determine settled SPs ────────────────────────────────────────────────
     # Primary: is_actual column written by the intraday pipeline.
