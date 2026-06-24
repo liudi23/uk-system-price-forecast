@@ -72,6 +72,15 @@ _LAST_PIPELINE_RUN = "2026-06-24"
 def load_data() -> pd.DataFrame:
     df = pd.read_csv(DATA_PATH, parse_dates=["settlement_date"])
     df["settlement_period"] = df["settlement_period"].astype(int)
+    # The dashboard shows REAL settled prices. dataset_5yr's `ssp` is Tukey-fence
+    # winsorised (capped at ~£353) for model training only; `ssp_raw` is the true
+    # Elexon price. Use the real price everywhere the dashboard displays actuals or
+    # verifies forecasts, so spike days aren't silently capped. The winsorised series
+    # is kept as `ssp_winsor` for reference; model evaluation uses its own predictions
+    # file and is unaffected.
+    if "ssp_raw" in df.columns:
+        df["ssp_winsor"] = df["ssp"]
+        df["ssp"] = df["ssp_raw"].fillna(df["ssp"])
     # Convert settlement period (1–48) to a clock time label
     df["time_label"] = pd.to_datetime(
         (df["settlement_period"] - 1) * 30 * 60, unit="s"
