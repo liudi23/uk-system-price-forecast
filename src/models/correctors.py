@@ -239,10 +239,14 @@ class KalmanCorrector:
         n           = len(actual_vals)
         z           = float(np.mean([a - f for a, f in zip(actual_vals, fc_vals)]))
         R           = (self.sigma_sp ** 2) / n
+        settled_sps = sorted(int(sp) for sp in settled_rows["settlement_period"])
 
-        # ── Idempotency: skip if no new SPs since last call ───────────────────
-        if n == state.get("last_n_settled"):
-            log.debug("Kalman idempotent skip: n_settled=%d unchanged", n)
+        # ── Idempotency: skip only when the exact SET of settled SPs is unchanged.
+        # Count-based skipping missed out-of-order / holey-feed updates where the
+        # count stays equal but the SPs differ (e.g. SP30 drops out, SP34 appears),
+        # leaving the bias estimate frozen on stale observations.
+        if settled_sps == state.get("last_settled_sps"):
+            log.debug("Kalman idempotent skip: settled SP set unchanged (n=%d)", n)
             return self._apply_correction(df, settled_actuals, x_hat, P), state
 
         # ── Guardrail: skip on anomalous z_t (data-quality check) ────────────
@@ -252,7 +256,12 @@ class KalmanCorrector:
                 "prior x̂=£%.2f applied",
                 abs(z), self.z_guardrail, n, x_hat,
             )
-            guard_state = {**state, "last_update": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M")}
+            guard_state = {
+                **state,
+                "last_update":      pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M"),
+                "last_n_settled":   n,
+                "last_settled_sps": settled_sps,   # record so the same anomaly isn't reprocessed
+            }
             return self._apply_correction(df, settled_actuals, x_hat, P), guard_state
 
         # ── Kalman recursion ──────────────────────────────────────────────────
@@ -267,12 +276,13 @@ class KalmanCorrector:
 
         # ── Persist state ─────────────────────────────────────────────────────
         new_state = {
-            "x_hat":          round(x_hat_new, 6),
-            "P":              round(P_new, 6),
-            "forecast_date":  fc_date,
-            "last_update":    pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M"),
-            "last_n_settled": n,
-            "last_z":         round(z, 4),
+            "x_hat":            round(x_hat_new, 6),
+            "P":                round(P_new, 6),
+            "forecast_date":    fc_date,
+            "last_update":      pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M"),
+            "last_n_settled":   n,
+            "last_settled_sps": settled_sps,
+            "last_z":           round(z, 4),
         }
         return self._apply_correction(df, settled_actuals, x_hat_new, P_new), new_state
 

@@ -95,6 +95,7 @@ jobs:
           echo "=== pre-commit git status ==="
           git status --porcelain
           git add model_assets/kalman_state.json \
+                  model_assets/intraday_fetch_status.json \
                   model_assets/next_day_forecast_phase3.csv \
                   model_assets/day2_forecast_phase3.csv \
                   "model_assets/forecasts/"
