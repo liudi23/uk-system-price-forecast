@@ -285,34 +285,37 @@ def _kalman(fc_date: str, last_update: str, n: int):
             "last_update": last_update, "last_n_settled": n, "last_z": 0.0}
 
 
-def test_health_delayed_when_frontier_lags():
-    # Contiguous data only through SP27 (=13:30 BST = 12:30 UTC) while it's 16:00 UTC
-    # → 210 min behind > 150 threshold → "delayed", even though Kalman is fresh.
+def test_health_delayed_when_latest_sp_lags():
+    # No recent data at all — latest received SP27 (=13:30 BST = 12:30 UTC) while it's
+    # 16:00 UTC → 210 min behind > 150 → "delayed" (a genuine stall), Kalman fresh.
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         fc, k = d / "fc.csv", d / "k.json"
-        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 28))))      # SP1..27
+        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 28))))      # SP1..27, none newer
         _write_kalman(k, _kalman(TODAY, f"{TODAY}T15:50", 27))        # fresh run
         ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=16))
     assert ps["health"] == "delayed"
-    assert ps["complete_sp"] == 27
-    assert ps["complete_sp_lag_min"] > 150
+    assert ps["last_actual_sp"] == 27
+    assert ps["latest_actual_lag_min"] > 150
     assert "SP27" in ps["health_msg"] and "BST" in ps["health_msg"]
 
 
-def test_health_holey_frontier_stops_at_gap_and_not_flagged_at_normal_lag():
-    # Sparse feed 1..27 + {29,30}: contiguous frontier is 27 (stops at the SP28 hole),
-    # last_actual_sp is 30. At 14:00 UTC the frontier lag is ~90 min (< 150) → "ok".
+def test_current_data_with_early_gap_not_delayed():
+    # SP28 never published but SP29..42 are: latest received SP42 is current → NOT
+    # delayed, even though the contiguous frontier (27) is hours behind. Regression
+    # for the false "8.2h behind" banner on a holey-but-current feed.
+    settled = set(range(1, 28)) | set(range(29, 43))   # 1..27, 29..42 (only SP28 missing)
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         fc, k = d / "fc.csv", d / "k.json"
-        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 28)) | {29, 30}))
-        _write_kalman(k, _kalman(TODAY, f"{TODAY}T13:50", 29))
-        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=14))
-    assert ps["complete_sp"] == 27          # frontier stops at the hole
-    assert ps["last_actual_sp"] == 30       # max settled still tracked
-    assert ps["health"] == "ok"             # 90 min < 150 → no false alarm
-    assert ps["complete_sp_lag_min"] < 150
+        _write_fc(fc, TODAY, _fc_rows(TODAY, settled))
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T20:40", len(settled)))
+        # SP42 ends 21:00 BST = 20:00 UTC; now 21:00 UTC → latest lag 60 min < 150.
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=21))
+    assert ps["complete_sp"] == 27          # frontier stuck at the SP28 hole
+    assert ps["last_actual_sp"] == 42       # but the latest received SP is current
+    assert ps["health"] == "ok"             # → not delayed
+    assert ps["latest_actual_lag_min"] < 150
 
 
 def test_health_ok_when_data_fresh():

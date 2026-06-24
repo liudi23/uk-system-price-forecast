@@ -118,14 +118,16 @@ if _ps.get("health") == "ok" and _n_settled and "Last intraday" in _pipeline_lin
 # dataset (Initial Settlement, D+1 lag) so the two can't look contradictory.
 _last_actual_sp = _ps.get("last_actual_sp") or 0
 _complete_sp    = _ps.get("complete_sp") or 0
+_n_actual_sps   = _ps.get("n_actual_sps") or 0
 if _last_actual_sp:
-    # One coherent story: newest received SP and the gap-free frontier. On a holey
-    # feed last_actual_sp > complete_sp; the difference is periods still filling in.
-    if _complete_sp and _complete_sp < _last_actual_sp:
-        _pending = _last_actual_sp - _complete_sp
+    # One coherent story: newest received SP, the gap-free frontier, and the count
+    # of genuinely missing SPs (latest − received) — not the whole span, since most
+    # SPs between the frontier and the latest are usually already received.
+    _missing = _last_actual_sp - _n_actual_sps
+    if _missing > 0:
         _intraday_actual = (
             f"📈 Intraday actuals: received **SP{_last_actual_sp}** · "
-            f"complete through **SP{_complete_sp}** ({_pending} pending)"
+            f"complete through **SP{_complete_sp}** · {_missing} missing"
         )
     else:
         _intraday_actual = f"📈 Intraday actuals: complete through **SP{_last_actual_sp}**"
