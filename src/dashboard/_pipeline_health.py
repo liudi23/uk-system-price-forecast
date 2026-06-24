@@ -5,15 +5,22 @@ Extracted here so streamlit_app.py can wrap pipeline_status() with
 @st.cache_data(ttl=300) while tests import _compute_pipeline_status directly.
 """
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+UK_TZ = ZoneInfo("Europe/London")   # settlement periods are UK-local (BST/GMT)
 
 _STALE_THRESHOLD_MIN = 360   # 6h — above P95 of same-day inter-run gaps (304 min, n=17)
                               # and above the observed same-day max (350 min, n=25 commits).
                               # 180 min (median) would false-alarm on every second missed slot.
+_DELAY_THRESHOLD_MIN = 150   # data-recency: how far the contiguous complete-data frontier
+                              # may lag wall-clock before flagging "delayed". Normal-day max
+                              # frontier lag is 91 min (Jun 22-23 git history); 150 leaves
+                              # ~60 min margin and would have caught the Jun 24 stall (max 350).
 _ACTIVE_WINDOW_START = 7     # UTC: Kalman updates expected from 07:00
 _ACTIVE_WINDOW_END   = 22    # UTC: Kalman updates expected until 22:00
 _RULE_B_TOL          = 3     # SP tolerance for Rule B: last_actual_sp vs kalman_n_settled
@@ -56,6 +63,7 @@ def _compute_pipeline_status(
     _fc_date: Optional[str] = None
     _n_actual = 0
     _last_actual_sp = 0
+    _complete_sp = 0   # contiguous frontier: largest F with SPs 1..F all settled
     if fc_path.exists():
         try:
             _wanted = {"settlement_date", "settlement_period", "is_actual"}
@@ -69,7 +77,12 @@ def _compute_pipeline_status(
                     )
                     _n_actual = int(_mask.sum())
                     if _n_actual > 0:
-                        _last_actual_sp = int(_fc_df.loc[_mask, "settlement_period"].max())
+                        _settled = set(int(sp) for sp in _fc_df.loc[_mask, "settlement_period"])
+                        _last_actual_sp = max(_settled)
+                        # Contiguous complete-data frontier (stops at the first hole), so a
+                        # sparse feed with high-SP outliers doesn't mask a mid-day gap.
+                        while (_complete_sp + 1) in _settled:
+                            _complete_sp += 1
         except Exception:
             pass
 
@@ -127,6 +140,30 @@ def _compute_pipeline_status(
         # Kalman has no last_update but fc_date is present — daily ran, intraday hasn't yet
         _health = "ok"
 
+    # ── 3b. Data-recency override ──────────────────────────────────────────────
+    # A run can look fresh (recent kalman_last_update) while serving stale data:
+    # the upstream Elexon feed can stall for hours, or a silently-failing fetch
+    # (exit-0 hardening) can freeze the spliced actuals. Flag when the contiguous
+    # complete-data frontier lags wall-clock by more than the tuned threshold.
+    _frontier_lag_min: Optional[float] = None
+    if _health == "ok" and _fc_date == _today and _in_window and _complete_sp > 0:
+        try:
+            _frontier_end = (
+                datetime.combine(date.fromisoformat(_fc_date), time.min, tzinfo=UK_TZ)
+                + timedelta(minutes=_complete_sp * 30)
+            )
+            _frontier_lag_min = (_now - _frontier_end).total_seconds() / 60
+            if _frontier_lag_min > _DELAY_THRESHOLD_MIN:
+                _health = "delayed"
+                _health_msg = (
+                    f"🟠 Settled data delayed — complete through SP{_complete_sp} "
+                    f"(**{_frontier_end.strftime('%H:%M')} {_frontier_end.tzname()}**), "
+                    f"{_frontier_lag_min / 60:.1f}h behind. Upstream Elexon publication gap "
+                    f"or stalled fetch; the dashboard catches up automatically when the feed resumes."
+                )
+        except Exception:
+            pass
+
     # ── 4. Self-consistency checks (skip when pipeline is known-missed or unknown) ──
     _consistent = True
     _inconsistency_msg: Optional[str] = None
@@ -157,6 +194,8 @@ def _compute_pipeline_status(
         "kalman_n_settled":   _kalman_n_settled,
         "n_actual_sps":       _n_actual,
         "last_actual_sp":     _last_actual_sp,
+        "complete_sp":        _complete_sp,
+        "complete_sp_lag_min": _frontier_lag_min,
         "health":             _health,
         "health_msg":         _health_msg,
         "consistent":         _consistent,

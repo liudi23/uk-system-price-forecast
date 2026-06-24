@@ -240,6 +240,8 @@ st.markdown(
 
 if _ps["health"] in ("stale", "daily_missed"):
     st.error(_ps["health_msg"])
+elif _ps["health"] == "delayed":
+    st.warning(_ps["health_msg"])
 if not _ps["consistent"]:
     st.warning(_ps["inconsistency_msg"])
 

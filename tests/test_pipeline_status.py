@@ -151,23 +151,25 @@ def test_health_not_stale_within_threshold():
 # ── Health: ok ────────────────────────────────────────────────────────────────
 
 def test_health_ok_basic():
-    fresh_kalman = {**KALMAN_TODAY, "last_update": f"{TODAY}T13:00"}
+    # Settled contiguously through SP28 (=14:00 BST = 13:00 UTC); at 14:00 UTC the
+    # frontier is 60 min behind (< 150) so the data-recency rule leaves it "ok".
+    fresh_kalman = {**KALMAN_TODAY, "last_update": f"{TODAY}T13:00", "last_n_settled": 28}
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         fc_path = d / "fc.csv"
         k_path  = d / "k.json"
         _write_fc(fc_path, TODAY, [
             {"settlement_date": TODAY, "settlement_period": i,
-             "is_actual": i <= 20}
+             "is_actual": i <= 28}
             for i in range(1, 49)
         ])
         _write_kalman(k_path, fresh_kalman)
         ps = _compute_pipeline_status(fc_path, k_path, now_utc=_now(hour=14))
     assert ps["health"] == "ok"
     assert "Last intraday" in ps["health_msg"]
-    assert ps["n_actual_sps"] == 20
-    assert ps["last_actual_sp"] == 20
-    assert ps["kalman_n_settled"] == 20
+    assert ps["n_actual_sps"] == 28
+    assert ps["last_actual_sp"] == 28
+    assert ps["kalman_n_settled"] == 28
 
 
 # ── Consistency: Rule A ───────────────────────────────────────────────────────
@@ -266,3 +268,60 @@ def test_no_consistency_check_during_daily_missed():
         ps = _compute_pipeline_status(fc_path, k_path, now_utc=_now(hour=16))
     assert ps["health"] == "daily_missed"
     assert ps["consistent"] is True   # checks disabled when daily_missed
+
+
+# ── Health: delayed (data-recency / contiguous frontier) ───────────────────────
+
+def _fc_rows(fc_date: str, settled: set):
+    """48-SP forecast where SPs in `settled` are is_actual=True."""
+    return [
+        {"settlement_date": fc_date, "settlement_period": i, "is_actual": (i in settled)}
+        for i in range(1, 49)
+    ]
+
+
+def _kalman(fc_date: str, last_update: str, n: int):
+    return {"x_hat": 0.0, "P": 1.0, "forecast_date": fc_date,
+            "last_update": last_update, "last_n_settled": n, "last_z": 0.0}
+
+
+def test_health_delayed_when_frontier_lags():
+    # Contiguous data only through SP27 (=13:30 BST = 12:30 UTC) while it's 16:00 UTC
+    # → 210 min behind > 150 threshold → "delayed", even though Kalman is fresh.
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fc, k = d / "fc.csv", d / "k.json"
+        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 28))))      # SP1..27
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T15:50", 27))        # fresh run
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=16))
+    assert ps["health"] == "delayed"
+    assert ps["complete_sp"] == 27
+    assert ps["complete_sp_lag_min"] > 150
+    assert "SP27" in ps["health_msg"] and "BST" in ps["health_msg"]
+
+
+def test_health_holey_frontier_stops_at_gap_and_not_flagged_at_normal_lag():
+    # Sparse feed 1..27 + {29,30}: contiguous frontier is 27 (stops at the SP28 hole),
+    # last_actual_sp is 30. At 14:00 UTC the frontier lag is ~90 min (< 150) → "ok".
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fc, k = d / "fc.csv", d / "k.json"
+        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 28)) | {29, 30}))
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T13:50", 29))
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=14))
+    assert ps["complete_sp"] == 27          # frontier stops at the hole
+    assert ps["last_actual_sp"] == 30       # max settled still tracked
+    assert ps["health"] == "ok"             # 90 min < 150 → no false alarm
+    assert ps["complete_sp_lag_min"] < 150
+
+
+def test_health_ok_when_data_fresh():
+    # Contiguous through SP30 (=15:00 BST = 14:00 UTC); now 14:30 UTC → 30 min behind → ok.
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        fc, k = d / "fc.csv", d / "k.json"
+        _write_fc(fc, TODAY, _fc_rows(TODAY, set(range(1, 31))))      # SP1..30
+        _write_kalman(k, _kalman(TODAY, f"{TODAY}T14:20", 30))
+        ps = _compute_pipeline_status(fc, k, now_utc=_now(hour=14) + __import__("datetime").timedelta(minutes=30))
+    assert ps["health"] == "ok"
+    assert ps["complete_sp"] == 30
