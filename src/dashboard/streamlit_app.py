@@ -330,7 +330,13 @@ if _fc_path.exists():
 
     if _has_actual:
         fc_actual    = fc[fc["is_actual"]].copy()
-        fc_remaining = fc[~fc["is_actual"]].copy()
+        # Forecast region = SPs AHEAD of the latest settled SP, not every non-actual
+        # row. On a holey feed an interior hole (e.g. a missing SP28) is a *past*
+        # period; including it would make the band and P50 lines stretch back across
+        # the settled region (Plotly fills straight across the gap to the late
+        # horizon). Those interior gaps stay covered by the dashed original forecast.
+        _last_settled_sp = int(fc_actual["settlement_period"].max())
+        fc_remaining = fc[fc["settlement_period"] > _last_settled_sp].copy()
     else:
         fc_actual    = pd.DataFrame()
         fc_remaining = fc.copy()
