@@ -619,20 +619,28 @@ st.caption(
 
 archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []
 
-# Separate Phase 2 and Phase 3 archives; prefer Phase 3 for each date
+# Normalise an archive filename to its settlement date. The "_shadow" suffix is
+# the early-published variant of the same date — it must be stripped, or it becomes
+# a junk date ("2026-06-23_shadow") that never matches actuals. It's the fallback
+# source for dates whose production archive wasn't written (e.g. the 12:30 daily
+# run skips the clean-archive write once actuals are already spliced).
 def _archive_date(f):
-    stem = f.stem  # "forecast_2026-05-18" or "forecast_phase3_2026-05-18"
-    return stem.replace("forecast_phase3_", "").replace("forecast_", "")
+    stem = f.stem.replace("forecast_phase3_", "").replace("forecast_", "")
+    return stem.replace("_shadow", "")
+
+# Per date, prefer the production phase3 archive, then phase3 shadow, then legacy.
+def _archive_rank(f):
+    return ("phase3" in f.stem, "_shadow" not in f.stem)
 
 if not archived:
     st.info("No archived forecasts yet. Run the forecast once to start tracking.")
 else:
     actual_dates = set(df["settlement_date"].dt.strftime("%Y-%m-%d").unique())
-    # Build date → file mapping, preferring phase3 archives
+    # Build date → best-available-file mapping (one entry per real settlement date)
     date_to_file: dict = {}
     for f in archived:
         d = _archive_date(f)
-        if d not in date_to_file or "phase3" in f.stem:
+        if d not in date_to_file or _archive_rank(f) > _archive_rank(date_to_file[d]):
             date_to_file[d] = f
 
     verified_dates = [d for d in date_to_file if d in actual_dates]
