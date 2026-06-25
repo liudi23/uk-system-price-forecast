@@ -626,6 +626,30 @@ st.caption(
     "Forecast is generated automatically each day at 12:30 UTC."
 )
 
+@st.cache_data(ttl=1800)
+def _fetch_elexon_actuals(date_str: str) -> pd.DataFrame:
+    """Settled SSP per SP for a date, straight from Elexon BMRS (real prices).
+    Used to verify recent days the daily-rebuilt dataset_5yr hasn't ingested yet —
+    it only updates at the 12:30 run, so 'yesterday' would otherwise stay in
+    'waiting for actuals' until midday. Returns empty on any error / no data."""
+    import requests
+    url = f"https://data.elexon.co.uk/bmrs/api/v1/balancing/settlement/system-prices/{date_str}"
+    try:
+        r = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        recs = r.json().get("data", [])
+        rows = [
+            {"settlement_period": int(x["settlementPeriod"]),
+             "ssp_actual": float(x["systemSellPrice"])}
+            for x in recs
+            if isinstance(x, dict) and x.get("settlementPeriod") is not None
+            and x.get("systemSellPrice") is not None
+        ]
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame(columns=["settlement_period", "ssp_actual"])
+
+
 archived = sorted(FORECASTS_DIR.glob("forecast_*.csv")) if FORECASTS_DIR.exists() else []
 
 # Normalise an archive filename to its settlement date. The "_shadow" suffix is
@@ -652,8 +676,25 @@ else:
         if d not in date_to_file or _archive_rank(f) > _archive_rank(date_to_file[d]):
             date_to_file[d] = f
 
-    verified_dates = [d for d in date_to_file if d in actual_dates]
-    pending_dates  = [d for d in date_to_file if d not in actual_dates]
+    # A date is verifiable if the daily dataset already has it, or it's a past day
+    # Elexon has settled (the dataset lags to the 12:30 run, so 'yesterday' is
+    # fetched live from Elexon instead of waiting half a day). Today/future stay
+    # pending. Only the 1–2 days between the dataset's max and today trigger a fetch.
+    _today_str = str(uk_today())
+    _live_actuals: dict = {}
+    verified_dates, pending_dates = [], []
+    for d in date_to_file:
+        if d in actual_dates:
+            verified_dates.append(d)
+        elif d < _today_str:
+            _a = _fetch_elexon_actuals(d)
+            if not _a.empty:
+                _live_actuals[d] = _a
+                verified_dates.append(d)
+            else:
+                pending_dates.append(d)
+        else:
+            pending_dates.append(d)
 
     if pending_dates:
         st.info(
@@ -674,11 +715,15 @@ else:
             date_to_file[sel_date],
             parse_dates=["settlement_datetime"],
         )
-        act_v = (
-            df[df["settlement_date"].dt.strftime("%Y-%m-%d") == sel_date]
-            [["settlement_period", "ssp"]]
-            .rename(columns={"ssp": "ssp_actual"})
-        )
+        if sel_date in _live_actuals:
+            act_v = _live_actuals[sel_date]
+            st.caption("Actuals from Elexon (live) — not yet in the daily settlement dataset.")
+        else:
+            act_v = (
+                df[df["settlement_date"].dt.strftime("%Y-%m-%d") == sel_date]
+                [["settlement_period", "ssp"]]
+                .rename(columns={"ssp": "ssp_actual"})
+            )
         merged = fc_v.merge(act_v, on="settlement_period", how="inner")
         merged["error"]     = merged["ssp_predicted"] - merged["ssp_actual"]
         merged["abs_error"] = merged["error"].abs()
