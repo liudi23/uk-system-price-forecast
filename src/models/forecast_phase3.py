@@ -28,6 +28,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -138,8 +139,21 @@ def fetch_forecast_weather(target_date: date) -> pd.DataFrame:
             "start_date": start, "end_date": end,
             "timezone": "UTC", "wind_speed_unit": "ms",
         }
-        r = requests.get(FORECAST_URL, params=params, timeout=30)
-        r.raise_for_status()
+        # Retry with backoff — a single transient Open-Meteo read-timeout should not
+        # crash the whole forecast run (matches the retry in inject_weather_yesterday).
+        r = None
+        for _attempt in range(3):
+            try:
+                r = requests.get(FORECAST_URL, params=params, timeout=30)
+                r.raise_for_status()
+                break
+            except (requests.RequestException, OSError) as _e:
+                if _attempt == 2:
+                    raise
+                _wait = 5 * (_attempt + 1)
+                log.warning("Open-Meteo forecast weather attempt %d/3 failed (%s: %s); "
+                            "retrying in %ds", _attempt + 1, type(_e).__name__, _e, _wait)
+                time.sleep(_wait)
         hourly = r.json()["hourly"]
         df = pd.DataFrame(hourly)
         df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
