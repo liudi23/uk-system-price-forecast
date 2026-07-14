@@ -21,3 +21,4 @@ date,n_sps,shadow_mae,prod_mae,mae_delta,shadow_cov,prod_cov,cov_delta_pp,shadow
 2026-07-10,48,22.781,,,0.75,,,73.91,,False,False,True
 2026-07-11,48,18.1,,,0.875,,,76.26,,False,False,True
 2026-07-12,48,46.069,,,0.6042,,,92.16,,False,False,True
+2026-07-13,48,33.851,,,0.75,,,111.38,,False,False,True
