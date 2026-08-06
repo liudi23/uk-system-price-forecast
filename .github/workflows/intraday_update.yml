@@ -33,6 +33,14 @@ jobs:
   update:
     runs-on: ubuntu-latest
 
+    # Hard cap on job runtime. A normal run finishes in ~1 min (≤5 min on a cold
+    # pip cache); without this, GitHub's default is 360 min. During the
+    # 2026-08-06 GitHub Actions incident, runs hung 8–25 min in platform-side
+    # retries ("Failed to resolve action download info" / runner-acquisition
+    # errors) before failing, burning free-tier minutes for nothing. 10 min
+    # bounds that waste; the next half-hourly run catches up any settled SPs.
+    timeout-minutes: 10
+
     permissions:
       contents: write           # required for commit-back of state + forecast
 
