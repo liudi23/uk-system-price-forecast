@@ -393,7 +393,7 @@ if _fc_path.exists():
         fig_fc.add_trace(go.Scatter(
             x=pd.concat([_rem["settlement_datetime"], _rem["settlement_datetime"].iloc[::-1]]),
             y=pd.concat([_rem["ssp_q90"], _rem["ssp_q10"].iloc[::-1]]),
-            fill="toself", fillcolor="rgba(255,127,14,0.12)",
+            fill="toself", fillcolor="rgba(255,127,14,0.18)",
             line=dict(color="rgba(255,127,14,0)"),
             hoverinfo="skip", name="P10–P90 band", showlegend=True,
         ))
@@ -601,7 +601,7 @@ if FORECAST_PATH_H2.exists():
         fig_h2.add_trace(go.Scatter(
             x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
             y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
-            fill="toself", fillcolor="rgba(42,157,143,0.15)",
+            fill="toself", fillcolor="rgba(42,157,143,0.18)",
             line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
         ))
     fig_h2.add_trace(go.Scatter(
@@ -1225,7 +1225,7 @@ if _pred_path.exists():
         fig_pred.add_trace(go.Scatter(
             x=pd.concat([pred["settlement_datetime"], pred["settlement_datetime"].iloc[::-1]]),
             y=pd.concat([pred["ssp_q90"], pred["ssp_q10"].iloc[::-1]]),
-            fill="toself", fillcolor="rgba(255,127,14,0.12)",
+            fill="toself", fillcolor="rgba(255,127,14,0.18)",
             line=dict(color="rgba(255,127,14,0)"),
             hoverinfo="skip", name="P10–P90",
         ))
