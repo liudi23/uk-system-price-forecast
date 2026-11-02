@@ -99,6 +99,7 @@ SHAPE_ALWAYS_EXCLUDE = {
     # the lag-48/lag-336 versions (wind_pct_lag_48 etc.) remain as features
     "wind_pct", "gas_pct",
     # Contemporaneous values (unknown at forecast time)
+    "mid_price", "mid_volume",
     "net_imbalance_volume", "abs_imbalance_volume",
     "price_derivation_code", "price_derivation_code_P",
     "replacement_price", "sell_price_adjustment", "buy_price_adjustment",
@@ -138,6 +139,10 @@ _H2_EXTRA_EXCLUDE_PATTERNS = [
     "spike_count_lag1d",
     "temp_c_daily_mean_lag1d",
     "wind_ms_daily_mean_lag1d",
+    # Phase 5b: D−1 12:00Z forecast vintages — not available at the H+2 origin (D−2)
+    "_fc",
+    "mid_daily_mean_lag1d",
+    "ssp_mid_spread_lag1d",
     "solar_wm2_daily_mean_lag1d",
 ]
 
@@ -157,6 +162,7 @@ def load_sp_data(path: Path) -> pd.DataFrame:
     # Weather, wind/gas, and CPI lag features are optional — HGBR handles missing
     # values natively, so rows are only dropped for price/NIV warm-up (lag ≤ 336).
     _optional = {"wind_pct_", "gas_pct_", "cpi_",
+                 "mid_", "ssp_mid_", "windfor_", "tsdf_", "margin_fc", "wind_pen_fc", "surplus_fc",
                  "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
                  "heating_", "cooling_"}
     core_lag_cols = [c for c in df.columns
@@ -192,7 +198,8 @@ def split_daily(daily: pd.DataFrame, test_days: int, val_days: int,
     # Drop rows with NaN in core daily features (lag warm-up); weather/wind/gas optional
     feat_cols = get_level_feature_cols(daily)
     _opt = {"wind_pct_", "gas_pct_", "cpi_",
-            "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+            "mid_", "ssp_mid_", "windfor_", "tsdf_", "margin_fc", "wind_pen_fc", "surplus_fc",
+                 "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
             "heating_", "cooling_"}
     core_feat = [c for c in feat_cols
                  if not any(c.startswith(p) for p in _opt)]
@@ -577,7 +584,8 @@ def _split_at(sp_df, daily_df, fold_start, val_days, level_train_years: int = 0)
 
     feat_cols = get_level_feature_cols(daily_df)
     _opt = {"wind_pct_", "gas_pct_", "cpi_",
-            "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+            "mid_", "ssp_mid_", "windfor_", "tsdf_", "margin_fc", "wind_pen_fc", "surplus_fc",
+                 "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
             "heating_", "cooling_"}
     core_feat = [c for c in feat_cols
                  if not any(c.startswith(p) for p in _opt)]

@@ -56,6 +56,13 @@ jobs:
           python src/data/fetch_generation.py --append
           python src/data/fetch_cpi.py
 
+      # Phase 5b wave 1: top up the committed vintage CSVs (backfill is done by
+      # phase5_backfill.yml; this keeps the last few days current for the folds).
+      - name: Top up MID + day-ahead vintages
+        run: |
+          python src/data/fetch_mid.py --append
+          python src/data/fetch_da_vintages.py --append
+
       - name: Extend dataset and build features
         run: |
           python src/data/extend_dataset.py

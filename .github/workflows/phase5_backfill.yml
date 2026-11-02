@@ -1,0 +1,70 @@
+# Phase 5b wave 1: one-off/occasional backfill of day-ahead vintage data.
+# Fetches the full history of:
+#   - MID market index prices           -> data/vintages/mid_prices.csv
+#   - WINDFOR/TSDF/OCNMFD D-1 vintages  -> data/vintages/da_vintages.csv
+# and commits the CSVs back to the branch it was run from (intended: phase-5).
+# Manual trigger only. Resumable: already-fetched days are skipped, so re-running
+# after a timeout or API hiccup continues where it left off.
+name: Phase 5 vintage backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Backfill start date (YYYY-MM-DD)"
+        required: false
+        default: "2021-05-17"
+
+concurrency:
+  group: phase5-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      - name: Backfill MID market index prices
+        run: |
+          python src/data/fetch_mid.py --backfill "${{ github.event.inputs.start_date }}" "$(date -u +%F)"
+
+      - name: Backfill WINDFOR/TSDF/OCNMFD day-ahead vintages
+        run: |
+          python src/data/fetch_da_vintages.py --backfill "${{ github.event.inputs.start_date }}" "$(date -u +%F)"
+
+      - name: Commit vintage data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/vintages/
+          git diff --staged --quiet || {
+            git commit -m "Phase 5b: backfill day-ahead vintage data $(date -u +%Y-%m-%dT%H:%M)" &&
+            for _i in 1 2 3; do
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && break
+              echo "Push attempt $_i failed — retrying in ${_i}s"
+              [ "$_i" -lt 3 ] && sleep "$_i"
+            done
+          }
