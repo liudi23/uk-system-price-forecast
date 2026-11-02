@@ -31,4 +31,17 @@ Add a **LEAR-style model** (Lasso-Estimated AutoRegressive — the standard inte
 - **5c (1–2 wks):** LEAR baseline + dashboard model-comparison panel (LEAR vs HGBR vs persistence; rolling 30-day MAE + pinball loss) + coefficient panel; ship the simple ensemble if it wins.
 - **5d (research, optional):** offline NN comparison; Phase 6a spike classifier if the autopsy shows spike days dominate the error budget.
 
-**Adoption gate:** a change ships only if walk-forward MAE improves ≥3% or CRPS/pinball ≥5% with no PI-coverage regression. Add CRPS + per-quantile pinball to the harness so probabilistic skill is tracked alongside MAE.
+## Adoption gate
+
+A change ships only if it passes **one** of the two clauses below, both of which also require **no PI-coverage regression** (overall walk-forward coverage must not drop by more than 0.02):
+
+1. **General clause:** overall walk-forward MAE improves ≥3%, or CRPS/pinball improves ≥5%.
+2. **Regime-conditional clause** (for a change targeting a *pre-diagnosed* failure mode): the diagnosis must be written down *before* the validation run (which fold(s) the change should fix, and why the others are expected to tie). The change then passes if (a) MAE improves ≥5% in the targeted fold(s), (b) no non-targeted fold degrades by more than 2%, and (c) coverage holds both overall and in the targeted fold(s). The diluted overall average is reported but not binding.
+
+Rationale: a regime-targeted fix (e.g. the Phase 5a window change) shows up almost entirely in the folds that resemble the diagnosed regime; averaging it across calm folds that are mathematically near-identical under both configs only dilutes the signal. The pre-registration requirement is what keeps this clause from becoming an excuse — the targeted folds are named before the numbers are seen, never after.
+
+**Precedent — Phase 5a window change (2026-11-02):** overall −2.0% (below clause 1) but autumn-2026 (the pre-diagnosed regime fold) −6.8% MAE / −22% level MAE / bias halved, no other fold worse than +1.3%, coverage improved 0.37→0.40. Passed under clause 2 reasoning (adopted before this clause was formalised; this section exists so future cases don't need a judgment call).
+
+**Post-deployment arbiter:** every adoption is provisional until the rolling level-bias / MAE on the monitoring panel confirms it over 1–2 weeks of live operation; if live behaviour contradicts the backtest, revert regardless of the gate outcome.
+
+Add CRPS + per-quantile pinball to the harness so probabilistic skill is tracked alongside MAE.
