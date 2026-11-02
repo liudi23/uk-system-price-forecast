@@ -61,7 +61,12 @@ ASSETS_DIR    = Path(__file__).resolve().parents[2] / "model_assets"
 
 TEST_DAYS   = 7   # last 7 days — full week, mix of normal + extreme days
 VAL_DAYS    = 5   # 5 days before test — stable early-stopping signal
-TRAIN_YEARS = 3   # drop data older than 3 years to reduce inflation drift
+TRAIN_YEARS = 3   # drop data older than 3 years to reduce inflation drift (shape model)
+# Level model window. Phase 5a (docs/phase5a-results.md): the 3-year truncation caused
+# a systematic level under-prediction in Sep-Oct 2026 — the window had rolled past the
+# 2021-23 high-price era just as prices returned to those levels. Full history with the
+# CPI deflator is unbiased and ~14% better level MAE. 0 = unbounded (full history).
+LEVEL_TRAIN_YEARS = 0
 QUANTILES = [0.10, 0.50, 0.90]
 
 # HGBR hyperparameters — same base as Phase 2 for fair comparison
@@ -554,11 +559,16 @@ WALK_FOLDS = [
     ("2025-10-01", "2025-10-30", "autumn-2025"),
     ("2025-12-01", "2025-12-30", "winter-2025"),   # Jan 2026 has CI API gap
     ("2026-04-01", "2026-04-30", "spring-2026"),
+    ("2026-10-01", "2026-10-30", "autumn-2026"),   # high-price regime return (Phase 5a)
 ]
 
 
-def _split_at(sp_df, daily_df, fold_start, val_days):
-    """Return (sp_train, sp_val, daily_train, daily_val) for data before fold_start."""
+def _split_at(sp_df, daily_df, fold_start, val_days, level_train_years: int = 0):
+    """Return (sp_train, sp_val, daily_train, daily_val) for data before fold_start.
+
+    level_train_years bounds the DAILY (level-model) training window; 0 = unbounded.
+    The SP-level (shape) window is left as-is (all data before the fold).
+    """
     cutoff = fold_start - pd.Timedelta(days=1)
     val_cut = cutoff - pd.Timedelta(days=val_days)
     sp_train = sp_df[sp_df["settlement_datetime"] <= val_cut]
@@ -573,12 +583,15 @@ def _split_at(sp_df, daily_df, fold_start, val_days):
                  if not any(c.startswith(p) for p in _opt)]
     daily_clean = daily_df[daily_df[core_feat].notna().all(axis=1)].reset_index(drop=True)
     d_train = daily_clean[daily_clean["date"] <= val_cut]
+    if level_train_years:
+        d_train = d_train[d_train["date"] > fold_start - pd.DateOffset(years=level_train_years)]
     d_val   = daily_clean[(daily_clean["date"] > val_cut) & (daily_clean["date"] <= cutoff)]
     return sp_train, sp_val, d_train, d_val
 
 
 def walk_forward_eval(sp_df: pd.DataFrame, daily_df: pd.DataFrame,
-                      val_days: int = VAL_DAYS) -> pd.DataFrame:
+                      val_days: int = VAL_DAYS,
+                      level_train_years: int = LEVEL_TRAIN_YEARS) -> pd.DataFrame:
     """
     Walk-forward cross-validation across seasonal folds.
 
@@ -603,7 +616,8 @@ def walk_forward_eval(sp_df: pd.DataFrame, daily_df: pd.DataFrame,
 
         log.info("── Fold %s  (%s → %s) ──", label, fold_start_str, fold_end_str)
 
-        sp_train, sp_val, d_train, d_val = _split_at(sp_df, daily_df, fold_start, val_days)
+        sp_train, sp_val, d_train, d_val = _split_at(sp_df, daily_df, fold_start, val_days,
+                                                      level_train_years=level_train_years)
         log.info("  Train: %d rows  Val: %d rows", len(sp_train), len(sp_val))
 
         shape_train = build_shape_data(sp_train, daily_df)
@@ -676,7 +690,10 @@ def main():
     parser.add_argument("--walk-forward", action="store_true",
                         help="Run seasonal walk-forward CV instead of standard holdout")
     parser.add_argument("--train-years", type=int, default=TRAIN_YEARS,
-                        help="Max training history in years (default 3)")
+                        help="Max SHAPE training history in years (default 3)")
+    parser.add_argument("--level-train-years", type=int, default=LEVEL_TRAIN_YEARS,
+                        help="Max LEVEL training history in years; 0 = full history "
+                             "(default, per Phase 5a)")
     args = parser.parse_args()
 
     # ── Load SP-level data ────────────────────────────────────────────────
@@ -692,7 +709,8 @@ def main():
     # ── Walk-forward mode: retrain per fold, do not overwrite production models
     if args.walk_forward:
         log.info("Running seasonal walk-forward cross-validation …")
-        combined = walk_forward_eval(sp_df, daily_df, val_days=args.val_days)
+        combined = walk_forward_eval(sp_df, daily_df, val_days=args.val_days,
+                                     level_train_years=args.level_train_years)
         if not combined.empty:
             _print_walk_forward_report(combined)
             wf_path = ASSETS_DIR / "walk_forward_predictions.csv"
@@ -702,7 +720,9 @@ def main():
 
     # ── Standard holdout training ─────────────────────────────────────────
     sp_train, sp_val, sp_test = split_dates(sp_df, args.test_days, args.val_days, args.train_years)
-    daily_train, daily_val, daily_test = split_daily(daily_df, args.test_days, args.val_days, args.train_years)
+    daily_train, daily_val, daily_test = split_daily(
+        daily_df, args.test_days, args.val_days,
+        args.level_train_years if args.level_train_years else 999)
 
     # ── Build shape dataset ───────────────────────────────────────────────
     log.info("Building shape dataset (merging daily lags + computing deviations) …")
