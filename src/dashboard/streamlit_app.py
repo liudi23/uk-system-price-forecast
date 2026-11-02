@@ -400,17 +400,15 @@ if _fc_path.exists():
                 annotation_font=dict(size=9, color="#2a9d8f"),
             )
 
-    _orig_note = "blue dashed = original forecast (as published) · " if _show_orig else ""
-    _legend_note = f"{_orig_note}red = actual · orange = near-term · yellow = forecast horizon"
+    # Caption rendered by Streamlit (wraps cleanly at any width) instead of an
+    # in-figure annotation: the long annotation at y=1.08 collided with the
+    # horizontal legend at y=1.02 and clipped/overlapped on narrow layouts.
+    # The colour key is omitted — the legend already names every trace.
+    st.caption(f"Forecast: {fc_label}")
     fig_fc.update_layout(
         xaxis_title="Datetime", yaxis_title="£/MWh",
-        height=340, margin=dict(t=10, b=40), hovermode="x unified",
+        height=340, margin=dict(t=30, b=40), hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        annotations=[dict(
-            text=f"Forecast: {fc_label}  ·  {_legend_note}",
-            xref="paper", yref="paper", x=0, y=1.08, showarrow=False,
-            font=dict(size=11, color="grey"),
-        )],
     )
     st.plotly_chart(fig_fc)
 
