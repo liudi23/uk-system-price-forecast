@@ -43,6 +43,13 @@ from correctors import (AlphaCorrector, Corrector, load_state, save_state,
                         KALMAN_STATE_PATH, get_corrector, apply_spike_widening)
 from fetch_generation import fetch_range as _fetch_ci_range
 from fetch_bmrs_forecasts import get_wind_pct_forecast
+# Phase 5b wave 1 (optional data sources — inference degrades to NaN without them)
+try:
+    from fetch_da_vintages import fetch_day as fetch_da_vintage_day
+    from fetch_mid import fetch_mid_range
+except Exception:                                   # pragma: no cover
+    fetch_da_vintage_day = None
+    fetch_mid_range = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -700,6 +707,68 @@ def run_forecast(
         wind_pct_forecast = None
         _wf_daily_mean = None
 
+    # ── Phase 5b wave 1: D−1 vintages (WINDFOR/TSDF/OCNMFD) + recent MID ──
+    # All optional: every failure degrades to NaN features (HGBR-native).
+    import numpy as _np5b
+    _vin_sp = {k: _np5b.full(48, _np5b.nan) for k in
+               ("windfor_fc_mw", "tsdf_fc_mw", "margin_fc_mw", "wind_pen_fc")}
+    _surplus_fc = float("nan")
+    if fetch_da_vintage_day is not None:
+        try:
+            _vdf = fetch_da_vintage_day(target_date).set_index("settlement_period")
+            for _sp in range(1, 49):
+                if _sp in _vdf.index:
+                    _w = float(_vdf.at[_sp, "windfor_fc_mw"])
+                    _t = float(_vdf.at[_sp, "tsdf_fc_mw"])
+                    _vin_sp["windfor_fc_mw"][_sp - 1] = _w
+                    _vin_sp["tsdf_fc_mw"][_sp - 1]    = _t
+                    _vin_sp["margin_fc_mw"][_sp - 1]  = _t - _w
+                    _vin_sp["wind_pen_fc"][_sp - 1]   = 100.0 * _w / _t if _t else float("nan")
+            _surplus_fc = float(_vdf["surplus_fc_mw"].iloc[0])
+            log.info("  D−1 vintages: windfor mean %.0f MW, tsdf mean %.0f MW, surplus %.0f MW",
+                     _np5b.nanmean(_vin_sp["windfor_fc_mw"]),
+                     _np5b.nanmean(_vin_sp["tsdf_fc_mw"]), _surplus_fc)
+        except Exception as _e:
+            log.warning("DA vintage fetch failed: %s — vintage features → NaN", _e)
+    _mid_daily: dict = {}
+    _mid_sp: dict = {}
+    if fetch_mid_range is not None:
+        try:
+            from datetime import timedelta as _td5b
+            _mdf = fetch_mid_range(target_date - _td5b(days=9), target_date - _td5b(days=1))
+            if len(_mdf):
+                _mid_daily = _mdf.groupby("settlement_date")["mid_price"].mean().to_dict()
+                _mid_sp = {(str(r.settlement_date), int(r.settlement_period)): float(r.mid_price)
+                           for r in _mdf.itertuples()}
+                log.info("  MID history: %d days through %s", len(_mid_daily), max(_mid_daily))
+        except Exception as _e:
+            log.warning("MID fetch failed: %s — MID features → NaN", _e)
+
+    def _mid_lag_features(day: date, h_idx: int) -> dict:
+        """Per-SP MID lags relative to `day` (NaN when history is missing)."""
+        from datetime import timedelta as _td
+        out = {}
+        for _lag_sps, _lag_days in (("48", 1), ("96", 2), ("336", 7)):
+            out[f"mid_price_lag_{_lag_sps}"] = _mid_sp.get(
+                (str(day - _td(days=_lag_days)), h_idx + 1), float("nan"))
+        return out
+
+    def _mid_level_features(lf_dict: dict) -> None:
+        """Augment a level-feature dict with MID daily lags (in place)."""
+        if not _mid_daily:
+            for _k in ("mid_daily_mean_lag1d", "mid_daily_mean_lag7d",
+                       "mid_daily_roll_mean_7d", "ssp_mid_spread_lag1d"):
+                lf_dict[_k] = float("nan")
+            return
+        _days = sorted(_mid_daily)
+        lf_dict["mid_daily_mean_lag1d"] = _mid_daily[_days[-1]]
+        lf_dict["mid_daily_mean_lag7d"] = _mid_daily[_days[0]] if len(_days) >= 7 else float("nan")
+        _tail = [_mid_daily[d] for d in _days[-7:]]
+        lf_dict["mid_daily_roll_mean_7d"] = float(sum(_tail) / len(_tail))
+        _ssp1 = lf_dict.get("ssp_daily_mean_lag1d")
+        lf_dict["ssp_mid_spread_lag1d"] = (
+            float(_ssp1) - lf_dict["mid_daily_mean_lag1d"] if _ssp1 is not None else float("nan"))
+
     # ── Fetch day-ahead weather ───────────────────────────────────────────
     log.info("Fetching Open-Meteo weather …")
     weather_df = fetch_forecast_weather(target_date)
@@ -797,6 +866,16 @@ def run_forecast(
         lf["wind_pct_daily_mean_lag1d"] = _wf_daily_mean
         log.info("  Level feature wind_pct_daily_mean_lag1d → WINDFOR %.1f%% (was CI lag-1d)", _wf_daily_mean)
 
+    # Phase 5b wave 1: vintage + MID level features for target_date
+    lf["windfor_fc_daily_mean"]  = float(_np5b.nanmean(_vin_sp["windfor_fc_mw"]))
+    lf["tsdf_fc_daily_mean"]     = float(_np5b.nanmean(_vin_sp["tsdf_fc_mw"]))
+    lf["tsdf_fc_daily_max"]      = float(_np5b.nanmax(_vin_sp["tsdf_fc_mw"])) if _np5b.isfinite(_vin_sp["tsdf_fc_mw"]).any() else float("nan")
+    lf["margin_fc_daily_min"]    = float(_np5b.nanmin(_vin_sp["margin_fc_mw"])) if _np5b.isfinite(_vin_sp["margin_fc_mw"]).any() else float("nan")
+    lf["margin_fc_daily_mean"]   = float(_np5b.nanmean(_vin_sp["margin_fc_mw"]))
+    lf["wind_pen_fc_daily_mean"] = float(_np5b.nanmean(_vin_sp["wind_pen_fc"]))
+    lf["surplus_fc"]             = _surplus_fc
+    _mid_level_features(lf)
+
     # Negative-price regime classifier: compute P(≥3 negative SPs tomorrow)
     # and inject as level feature so the level model can predict low daily means
     # on high-renewable-oversupply days.
@@ -865,6 +944,16 @@ def run_forecast(
             wind_pct_forecast=wind_pct_forecast,
             solar_forecast=target_weather["solar_wm2"],
         )
+        # Phase 5b wave 1: per-SP D−1 vintages + MID lags
+        row["windfor_fc_mw"] = float(_vin_sp["windfor_fc_mw"][h])
+        row["tsdf_fc_mw"]    = float(_vin_sp["tsdf_fc_mw"][h])
+        row["margin_fc_mw"]  = float(_vin_sp["margin_fc_mw"][h])
+        row["wind_pen_fc"]   = float(_vin_sp["wind_pen_fc"][h])
+        row["surplus_fc_mw"] = _surplus_fc
+        row.update(_mid_lag_features(target_date, h))
+        _m48 = row.get("mid_price_lag_48")
+        row["ssp_mid_spread_lag_48"] = (row["ssp_raw_lag_48"] - _m48
+                                        if _m48 == _m48 else float("nan"))
         shape_rows.append(row)
 
     X_shape = np.array([[r.get(c, 0.0) for c in shape_feat_cols] for r in shape_rows])
@@ -1017,6 +1106,12 @@ def run_forecast(
 
         # Level for H+2: use lag-2d features (available 2 days before H+2)
         lf_h2 = build_level_features(daily_hist, h2_date, target_weather)
+        # Phase 5b: D+2 vintages are not published at run time → NaN (never 0.0)
+        for _k5b in ("windfor_fc_daily_mean", "tsdf_fc_daily_mean", "tsdf_fc_daily_max",
+                     "margin_fc_daily_min", "margin_fc_daily_mean",
+                     "wind_pen_fc_daily_mean", "surplus_fc"):
+            lf_h2[_k5b] = float("nan")
+        _mid_level_features(lf_h2)
         # WINDFOR for H+2 (tomorrow)
         try:
             log.info("Fetching BMRS WINDFOR for H+2 date %s …", h2_date)
@@ -1067,6 +1162,9 @@ def run_forecast(
                 wind_pct_forecast_h2=wind_pct_h2,
                 solar_forecast_h2=solar_h2,
             )
+            _mid_h2 = _mid_lag_features(h2_date, h)
+            row_h2["mid_price_lag_96"]  = _mid_h2["mid_price_lag_96"]
+            row_h2["mid_price_lag_336"] = _mid_h2["mid_price_lag_336"]
             h2_shape_rows.append(row_h2)
 
         X_h2   = np.array([[r.get(c, 0.0) for c in shape_h2_feat_cols] for r in h2_shape_rows])
