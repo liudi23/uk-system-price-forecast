@@ -1,0 +1,130 @@
+# Phase 5a validation: run the seasonal walk-forward (now incl. autumn-2026) with the
+# FULL CI feature set (weather, generation mix, CPI deflator) under two level-model
+# training windows, and publish the comparison. Manual trigger only; nothing is
+# committed back and production model assets are not overwritten (walk-forward mode
+# never writes the .pkl files).
+#
+# Usage: Actions UI -> "Phase 5 walk-forward validation" -> Run workflow (branch: phase-5)
+name: Phase 5 walk-forward validation
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: phase5-walkforward
+  cancel-in-progress: false
+
+jobs:
+  walkforward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements-pipeline.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # Reuse the daily pipeline's raw-data cache so weather/genmix/CPI features are
+      # identical to production. restore-keys falls back to the newest weekly cache.
+      - name: Restore raw data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/raw/
+          key: raw-data-${{ github.run_id }}   # never matches — always use restore-keys
+          restore-keys: raw-data-
+
+      - name: Top up raw data (same sequence as daily pipeline)
+        run: |
+          python src/data/fetch_elexon.py --append
+          python src/data/fetch_weather.py --append
+          python src/data/fetch_generation.py --append
+          python src/data/fetch_cpi.py
+
+      - name: Extend dataset and build features
+        run: |
+          python src/data/extend_dataset.py
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_5yr.csv
+
+      - name: "Walk-forward A: baseline (level window = 3y, production behaviour)"
+        run: |
+          python src/models/train_phase3.py --walk-forward --level-train-years 3 \
+            2>&1 | tee wf_baseline.log
+          cp model_assets/walk_forward_predictions.csv wf_baseline.csv
+
+      - name: "Walk-forward B: full-history level window (Phase 5a candidate)"
+        run: |
+          python src/models/train_phase3.py --walk-forward --level-train-years 0 \
+            2>&1 | tee wf_full.log
+          cp model_assets/walk_forward_predictions.csv wf_full.csv
+
+      - name: Compare and publish summary
+        run: |
+          python - <<'EOF' | tee comparison.md
+          import pandas as pd, numpy as np
+
+          def level_mae(df):
+              d = df.groupby("settlement_date").agg(a=("ssp_actual","mean"), p=("pred_level_q50","mean"))
+              return float((d.a - d.p).abs().mean()), float((d.p - d.a).mean())
+
+          def summarise(path):
+              df = pd.read_csv(path)
+              out = {}
+              for fold, g in df.groupby("fold"):
+                  lm, bias = level_mae(g)
+                  out[fold] = dict(
+                      mae=float((g.ssp_actual - g.ssp_predicted).abs().mean()),
+                      level_mae=lm, level_bias=bias,
+                      cov=float(((g.ssp_actual >= g.ssp_q10) & (g.ssp_actual <= g.ssp_q90)).mean()))
+              lm, bias = level_mae(df)
+              out["ALL"] = dict(
+                  mae=float((df.ssp_actual - df.ssp_predicted).abs().mean()),
+                  level_mae=lm, level_bias=bias,
+                  cov=float(((df.ssp_actual >= df.ssp_q10) & (df.ssp_actual <= df.ssp_q90)).mean()))
+              return out
+
+          a, b = summarise("wf_baseline.csv"), summarise("wf_full.csv")
+          print("## Phase 5a validation: level window 3y (baseline) vs full history\n")
+          print("| Fold | MAE 3y | MAE full | Δ% | LvlMAE 3y | LvlMAE full | LvlBias 3y | LvlBias full | cov80 3y | cov80 full |")
+          print("|---|---|---|---|---|---|---|---|---|---|")
+          for k in list(a.keys()):
+              if k not in b: continue
+              d = (b[k]["mae"] / a[k]["mae"] - 1) * 100
+              print(f"| {k} | {a[k]['mae']:.2f} | {b[k]['mae']:.2f} | {d:+.1f}% | "
+                    f"{a[k]['level_mae']:.2f} | {b[k]['level_mae']:.2f} | "
+                    f"{a[k]['level_bias']:+.2f} | {b[k]['level_bias']:+.2f} | "
+                    f"{a[k]['cov']:.2f} | {b[k]['cov']:.2f} |")
+          d_all = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
+          gate = "PASS" if d_all <= -3 and b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02 else "CHECK MANUALLY"
+          print(f"\n**Adoption gate (MAE ≥3% better, no coverage regression): {gate}**")
+          EOF
+          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-walkforward-results
+          path: |
+            wf_baseline.csv
+            wf_full.csv
+            wf_baseline.log
+            wf_full.log
+            comparison.md
+          retention-days: 30
