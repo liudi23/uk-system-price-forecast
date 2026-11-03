@@ -5,6 +5,12 @@ on:
     # 12:30 UTC daily — Elexon Initial Settlement (D+1) is published by ~12:00 UTC
     - cron: '30 12 * * *'
   workflow_dispatch:  # manual trigger from GitHub Actions UI
+    inputs:
+      force_retrain:
+        description: "Retrain models now, ignoring the 7-day age gate"
+        type: boolean
+        required: false
+        default: false
 
 # Same group as intraday_update.yml — serialises the daily retrain push against any
 # concurrent intraday commit so both can't hit a non-fast-forward push race.
@@ -113,7 +119,12 @@ jobs:
       # via the shared scripts/check_model_age.sh (needs fetch-depth: 0 above).
       - name: Check model age (days since last retrain commit)
         id: model-age
-        run: bash scripts/check_model_age.sh
+        run: |
+          bash scripts/check_model_age.sh
+          if [ "${{ github.event.inputs.force_retrain }}" = "true" ]; then
+            echo "should_retrain=true" >> "$GITHUB_OUTPUT"
+            echo "force_retrain=true — overriding the 7-day age gate"
+          fi
 
       - name: Retrain Phase 3 models
         if: steps.model-age.outputs.should_retrain == 'true'
