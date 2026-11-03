@@ -152,6 +152,18 @@ jobs:
           python src/data/fetch_mid.py --append
           python src/data/fetch_da_vintages.py --append
 
+      # Phase 5c: LEAR interpretable baseline — weekly refit on the retrain
+      # cadence, daily H+1 prediction for the dashboard comparison panel.
+      # Both fail soft: the baseline must never block the production forecast.
+      - name: Refit LEAR baseline (weekly)
+        if: steps.model-age.outputs.should_retrain == 'true'
+        continue-on-error: true
+        run: python src/models/train_lear.py --fit --window-days 1092
+
+      - name: LEAR daily prediction
+        continue-on-error: true
+        run: python src/models/train_lear.py --predict
+
       - name: Run H+1 and H+2 forecast
         run: python src/models/forecast_phase3.py
 
@@ -188,6 +200,9 @@ jobs:
                      model_assets/shape_q50.pkl \
                      model_assets/shape_h2_q50.pkl \
                      model_assets/neg_day_classifier.pkl \
+                     model_assets/lear_models.pkl \
+                     model_assets/lear_coefficients.json \
+                     model_assets/lear_forecast_history.csv \
                      "model_assets/forecasts/"
           git diff --staged --quiet || {
             git commit -m "Daily forecast update $(date -u +%Y-%m-%d)" &&

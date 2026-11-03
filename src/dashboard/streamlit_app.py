@@ -501,6 +501,128 @@ else:
         "No forecast found. Run `python src/models/forecast_phase3.py` to generate one."
     )
 
+# ── Model comparison: HGBR vs LEAR vs persistence (Phase 5c) ─────────────────
+LEAR_HISTORY = ROOT / "model_assets" / "lear_forecast_history.csv"
+LEAR_COEFS   = ROOT / "model_assets" / "lear_coefficients.json"
+
+if LEAR_HISTORY.exists():
+    st.subheader("Model Comparison — HGBR vs LEAR baseline vs persistence")
+    st.caption(
+        "LEAR = Lasso-Estimated AutoRegressive, the standard interpretable "
+        "benchmark in electricity-price forecasting: one lasso per settlement "
+        "period on the same day-ahead information set as the production model. "
+        "Rolling 30-day H+1 accuracy against settled prices; persistence = same "
+        "SP yesterday."
+    )
+    try:
+        _lh = pd.read_csv(LEAR_HISTORY)
+        _lh["settlement_date"] = _lh["settlement_date"].astype(str).str[:10]
+
+        # Settled actuals + persistence from the full dataset
+        _act = df[["settlement_date", "settlement_period", "ssp"]].copy()
+        if "ssp_raw" in df.columns:
+            _act["ssp"] = df["ssp_raw"].fillna(df["ssp"])
+        _act["settlement_date"] = _act["settlement_date"].astype(str).str[:10]
+        _act = _act.rename(columns={"ssp": "actual"})
+        _prev = _act.copy()
+        _prev["settlement_date"] = (
+            pd.to_datetime(_prev["settlement_date"]) + pd.Timedelta(days=1)
+        ).dt.strftime("%Y-%m-%d")
+        _prev = _prev.rename(columns={"actual": "persistence"})
+
+        # HGBR as-published H+1 forecasts from the dated archive.
+        # Prefer the production (12:30) snapshot; fall back to the early/shadow
+        # (01:00) snapshot for days where the prod file is absent.
+        _hg_files = {}
+        for _f in sorted(FORECASTS_DIR.glob("forecast_phase3_????-??-??_shadow.csv")):
+            _hg_files[_f.stem[16:26]] = _f
+        for _f in sorted(FORECASTS_DIR.glob("forecast_phase3_????-??-??.csv")):
+            _hg_files[_f.stem[-10:]] = _f
+        _hg_rows = []
+        for _d, _f in sorted(_hg_files.items()):
+            try:
+                _g = pd.read_csv(_f, usecols=["settlement_period", "ssp_q50"])
+                _g["settlement_date"] = _d
+                _hg_rows.append(_g)
+            except Exception:
+                continue
+        _hg = (pd.concat(_hg_rows, ignore_index=True)
+                 .rename(columns={"ssp_q50": "hgbr"})) if _hg_rows else pd.DataFrame(
+                 columns=["settlement_date", "settlement_period", "hgbr"])
+
+        _cmp = (_lh.merge(_act, on=["settlement_date", "settlement_period"])
+                   .merge(_prev, on=["settlement_date", "settlement_period"], how="left")
+                   .merge(_hg, on=["settlement_date", "settlement_period"], how="left"))
+        _cmp["date"] = pd.to_datetime(_cmp["settlement_date"])
+        _cmp = _cmp[_cmp["date"] >= _cmp["date"].max() - pd.Timedelta(days=30)]
+
+        if len(_cmp) >= 48:
+            _daily = _cmp.groupby("date").apply(
+                lambda g: pd.Series({
+                    "LEAR":        (g.actual - g.lear_pred).abs().mean(),
+                    "HGBR":        (g.actual - g.hgbr).abs().mean(),
+                    "Persistence": (g.actual - g.persistence).abs().mean(),
+                }), include_groups=False).reset_index()
+
+            _m1, _m2, _m3 = st.columns(3)
+            _m1.metric("HGBR 30-day MAE", f"£{_daily['HGBR'].mean():.1f}/MWh")
+            _m2.metric("LEAR 30-day MAE", f"£{_daily['LEAR'].mean():.1f}/MWh")
+            _m3.metric("Persistence 30-day MAE", f"£{_daily['Persistence'].mean():.1f}/MWh")
+
+            _fig_cmp = go.Figure()
+            for _name, _color in [("HGBR", "#e05c00"), ("LEAR", "#2a9d8f"),
+                                  ("Persistence", "#8ab4d4")]:
+                _fig_cmp.add_trace(go.Scatter(
+                    x=_daily["date"], y=_daily[_name], name=_name, mode="lines",
+                    line=dict(color=_color, width=2,
+                              dash="dash" if _name == "Persistence" else "solid"),
+                    hovertemplate=_name + " £%{y:.1f}<extra></extra>",
+                ))
+            _fig_cmp.update_layout(
+                xaxis_title="Day", yaxis_title="Daily MAE £/MWh", height=280,
+                margin=dict(t=30, b=40), hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+            )
+            st.plotly_chart(_fig_cmp)
+            _src_counts = _lh["source"].value_counts().to_dict() if "source" in _lh.columns else {}
+            if _src_counts.get("walkforward"):
+                st.caption(
+                    f"LEAR history: {_src_counts.get('live', 0):,} live SPs, "
+                    f"{_src_counts.get('walkforward', 0):,} seeded from the validated "
+                    "walk-forward backtest (replaced by live forecasts as they accrue)."
+                )
+        else:
+            st.info("Model comparison accumulates as LEAR live forecasts settle — check back soon.")
+
+        # ── LEAR coefficient panel ────────────────────────────────────────────
+        if LEAR_COEFS.exists():
+            with st.expander("LEAR coefficients — why the baseline predicts what it does"):
+                _lc = json.load(open(LEAR_COEFS))
+                _sp_sel = st.slider("Settlement period", 1, 48, 36,
+                                    help="SP n starts (n−1)×30 min after midnight UK time")
+                _c = _lc["by_sp"][str(_sp_sel)]
+                st.caption(
+                    f"Fit through {_lc.get('fit_through', '—')} · window "
+                    f"{_lc.get('window_days', '—')}d · α={_c['alpha']:.3f} · "
+                    f"{_c['n_nonzero']} non-zero of ~163 candidates. Standardised "
+                    "coefficients: comparable magnitudes, sign = direction of effect."
+                )
+                _top = _c["top"][:10]
+                if _top:
+                    _fig_co = go.Figure(go.Bar(
+                        x=[b for _, b in _top][::-1],
+                        y=[n for n, _ in _top][::-1],
+                        orientation="h",
+                        marker_color=["#c0392b" if b > 0 else "#2a9d8f"
+                                      for _, b in _top][::-1],
+                    ))
+                    _fig_co.update_layout(height=320, margin=dict(t=10, b=30, l=10),
+                                          xaxis_title="standardised coefficient")
+                    st.plotly_chart(_fig_co)
+    except Exception as _e:
+        st.warning(f"Model comparison unavailable: {_e}")
+
 # ── Model & methodology reference ─────────────────────────────────────────────
 # Moved below the Day-Ahead panel (2026-10-30) so the live chart is visible on
 # the first screen; content unchanged.
