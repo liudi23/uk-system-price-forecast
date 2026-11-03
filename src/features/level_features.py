@@ -38,6 +38,7 @@ _CONTEMPORANEOUS = {
     "gas_pct_daily_mean",    # contemporaneous — not available day-ahead
     "cpi_deflator",          # training-only scaling column, not a predictor
     "neg_sp_daily_count",    # contemporaneous day-D count — not available before D ends
+    "mid_daily_mean",        # market index outturn — contemporaneous, lags only
     "date",
 }
 
@@ -82,6 +83,20 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
     for _cpi_col in ["cpi_index", "cpi_yoy", "cpi_deflator"]:
         if _cpi_col in df.columns:
             agg[_cpi_col] = (_cpi_col, "first")
+    # Phase 5b wave 1 aggregates
+    if "mid_price" in df.columns:
+        agg["mid_daily_mean"] = ("mid_price", "mean")        # outturn → lagged below
+    for _fc_col, _name, _fn in [
+        ("windfor_fc_mw", "windfor_fc_daily_mean", "mean"),
+        ("tsdf_fc_mw",    "tsdf_fc_daily_mean",    "mean"),
+        ("tsdf_fc_mw",    "tsdf_fc_daily_max",     "max"),
+        ("margin_fc_mw",  "margin_fc_daily_min",   "min"),
+        ("margin_fc_mw",  "margin_fc_daily_mean",  "mean"),
+        ("wind_pen_fc",   "wind_pen_fc_daily_mean","mean"),
+        ("surplus_fc_mw", "surplus_fc",            "first"),
+    ]:
+        if _fc_col in df.columns:
+            agg[_name] = (_fc_col, _fn)
     # Negative-price SP count — must be added BEFORE groupby
     if "ssp_raw" in df.columns:
         df["_is_neg"] = (df["ssp_raw"] < 0).astype(float)
@@ -190,10 +205,39 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
         roll_neg = daily["neg_sp_daily_count"].shift(1).rolling(window=7, min_periods=1)
         daily["neg_sp_count_roll_7d"] = roll_neg.sum()
 
+    # ── Market index lags (outturn → shift ≥ 1 day) ──────────────────────
+    if "mid_daily_mean" in daily.columns:
+        daily["mid_daily_mean_lag1d"] = daily["mid_daily_mean"].shift(1)
+        daily["mid_daily_mean_lag7d"] = daily["mid_daily_mean"].shift(7)
+        roll_mid = daily["mid_daily_mean"].shift(1).rolling(window=7, min_periods=3)
+        daily["mid_daily_roll_mean_7d"] = roll_mid.mean()
+        if "ssp_daily_mean_lag1d" in daily.columns:
+            # yesterday's imbalance premium over the market index
+            daily["ssp_mid_spread_lag1d"] = (daily["ssp_daily_mean_lag1d"]
+                                             - daily["mid_daily_mean_lag1d"])
+
     return daily
 
 
+# Phase 5b wave 1.1 (2026-11-03): wave-1 validation showed the per-SP vintage
+# features are a clear SHAPE win (overall MAE −7.6%) but these daily aggregates
+# HARM the level model (level MAE +24%, autumn-2026 worse) — raw MW levels are
+# non-stationary across the 5.5y window (wind capacity ~doubled), so one global
+# MW→price mapping misreads both eras. Excluded from the level model pending a
+# wave-1.2 test of normalised variants (penetration %, margin fraction).
+# They are still aggregated above so inference code and future tests can use them.
+LEVEL_EXCLUDE_5B = {
+    "windfor_fc_daily_mean", "tsdf_fc_daily_mean", "tsdf_fc_daily_max",
+    "margin_fc_daily_min", "margin_fc_daily_mean", "wind_pen_fc_daily_mean",
+    "surplus_fc",
+    "mid_daily_mean_lag1d", "mid_daily_mean_lag7d", "mid_daily_roll_mean_7d",
+    "ssp_mid_spread_lag1d",
+}
+
+
 def get_level_feature_cols(daily: pd.DataFrame) -> list:
-    """Return model feature columns for the level model (excludes target and
-    contemporaneous day-D aggregates)."""
-    return [c for c in daily.columns if c not in _CONTEMPORANEOUS]
+    """Return model feature columns for the level model (excludes target,
+    contemporaneous day-D aggregates, and the wave-1 vintage/MID aggregates —
+    see LEVEL_EXCLUDE_5B)."""
+    return [c for c in daily.columns
+            if c not in _CONTEMPORANEOUS and c not in LEVEL_EXCLUDE_5B]

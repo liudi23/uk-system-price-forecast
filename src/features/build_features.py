@@ -32,6 +32,9 @@ from fetch_cpi import OUTPUT_FILE as CPI_FILE, load_cpi
 
 IN_FILE  = Path(__file__).resolve().parents[2] / "data" / "processed" / "dataset.csv"
 OUT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "features.csv"
+VINTAGES_DIR     = Path(__file__).resolve().parents[2] / "data" / "vintages"
+MID_FILE         = VINTAGES_DIR / "mid_prices.csv"
+DA_VINTAGES_FILE = VINTAGES_DIR / "da_vintages.csv"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -95,6 +98,52 @@ def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> p
     else:
         log.warning("cpi_uk.csv not found — skipping CPI features. "
                     "Run src/data/fetch_cpi.py to generate it.")
+
+    # ── Phase 5b wave 1: market index (lagged) + day-ahead forecast vintages ──
+    if MID_FILE.exists():
+        log.info("Merging Market Index (MID) prices from %s…", MID_FILE)
+        mid = pd.read_csv(MID_FILE)
+        mid["settlement_date"] = mid["settlement_date"].astype(str).str[:10]
+        df["_sdate_str"] = df["settlement_date"].astype(str).str[:10]
+        df = df.merge(mid[["settlement_date", "settlement_period", "mid_price"]],
+                      left_on=["_sdate_str", "settlement_period"],
+                      right_on=["settlement_date", "settlement_period"],
+                      how="left", suffixes=("", "_mid")
+                      ).drop(columns=["_sdate_str", "settlement_date_mid"], errors="ignore")
+        # MID is OUTTURN — enters only as lags (same leakage class as ssp lags).
+        df = df.sort_values("settlement_datetime").reset_index(drop=True)
+        df["mid_price_lag_48"]  = df["mid_price"].shift(48)
+        df["mid_price_lag_96"]  = df["mid_price"].shift(96)
+        df["mid_price_lag_336"] = df["mid_price"].shift(336)
+        if "ssp_raw_lag_48" in df.columns:
+            # imbalance premium vs market index, one day ago
+            df["ssp_mid_spread_lag_48"] = df["ssp_raw_lag_48"] - df["mid_price_lag_48"]
+        log.info("  mid_price coverage: %.1f%%", df["mid_price"].notna().mean() * 100)
+    else:
+        log.warning("mid_prices.csv not found — skipping MID features. "
+                    "Run src/data/fetch_mid.py to generate it.")
+
+    if DA_VINTAGES_FILE.exists():
+        log.info("Merging day-ahead forecast vintages from %s…", DA_VINTAGES_FILE)
+        vin = pd.read_csv(DA_VINTAGES_FILE)
+        vin["settlement_date"] = vin["settlement_date"].astype(str).str[:10]
+        df["_sdate_str"] = df["settlement_date"].astype(str).str[:10]
+        df = df.merge(vin[["settlement_date", "settlement_period",
+                           "windfor_fc_mw", "tsdf_fc_mw", "surplus_fc_mw"]],
+                      left_on=["_sdate_str", "settlement_period"],
+                      right_on=["settlement_date", "settlement_period"],
+                      how="left", suffixes=("", "_vin")
+                      ).drop(columns=["_sdate_str", "settlement_date_vin"], errors="ignore")
+        # D−1 12:00Z vintages — legitimately known before day D (no lag needed).
+        df["margin_fc_mw"]   = df["tsdf_fc_mw"] - df["windfor_fc_mw"]
+        df["wind_pen_fc"]    = 100.0 * df["windfor_fc_mw"] / df["tsdf_fc_mw"]
+        log.info("  windfor_fc coverage: %.1f%%  tsdf_fc: %.1f%%  surplus_fc: %.1f%%",
+                 df["windfor_fc_mw"].notna().mean() * 100,
+                 df["tsdf_fc_mw"].notna().mean() * 100,
+                 df["surplus_fc_mw"].notna().mean() * 100)
+    else:
+        log.warning("da_vintages.csv not found — skipping day-ahead vintage features. "
+                    "Run src/data/fetch_da_vintages.py to generate it.")
 
     if use_weather and WEATHER_FILE.exists():
         log.info("Adding weather features from %s…", WEATHER_FILE)

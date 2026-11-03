@@ -143,6 +143,15 @@ jobs:
         if: steps.model-age.outputs.should_retrain == 'true'
         run: python src/models/build_nowcast_bands.py
 
+      # Phase 5b wave 1: keep committed vintage CSVs current (cheap daily top-up;
+      # full history comes from phase5_backfill.yml). Failures must not kill the
+      # daily run — features degrade to NaN and HGBR handles them natively.
+      - name: Top up MID + day-ahead vintages
+        continue-on-error: true
+        run: |
+          python src/data/fetch_mid.py --append
+          python src/data/fetch_da_vintages.py --append
+
       - name: Run H+1 and H+2 forecast
         run: python src/models/forecast_phase3.py
 
@@ -157,7 +166,8 @@ jobs:
           TODAY=$(date -u +%Y-%m-%d)
           sed -i "s/_LAST_PIPELINE_RUN = \".*\"/_LAST_PIPELINE_RUN = \"${TODAY}\"/" \
             src/dashboard/streamlit_app.py
-          git add src/dashboard/streamlit_app.py
+          git add src/dashboard/streamlit_app.py \
+                  data/vintages/
           git add -f data/processed/dataset_5yr.csv \
                      data/processed/features_recent.csv
           git add    model_assets/kalman_state.json \

@@ -1,4 +1,4 @@
-# Phase 5a validation: run the seasonal walk-forward (now incl. autumn-2026) with the
+# Phase 5 validation (5a window: done & adopted; now 5b wave 1): seasonal walk-forward with the
 # FULL CI feature set (weather, generation mix, CPI deflator) under two level-model
 # training windows, and publish the comparison. Manual trigger only; nothing is
 # committed back and production model assets are not overwritten (walk-forward mode
@@ -56,22 +56,40 @@ jobs:
           python src/data/fetch_generation.py --append
           python src/data/fetch_cpi.py
 
-      - name: Extend dataset and build features
+      # Phase 5b wave 1: top up the committed vintage CSVs (backfill is done by
+      # phase5_backfill.yml; this keeps the last few days current for the folds).
+      - name: Top up MID + day-ahead vintages
+        run: |
+          python src/data/fetch_mid.py --append
+          python src/data/fetch_da_vintages.py --append
+
+      - name: Extend dataset and build features (A = without 5b data, B = with)
         run: |
           python src/data/extend_dataset.py
+          # B: full feature set including Phase 5b vintage/MID features
           python src/features/build_features.py \
             --input  data/processed/dataset_5yr.csv \
-            --output data/processed/features_5yr.csv
+            --output data/processed/features_5b.csv
+          # A: identical build with the vintage data hidden -> pre-5b feature set
+          mv data/vintages data/_vintages_hidden
+          python src/features/build_features.py \
+            --input  data/processed/dataset_5yr.csv \
+            --output data/processed/features_base.csv
+          mv data/_vintages_hidden data/vintages
 
-      - name: "Walk-forward A: baseline (level window = 3y, production behaviour)"
+      - name: "Walk-forward A: baseline features (full-history window, no 5b data)"
         run: |
-          python src/models/train_phase3.py --walk-forward --level-train-years 3 \
+          set -o pipefail   # a crashed training run must fail the step, not hide behind tee
+          python src/models/train_phase3.py --walk-forward --level-train-years 0 \
+            --features data/processed/features_base.csv \
             2>&1 | tee wf_baseline.log
           cp model_assets/walk_forward_predictions.csv wf_baseline.csv
 
-      - name: "Walk-forward B: full-history level window (Phase 5a candidate)"
+      - name: "Walk-forward B: + Phase 5b wave-1 features (MID, WINDFOR/TSDF/OCNMFD vintages)"
         run: |
+          set -o pipefail   # a crashed training run must fail the step, not hide behind tee
           python src/models/train_phase3.py --walk-forward --level-train-years 0 \
+            --features data/processed/features_5b.csv \
             2>&1 | tee wf_full.log
           cp model_assets/walk_forward_predictions.csv wf_full.csv
 
@@ -91,29 +109,40 @@ jobs:
                   lm, bias = level_mae(g)
                   out[fold] = dict(
                       mae=float((g.ssp_actual - g.ssp_predicted).abs().mean()),
-                      level_mae=lm, level_bias=bias,
+                      level_mae=lm, level_bias=bias, pinball=pinball(g),
                       cov=float(((g.ssp_actual >= g.ssp_q10) & (g.ssp_actual <= g.ssp_q90)).mean()))
               lm, bias = level_mae(df)
               out["ALL"] = dict(
                   mae=float((df.ssp_actual - df.ssp_predicted).abs().mean()),
-                  level_mae=lm, level_bias=bias,
+                  level_mae=lm, level_bias=bias, pinball=pinball(df),
                   cov=float(((df.ssp_actual >= df.ssp_q10) & (df.ssp_actual <= df.ssp_q90)).mean()))
               return out
 
+          def pinball(df):
+              y = df.ssp_actual.values
+              d10 = y - df.ssp_q10.values
+              d90 = y - df.ssp_q90.values
+              pb10 = np.mean(np.maximum(0.10 * d10, -0.90 * d10))
+              pb90 = np.mean(np.maximum(0.90 * d90, -0.10 * d90))
+              return float((pb10 + pb90) / 2)
+
           a, b = summarise("wf_baseline.csv"), summarise("wf_full.csv")
-          print("## Phase 5a validation: level window 3y (baseline) vs full history\n")
-          print("| Fold | MAE 3y | MAE full | Δ% | LvlMAE 3y | LvlMAE full | LvlBias 3y | LvlBias full | cov80 3y | cov80 full |")
-          print("|---|---|---|---|---|---|---|---|---|---|")
+          print("## Phase 5 walk-forward: A = baseline (features off) vs B = candidate (features on)\n")
+          print("| Fold | MAE A | MAE B | ΔMAE% | LvlMAE A | LvlMAE B | Bias A | Bias B | PB A | PB B | ΔPB% | cov A | cov B |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
           for k in list(a.keys()):
               if k not in b: continue
-              d = (b[k]["mae"] / a[k]["mae"] - 1) * 100
+              d   = (b[k]["mae"] / a[k]["mae"] - 1) * 100
+              dpb = (b[k]["pinball"] / a[k]["pinball"] - 1) * 100
               print(f"| {k} | {a[k]['mae']:.2f} | {b[k]['mae']:.2f} | {d:+.1f}% | "
                     f"{a[k]['level_mae']:.2f} | {b[k]['level_mae']:.2f} | "
                     f"{a[k]['level_bias']:+.2f} | {b[k]['level_bias']:+.2f} | "
-                    f"{a[k]['cov']:.2f} | {b[k]['cov']:.2f} |")
-          d_all = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
-          gate = "PASS" if d_all <= -3 and b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02 else "CHECK MANUALLY"
-          print(f"\n**Adoption gate (MAE ≥3% better, no coverage regression): {gate}**")
+                    f"{a[k]['pinball']:.2f} | {b[k]['pinball']:.2f} | {dpb:+.1f}% | "
+                    f"{a[k]['cov']:.3f} | {b[k]['cov']:.3f} |")
+          d_all   = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
+          dpb_all = (b["ALL"]["pinball"] / a["ALL"]["pinball"] - 1) * 100
+          cov_ok  = b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02
+          print(f"\nALL: ΔMAE {d_all:+.1f}%  ΔPinball {dpb_all:+.1f}%  cov {a['ALL']['cov']:.3f} → {b['ALL']['cov']:.3f}")
           EOF
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
 
