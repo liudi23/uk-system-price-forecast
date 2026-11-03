@@ -49,19 +49,22 @@ jobs:
           key: raw-data-${{ github.run_id }}   # never matches — always use restore-keys
           restore-keys: raw-data-
 
-      - name: Top up raw data (same sequence as daily pipeline)
+      # Best-effort: the walk-forward folds end before the cached data does, so a
+      # stale cache only costs the newest few days. An upstream API outage (e.g.
+      # Open-Meteo, 2026-11-03) must not block validation. Each source fails soft.
+      - name: Top up raw data (best effort)
         run: |
-          python src/data/fetch_elexon.py --append
-          python src/data/fetch_weather.py --append
-          python src/data/fetch_generation.py --append
-          python src/data/fetch_cpi.py
+          python src/data/fetch_elexon.py --append     || echo "::warning::Elexon top-up failed — using cached prices"
+          python src/data/fetch_weather.py --append    || echo "::warning::weather top-up failed — using cached weather"
+          python src/data/fetch_generation.py --append || echo "::warning::generation top-up failed — using cached mix"
+          python src/data/fetch_cpi.py                 || echo "::warning::CPI fetch failed — using cached CPI"
 
       # Phase 5b wave 1: top up the committed vintage CSVs (backfill is done by
       # phase5_backfill.yml; this keeps the last few days current for the folds).
-      - name: Top up MID + day-ahead vintages
+      - name: Top up MID + day-ahead vintages (best effort)
         run: |
-          python src/data/fetch_mid.py --append
-          python src/data/fetch_da_vintages.py --append
+          python src/data/fetch_mid.py --append         || echo "::warning::MID top-up failed — using committed vintages"
+          python src/data/fetch_da_vintages.py --append || echo "::warning::vintage top-up failed — using committed vintages"
 
       - name: Extend dataset and build features (A = without 5b data, B = with)
         run: |
