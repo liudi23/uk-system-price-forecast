@@ -52,6 +52,7 @@ VINTAGES     = ROOT / "data" / "vintages" / "da_vintages.csv"
 MID          = ROOT / "data" / "vintages" / "mid_prices.csv"
 ASSETS       = ROOT / "model_assets"
 WF_HGBR      = ASSETS / "walk_forward_predictions.csv"
+LEAR_HISTORY = ASSETS / "lear_forecast_history.csv"
 
 N_SP = 48
 PRICE_LAG_DAYS = (1, 2, 7)
@@ -277,10 +278,88 @@ def fit_production(window_days: int) -> None:
     log.info("saved lear_models.pkl + lear_coefficients.json (fit through %s)", cutoff.date())
 
 
+def predict_next(seed_backtest: str = "") -> None:
+    """Forecast the day after the last complete day in the panel with the saved
+    LEAR models and append to lear_forecast_history.csv (source='live').
+
+    Mirrors the production HGBR timing: at the 12:30 UTC run on day D, day D−1
+    is fully settled, the D vintage (published ≤ D−1 12:00Z) is in
+    data/vintages/, and the target is day D.
+    """
+    import joblib
+    if not (ASSETS / "lear_models.pkl").exists():
+        log.warning("lear_models.pkl missing — run --fit first; skipping predict")
+        return
+    bundle = joblib.load(ASSETS / "lear_models.pkl")
+    models = bundle["models"]
+
+    piv, exog, daily = load_panel()
+    target = piv.index.max() + pd.Timedelta(days=1)
+    # extend the panel index by the target day so design rows exist for it
+    piv = piv.reindex(piv.index.append(pd.DatetimeIndex([target])))
+    for c in exog:
+        exog[c] = exog[c].reindex(piv.index)
+        # vintage for the target day comes from data/vintages (topped up upstream)
+        try:
+            v = pd.read_csv(VINTAGES, parse_dates=["settlement_date"])
+            v["margin_fc_mw"] = v["tsdf_fc_mw"] - v["windfor_fc_mw"]
+            v["wind_pen_fc"]  = 100.0 * v["windfor_fc_mw"] / v["tsdf_fc_mw"]
+            row = v[v["settlement_date"] == target]
+            if len(row):
+                exog[c].loc[target] = (row.set_index("settlement_period")[c]
+                                          .reindex(range(1, N_SP + 1)).values)
+        except Exception as _e:
+            log.warning("target-day vintage unavailable (%s) — NaN", _e)
+    daily = daily.reindex(piv.index)
+
+    dates, X_shared, exog_by_sp, _names = build_design(piv, exog, daily)
+    i = list(dates).index(target)
+    recs = []
+    for s_ in range(1, N_SP + 1):
+        Xs = np.column_stack([X_shared, exog_by_sp[s_]])[i:i + 1]
+        pred, lo, hi = predict_sp(models[s_], Xs)
+        recs.append({"settlement_date": str(target.date()), "settlement_period": s_,
+                     "lear_pred": float(pred[0]), "lear_q10": float(lo[0]),
+                     "lear_q90": float(hi[0]), "source": "live"})
+    new = pd.DataFrame(recs)
+    if LEAR_HISTORY.exists():
+        hist = pd.read_csv(LEAR_HISTORY)
+        combined = (pd.concat([hist, new], ignore_index=True)
+                    .drop_duplicates(subset=["settlement_date", "settlement_period"],
+                                     keep="last")
+                    .sort_values(["settlement_date", "settlement_period"]))
+    else:
+        combined = new
+    combined.to_csv(LEAR_HISTORY, index=False)
+    log.info("LEAR forecast for %s appended → %s (%d rows total)",
+             target.date(), LEAR_HISTORY, len(combined))
+
+
+def seed_history_from_backtest(path: str) -> None:
+    """One-off: seed lear_forecast_history.csv from a walk-forward predictions
+    file so the comparison panel has content before live history accumulates."""
+    bt = pd.read_csv(path)
+    bt = bt.rename(columns={"fold": "_fold"})
+    bt["source"] = "walkforward"
+    bt = bt[["settlement_date", "settlement_period", "lear_pred",
+             "lear_q10", "lear_q90", "source"]]
+    if LEAR_HISTORY.exists():
+        hist = pd.read_csv(LEAR_HISTORY)
+        bt = (pd.concat([bt, hist], ignore_index=True)
+                .drop_duplicates(subset=["settlement_date", "settlement_period"],
+                                 keep="last"))
+    bt.sort_values(["settlement_date", "settlement_period"]).to_csv(LEAR_HISTORY, index=False)
+    log.info("history seeded from %s (%d rows)", path, len(bt))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backtest", action="store_true")
     ap.add_argument("--fit", action="store_true")
+    ap.add_argument("--predict", action="store_true",
+                    help="forecast next day with saved models, append history")
+    ap.add_argument("--seed-history", metavar="WF_CSV",
+                    help="seed lear_forecast_history.csv from a backtest file")
     ap.add_argument("--window-days", type=int, default=1092,
                     help="training window in days (0 = full history)")
     ap.add_argument("--out", default=str(ASSETS / "wf_lear_predictions.csv"))
@@ -290,8 +369,12 @@ def main():
         report(df, args.window_days)
     if args.fit:
         fit_production(args.window_days)
-    if not (args.backtest or args.fit):
-        ap.error("one of --backtest / --fit is required")
+    if args.seed_history:
+        seed_history_from_backtest(args.seed_history)
+    if args.predict:
+        predict_next()
+    if not (args.backtest or args.fit or args.predict or args.seed_history):
+        ap.error("one of --backtest / --fit / --predict / --seed-history is required")
 
 
 if __name__ == "__main__":
