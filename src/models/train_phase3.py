@@ -543,7 +543,7 @@ def decomposition_metrics(pred_df: pd.DataFrame) -> dict:
     peak_timing   : mean |argmax(pred) − argmax(actual)| in SPs per day
     """
     dates = pred_df["settlement_date"].unique()
-    level_errs, shape_corrs, peak_gaps = [], [], []
+    level_errs, shape_corrs, peak_gaps, pit_gaps = [], [], [], []
 
     for d in dates:
         day = pred_df[pred_df["settlement_date"] == d].sort_values("settlement_period")
@@ -561,15 +561,19 @@ def decomposition_metrics(pred_df: pd.DataFrame) -> dict:
             r, _ = pearsonr(act_shape, pred_shape)
             shape_corrs.append(r)
 
-        # Peak timing
+        # Peak / pit timing (wave 1.2b: pits are the targeted defect)
         actual_peak = int(np.argmax(day["ssp_actual"].values))
         pred_peak   = int(np.argmax(day["ssp_predicted"].values))
         peak_gaps.append(abs(pred_peak - actual_peak))
+        actual_pit = int(np.argmin(day["ssp_actual"].values))
+        pred_pit   = int(np.argmin(day["ssp_predicted"].values))
+        pit_gaps.append(abs(pred_pit - actual_pit))
 
     return {
         "level_mae":       round(float(np.mean(level_errs)),   2),
         "shape_corr_mean": round(float(np.mean(shape_corrs)),  4),
         "peak_timing_mae": round(float(np.mean(peak_gaps)),    2),
+        "pit_timing_mae":  round(float(np.mean(pit_gaps)),     2),
         "n_days":          len(dates),
     }
 

@@ -744,6 +744,35 @@ def run_forecast(
         except Exception as _e:
             log.warning("MID fetch failed: %s — MID features → NaN", _e)
 
+    # ── Phase 5b wave 1.2b: within-day-relative margin + solar-profile features ──
+    # Mirrors build_features.py: z/rank/argmax-distance of each SP inside the
+    # day's D−1 margin profile, and relative height/argmax-distance inside the
+    # solar profile. Solar uses the day-ahead forecast when available (same
+    # substitution convention as solar_wm2_lag_48), else yesterday's actuals.
+    def _wave12b_features(h_idx: int, solar_profile) -> dict:
+        out = {"margin_fc_z": float("nan"), "margin_fc_rank": float("nan"),
+               "margin_fc_dist_max": float("nan"), "margin_fc_dist_min": float("nan"),
+               "solar_wm2_lag_48_rel": float("nan"),
+               "solar_wm2_lag_48_distmax": float("nan")}
+        _m = _vin_sp["margin_fc_mw"]
+        _fin = _np5b.isfinite(_m)
+        if _fin.sum() >= 8 and _np5b.isfinite(_m[h_idx]):
+            _sd = float(_np5b.nanstd(_m))
+            if _sd > 0:
+                out["margin_fc_z"] = float((_m[h_idx] - _np5b.nanmean(_m)) / _sd)
+            out["margin_fc_rank"]     = float((_m[_fin] <= _m[h_idx]).mean())
+            out["margin_fc_dist_max"] = float(h_idx - int(_np5b.nanargmax(_m)))
+            out["margin_fc_dist_min"] = float(h_idx - int(_np5b.nanargmin(_m)))
+        if solar_profile is not None:
+            _s = _np5b.asarray(solar_profile, dtype=float)
+            if len(_s) == 48 and _np5b.isfinite(_s).any():
+                _smax = float(_np5b.nanmax(_s))
+                if _np5b.isfinite(_s[h_idx]):
+                    out["solar_wm2_lag_48_rel"] = float(_s[h_idx] / max(_smax, 1.0))
+                if _smax > 0:
+                    out["solar_wm2_lag_48_distmax"] = float(h_idx - int(_np5b.nanargmax(_s)))
+        return out
+
     def _mid_lag_features(day: date, h_idx: int) -> dict:
         """Per-SP MID lags relative to `day` (NaN when history is missing)."""
         from datetime import timedelta as _td
@@ -954,6 +983,11 @@ def run_forecast(
         _m48 = row.get("mid_price_lag_48")
         row["ssp_mid_spread_lag_48"] = (row["ssp_raw_lag_48"] - _m48
                                         if _m48 == _m48 else float("nan"))
+        # Phase 5b wave 1.2b: within-day relative margin/solar position features
+        _solar_prof = target_weather["solar_wm2"]
+        if not np.isfinite(np.asarray(_solar_prof, dtype=float)).any():
+            _solar_prof = weather_hist.get("solar_wm2")
+        row.update(_wave12b_features(h, _solar_prof))
         shape_rows.append(row)
 
     X_shape = np.array([[r.get(c, 0.0) for c in shape_feat_cols] for r in shape_rows])

@@ -19,6 +19,7 @@ import argparse
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 import sys
@@ -40,7 +41,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> pd.DataFrame:
+def build_features(in_path: Path, out_path: Path, use_weather: bool = True,
+                   wave12b: bool = True) -> pd.DataFrame:
     log.info("Loading dataset from %s", in_path)
     df = pd.read_csv(in_path, parse_dates=["settlement_datetime", "settlement_date"])
     df = df.sort_values("settlement_datetime").reset_index(drop=True)
@@ -154,6 +156,54 @@ def build_features(in_path: Path, out_path: Path, use_weather: bool = True) -> p
         log.warning("Weather file not found (%s) — skipping weather features. "
                     "Run src/data/fetch_weather.py to generate it.", WEATHER_FILE)
 
+    # ── Phase 5b wave 1.2b: within-day-relative margin + solar-profile features ──
+    # Diagnosis (pre-registered, docs/phase5b-wave12b-prereg.md): the D−1 margin
+    # profile tracks the evening peak (median error 3 SPs) but misses midday pits
+    # (median error 14 SPs) because solar is absent from TSDF−WINDFOR. These
+    # features encode each SP's POSITION inside the day's forecast margin/solar
+    # profile — relatives are regime-free where raw MW levels drift with capacity.
+    # Leakage: margin_fc_* derive from the D−1 12:00Z vintage (known day-ahead;
+    # the "_fc" pattern keeps them out of the H+2 head). solar_wm2_lag_48_* use
+    # yesterday's observed irradiance; at inference forecast_phase3 substitutes
+    # the day-ahead solar forecast, mirroring the existing solar_wm2_lag_48
+    # convention; the "_lag_48" pattern keeps them out of the H+2 head.
+    if wave12b:
+        df = df.sort_values("settlement_datetime").reset_index(drop=True)
+        df["_sdate_str"] = df["settlement_date"].astype(str).str[:10]
+        if "margin_fc_mw" in df.columns:
+            g = df.groupby("_sdate_str")["margin_fc_mw"]
+            _std = g.transform("std")
+            df["margin_fc_z"]    = (df["margin_fc_mw"] - g.transform("mean")) / _std.where(_std > 0)
+            df["margin_fc_rank"] = g.rank(pct=True)
+            _valid = df.dropna(subset=["margin_fc_mw"])
+            _sp_max = (_valid.loc[_valid.groupby("_sdate_str")["margin_fc_mw"].idxmax(),
+                                  ["_sdate_str", "settlement_period"]]
+                       .set_index("_sdate_str")["settlement_period"])
+            _sp_min = (_valid.loc[_valid.groupby("_sdate_str")["margin_fc_mw"].idxmin(),
+                                  ["_sdate_str", "settlement_period"]]
+                       .set_index("_sdate_str")["settlement_period"])
+            df["margin_fc_dist_max"] = df["settlement_period"] - df["_sdate_str"].map(_sp_max)
+            df["margin_fc_dist_min"] = df["settlement_period"] - df["_sdate_str"].map(_sp_min)
+            log.info("  wave 1.2b margin relatives: %.1f%% coverage",
+                     df["margin_fc_z"].notna().mean() * 100)
+        if "solar_wm2_lag_48" in df.columns:
+            g = df.groupby("_sdate_str")["solar_wm2_lag_48"]
+            _dmax = g.transform("max")
+            # UK midday irradiance is ≥ tens of W/m² even in deep winter; clip(1)
+            # only guards a pathological all-zero day from dividing by zero.
+            df["solar_wm2_lag_48_rel"] = df["solar_wm2_lag_48"] / _dmax.clip(lower=1.0)
+            _solar = df[df["solar_wm2_lag_48"].notna() & (_dmax > 0)]
+            if len(_solar):
+                _sp_smax = (_solar.loc[_solar.groupby("_sdate_str")["solar_wm2_lag_48"].idxmax(),
+                                       ["_sdate_str", "settlement_period"]]
+                            .set_index("_sdate_str")["settlement_period"])
+                df["solar_wm2_lag_48_distmax"] = df["settlement_period"] - df["_sdate_str"].map(_sp_smax)
+            else:
+                df["solar_wm2_lag_48_distmax"] = np.nan
+            log.info("  wave 1.2b solar relatives: %.1f%% coverage",
+                     df["solar_wm2_lag_48_rel"].notna().mean() * 100)
+        df = df.drop(columns=["_sdate_str"])
+
     # Completeness report — binding constraint is ssp_lag_336 (7-day warm-up)
     lag_cols = [c for c in df.columns if "_lag_" in c or "_roll_" in c or "_diff_" in c]
     n_complete = df[lag_cols].notna().all(axis=1).sum()
@@ -174,8 +224,12 @@ def main() -> None:
     parser.add_argument("--input",      default=str(IN_FILE))
     parser.add_argument("--output",     default=str(OUT_FILE))
     parser.add_argument("--no-weather", action="store_true", help="Skip weather feature merge")
+    parser.add_argument("--no-wave12b", action="store_true",
+                        help="Skip wave-1.2b within-day relative margin/solar features "
+                             "(used for the A build in the Phase 5 walk-forward gate)")
     args = parser.parse_args()
-    build_features(Path(args.input), Path(args.output), use_weather=not args.no_weather)
+    build_features(Path(args.input), Path(args.output), use_weather=not args.no_weather,
+                   wave12b=not args.no_wave12b)
 
 
 if __name__ == "__main__":

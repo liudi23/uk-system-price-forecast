@@ -1,10 +1,19 @@
-# Phase 5 validation (5a window: done & adopted; now 5b wave 1): seasonal walk-forward with the
-# FULL CI feature set (weather, generation mix, CPI deflator) under two level-model
-# training windows, and publish the comparison. Manual trigger only; nothing is
-# committed back and production model assets are not overwritten (walk-forward mode
-# never writes the .pkl files).
+# Phase 5 validation. History: 5a window (done, adopted), 5b wave 1 (done, adopted
+# for the shape head). Current experiment: 5b wave 1.2b — within-day-relative margin
+# + solar-profile features for the H+1 shape head (pre-registered in
+# docs/phase5b-wave12b-prereg.md).
 #
-# Usage: Actions UI -> "Phase 5 walk-forward validation" -> Run workflow (branch: phase-5)
+# A = current production feature set (full-history level window + wave-1 MID/vintage
+#     shape features) — built with --no-wave12b
+# B = A + the six wave-1.2b features — default build
+#
+# Seasonal walk-forward with the FULL CI feature set; publishes the gate comparison
+# plus within-day shape diagnostics (shape corr, peak/pit timing). Manual trigger
+# only; nothing is committed back and production model assets are not overwritten
+# (walk-forward mode never writes the .pkl files).
+#
+# Usage: Actions UI -> "Phase 5 walk-forward validation" -> Run workflow
+#        (branch: phase-5-wave1.2b)
 name: Phase 5 walk-forward validation
 
 on:
@@ -56,28 +65,26 @@ jobs:
           python src/data/fetch_generation.py --append
           python src/data/fetch_cpi.py
 
-      # Phase 5b wave 1: top up the committed vintage CSVs (backfill is done by
-      # phase5_backfill.yml; this keeps the last few days current for the folds).
+      # Keep the committed vintage CSVs current for the folds (backfill is done by
+      # phase5_backfill.yml).
       - name: Top up MID + day-ahead vintages
         run: |
           python src/data/fetch_mid.py --append
           python src/data/fetch_da_vintages.py --append
 
-      - name: Extend dataset and build features (A = without 5b data, B = with)
+      - name: Extend dataset and build features (A = production set, B = + wave 1.2b)
         run: |
           python src/data/extend_dataset.py
-          # B: full feature set including Phase 5b vintage/MID features
+          # B: full feature set including the wave-1.2b within-day relatives
           python src/features/build_features.py \
             --input  data/processed/dataset_5yr.csv \
-            --output data/processed/features_5b.csv
-          # A: identical build with the vintage data hidden -> pre-5b feature set
-          mv data/vintages data/_vintages_hidden
-          python src/features/build_features.py \
+            --output data/processed/features_12b.csv
+          # A: identical build minus the wave-1.2b block -> current production set
+          python src/features/build_features.py --no-wave12b \
             --input  data/processed/dataset_5yr.csv \
             --output data/processed/features_base.csv
-          mv data/_vintages_hidden data/vintages
 
-      - name: "Walk-forward A: baseline features (full-history window, no 5b data)"
+      - name: "Walk-forward A: production feature set (wave 1 on, wave 1.2b off)"
         run: |
           set -o pipefail   # a crashed training run must fail the step, not hide behind tee
           python src/models/train_phase3.py --walk-forward --level-train-years 0 \
@@ -85,11 +92,11 @@ jobs:
             2>&1 | tee wf_baseline.log
           cp model_assets/walk_forward_predictions.csv wf_baseline.csv
 
-      - name: "Walk-forward B: + Phase 5b wave-1 features (MID, WINDFOR/TSDF/OCNMFD vintages)"
+      - name: "Walk-forward B: + wave 1.2b relative margin/solar features"
         run: |
           set -o pipefail   # a crashed training run must fail the step, not hide behind tee
           python src/models/train_phase3.py --walk-forward --level-train-years 0 \
-            --features data/processed/features_5b.csv \
+            --features data/processed/features_12b.csv \
             2>&1 | tee wf_full.log
           cp model_assets/walk_forward_predictions.csv wf_full.csv
 
@@ -102,22 +109,6 @@ jobs:
               d = df.groupby("settlement_date").agg(a=("ssp_actual","mean"), p=("pred_level_q50","mean"))
               return float((d.a - d.p).abs().mean()), float((d.p - d.a).mean())
 
-          def summarise(path):
-              df = pd.read_csv(path)
-              out = {}
-              for fold, g in df.groupby("fold"):
-                  lm, bias = level_mae(g)
-                  out[fold] = dict(
-                      mae=float((g.ssp_actual - g.ssp_predicted).abs().mean()),
-                      level_mae=lm, level_bias=bias, pinball=pinball(g),
-                      cov=float(((g.ssp_actual >= g.ssp_q10) & (g.ssp_actual <= g.ssp_q90)).mean()))
-              lm, bias = level_mae(df)
-              out["ALL"] = dict(
-                  mae=float((df.ssp_actual - df.ssp_predicted).abs().mean()),
-                  level_mae=lm, level_bias=bias, pinball=pinball(df),
-                  cov=float(((df.ssp_actual >= df.ssp_q10) & (df.ssp_actual <= df.ssp_q90)).mean()))
-              return out
-
           def pinball(df):
               y = df.ssp_actual.values
               d10 = y - df.ssp_q10.values
@@ -126,8 +117,44 @@ jobs:
               pb90 = np.mean(np.maximum(0.90 * d90, -0.10 * d90))
               return float((pb10 + pb90) / 2)
 
+          def shape_diag(df):
+              """Within-day diagnostics: shape corr, peak/pit timing (per-day argmax/argmin)."""
+              corrs, peak, pit = [], [], []
+              for _, day in df.groupby("settlement_date"):
+                  day = day.sort_values("settlement_period")
+                  if len(day) < 24: continue
+                  a = day.ssp_actual.values; p = day.ssp_predicted.values
+                  aa = a - a.mean(); pp = p - p.mean()
+                  if aa.std() > 0 and pp.std() > 0:
+                      corrs.append(float(np.corrcoef(aa, pp)[0, 1]))
+                  peak.append(abs(int(np.argmax(p)) - int(np.argmax(a))))
+                  pit.append(abs(int(np.argmin(p)) - int(np.argmin(a))))
+              peak = np.array(peak); pit = np.array(pit)
+              return dict(corr=float(np.mean(corrs)) if corrs else float("nan"),
+                          peak_med=float(np.median(peak)) if len(peak) else float("nan"),
+                          pit_med=float(np.median(pit)) if len(pit) else float("nan"),
+                          pit_le2=float((pit <= 2).mean()) if len(pit) else float("nan"))
+
+          def summarise(path):
+              df = pd.read_csv(path)
+              out = {}
+              for fold, g in df.groupby("fold"):
+                  lm, bias = level_mae(g)
+                  out[fold] = dict(
+                      mae=float((g.ssp_actual - g.ssp_predicted).abs().mean()),
+                      level_mae=lm, level_bias=bias, pinball=pinball(g),
+                      cov=float(((g.ssp_actual >= g.ssp_q10) & (g.ssp_actual <= g.ssp_q90)).mean()),
+                      **shape_diag(g))
+              lm, bias = level_mae(df)
+              out["ALL"] = dict(
+                  mae=float((df.ssp_actual - df.ssp_predicted).abs().mean()),
+                  level_mae=lm, level_bias=bias, pinball=pinball(df),
+                  cov=float(((df.ssp_actual >= df.ssp_q10) & (df.ssp_actual <= df.ssp_q90)).mean()),
+                  **shape_diag(df))
+              return out
+
           a, b = summarise("wf_baseline.csv"), summarise("wf_full.csv")
-          print("## Phase 5 walk-forward: A = baseline (features off) vs B = candidate (features on)\n")
+          print("## Phase 5 wave 1.2b walk-forward: A = production set vs B = + relative margin/solar\n")
           print("| Fold | MAE A | MAE B | ΔMAE% | LvlMAE A | LvlMAE B | Bias A | Bias B | PB A | PB B | ΔPB% | cov A | cov B |")
           print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
           for k in list(a.keys()):
@@ -139,10 +166,20 @@ jobs:
                     f"{a[k]['level_bias']:+.2f} | {b[k]['level_bias']:+.2f} | "
                     f"{a[k]['pinball']:.2f} | {b[k]['pinball']:.2f} | {dpb:+.1f}% | "
                     f"{a[k]['cov']:.3f} | {b[k]['cov']:.3f} |")
+          print("\n### Within-day shape diagnostics (wave 1.2b secondary endpoints)\n")
+          print("| Fold | ShapeCorr A | ShapeCorr B | PeakMed A | PeakMed B | PitMed A | PitMed B | Pit≤2SP A | Pit≤2SP B |")
+          print("|---|---|---|---|---|---|---|---|---|")
+          for k in list(a.keys()):
+              if k not in b: continue
+              print(f"| {k} | {a[k]['corr']:.3f} | {b[k]['corr']:.3f} | "
+                    f"{a[k]['peak_med']:.0f} | {b[k]['peak_med']:.0f} | "
+                    f"{a[k]['pit_med']:.0f} | {b[k]['pit_med']:.0f} | "
+                    f"{a[k]['pit_le2']:.0%} | {b[k]['pit_le2']:.0%} |")
           d_all   = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
           dpb_all = (b["ALL"]["pinball"] / a["ALL"]["pinball"] - 1) * 100
-          cov_ok  = b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02
           print(f"\nALL: ΔMAE {d_all:+.1f}%  ΔPinball {dpb_all:+.1f}%  cov {a['ALL']['cov']:.3f} → {b['ALL']['cov']:.3f}")
+          print(f"Gate (pre-registered): ΔMAE ≤ −3% or ΔPinball ≤ −5%, coverage drop ≤ 0.02. "
+                f"Shape diagnostics are secondary endpoints — not sufficient for adoption alone.")
           EOF
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
 
