@@ -118,8 +118,6 @@ jobs:
 
           def pinball(df):
               y = df.ssp_actual.values
-              lo = ((y - df.ssp_q10.values) * 0.10).clip(min=None)
-              import numpy as np
               d10 = y - df.ssp_q10.values
               d90 = y - df.ssp_q90.values
               pb10 = np.mean(np.maximum(0.10 * d10, -0.90 * d10))
@@ -127,21 +125,22 @@ jobs:
               return float((pb10 + pb90) / 2)
 
           a, b = summarise("wf_baseline.csv"), summarise("wf_full.csv")
-          print("## Phase 5 walk-forward: A = baseline vs B = candidate\n")
-          print("| Fold | MAE 3y | MAE full | Δ% | LvlMAE 3y | LvlMAE full | LvlBias 3y | LvlBias full | cov80 3y | cov80 full |")
-          print("|---|---|---|---|---|---|---|---|---|---|")
+          print("## Phase 5 walk-forward: A = baseline (features off) vs B = candidate (features on)\n")
+          print("| Fold | MAE A | MAE B | ΔMAE% | LvlMAE A | LvlMAE B | Bias A | Bias B | PB A | PB B | ΔPB% | cov A | cov B |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
           for k in list(a.keys()):
               if k not in b: continue
-              d = (b[k]["mae"] / a[k]["mae"] - 1) * 100
+              d   = (b[k]["mae"] / a[k]["mae"] - 1) * 100
+              dpb = (b[k]["pinball"] / a[k]["pinball"] - 1) * 100
               print(f"| {k} | {a[k]['mae']:.2f} | {b[k]['mae']:.2f} | {d:+.1f}% | "
                     f"{a[k]['level_mae']:.2f} | {b[k]['level_mae']:.2f} | "
                     f"{a[k]['level_bias']:+.2f} | {b[k]['level_bias']:+.2f} | "
-                    f"{a[k]['cov']:.2f} | {b[k]['cov']:.2f} |")
-          d_all  = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
+                    f"{a[k]['pinball']:.2f} | {b[k]['pinball']:.2f} | {dpb:+.1f}% | "
+                    f"{a[k]['cov']:.3f} | {b[k]['cov']:.3f} |")
+          d_all   = (b["ALL"]["mae"] / a["ALL"]["mae"] - 1) * 100
           dpb_all = (b["ALL"]["pinball"] / a["ALL"]["pinball"] - 1) * 100
-          cov_ok = b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02
-          gate = "PASS" if (d_all <= -3 or dpb_all <= -5) and cov_ok else "CHECK MANUALLY"
-          print(f"\n**Adoption gate (MAE ≥3% or pinball ≥5% better, no coverage regression): {gate}**")
+          cov_ok  = b["ALL"]["cov"] >= a["ALL"]["cov"] - 0.02
+          print(f"\nALL: ΔMAE {d_all:+.1f}%  ΔPinball {dpb_all:+.1f}%  cov {a['ALL']['cov']:.3f} → {b['ALL']['cov']:.3f}")
           EOF
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
 

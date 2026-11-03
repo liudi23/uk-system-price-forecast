@@ -219,7 +219,25 @@ def build_level_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
+# Phase 5b wave 1.1 (2026-11-03): wave-1 validation showed the per-SP vintage
+# features are a clear SHAPE win (overall MAE −7.6%) but these daily aggregates
+# HARM the level model (level MAE +24%, autumn-2026 worse) — raw MW levels are
+# non-stationary across the 5.5y window (wind capacity ~doubled), so one global
+# MW→price mapping misreads both eras. Excluded from the level model pending a
+# wave-1.2 test of normalised variants (penetration %, margin fraction).
+# They are still aggregated above so inference code and future tests can use them.
+LEVEL_EXCLUDE_5B = {
+    "windfor_fc_daily_mean", "tsdf_fc_daily_mean", "tsdf_fc_daily_max",
+    "margin_fc_daily_min", "margin_fc_daily_mean", "wind_pen_fc_daily_mean",
+    "surplus_fc",
+    "mid_daily_mean_lag1d", "mid_daily_mean_lag7d", "mid_daily_roll_mean_7d",
+    "ssp_mid_spread_lag1d",
+}
+
+
 def get_level_feature_cols(daily: pd.DataFrame) -> list:
-    """Return model feature columns for the level model (excludes target and
-    contemporaneous day-D aggregates)."""
-    return [c for c in daily.columns if c not in _CONTEMPORANEOUS]
+    """Return model feature columns for the level model (excludes target,
+    contemporaneous day-D aggregates, and the wave-1 vintage/MID aggregates —
+    see LEVEL_EXCLUDE_5B)."""
+    return [c for c in daily.columns
+            if c not in _CONTEMPORANEOUS and c not in LEVEL_EXCLUDE_5B]
