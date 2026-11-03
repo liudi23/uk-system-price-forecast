@@ -420,12 +420,30 @@ def train_neg_day_classifier(train_daily: pd.DataFrame, val_daily: pd.DataFrame)
     return clf, avail
 
 
+
+# Phase 5b: optional data sources (MID market index, day-ahead forecast vintages,
+# weather) may have gaps — HGBR handles NaN natively, so completeness is only
+# required of CORE features. Requiring all-features-complete silently dropped
+# ~40% of shape training rows and emptied whole evaluation days once the
+# gap-bearing vintage features arrived (2026-11-03 incident).
+OPTIONAL_FEATURE_PREFIXES = (
+    "mid_", "ssp_mid_", "windfor_", "tsdf_", "margin_fc", "wind_pen_fc",
+    "surplus_fc", "temp_c_", "wind_ms_", "solar_wm2_", "precip_mm_",
+    "heating_", "cooling_", "wind_pct_", "gas_pct_", "cpi_",
+)
+
+
+def _core_cols(cols):
+    """Feature columns whose completeness is required (non-optional sources)."""
+    return [c for c in cols if not any(c.startswith(p) for p in OPTIONAL_FEATURE_PREFIXES)]
+
 def train_shape_model(train_sp, val_sp, feat_cols):
     """Train P50 HGBR on intra-day shape deviations (CPI-deflated to real terms)."""
     combined = pd.concat([train_sp, val_sp], ignore_index=True)
     # Drop all-NaN columns before mask so they don't eliminate every row
     feat_cols = [c for c in feat_cols if combined[c].notna().any()]
-    mask     = combined["ssp_shape_target"].notna() & combined[feat_cols].notna().all(axis=1)
+    # Completeness required of core features only; optional sources may be NaN.
+    mask     = combined["ssp_shape_target"].notna() & combined[_core_cols(feat_cols)].notna().all(axis=1)
     combined = combined[mask]
     X        = combined[feat_cols].values
     # Deflate shape target to real terms (deviation * deflator stays interpretable)
@@ -485,7 +503,7 @@ def evaluate_phase3(level_models, shape_model,
         if day_sps.empty:
             continue
 
-        mask = day_sps[shape_feat_cols].notna().all(axis=1)
+        mask = day_sps[_core_cols(shape_feat_cols)].notna().all(axis=1)
         X_sh = day_sps.loc[mask, shape_feat_cols].values
         dev  = shape_model.predict(X_sh)
 
