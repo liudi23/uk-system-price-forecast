@@ -565,10 +565,31 @@ if LEAR_HISTORY.exists():
                     "Actual":      g.actual.mean(),
                 }), include_groups=False).reset_index()
 
+            # Seeded (walk-forward backtest) vs live boundary. Headline metrics
+            # switch to live-only rows once ≥7 live days have settled — a seeded
+            # LEAR backtest vs as-published HGBR is not a fair live comparison.
+            _live_start = None
+            if "source" in _cmp.columns and (_cmp["source"] == "live").any():
+                _live_start = _cmp.loc[_cmp["source"] == "live", "date"].min()
+            _live_daily = (_daily[_daily["date"] >= _live_start]
+                           if _live_start is not None else _daily.iloc[0:0])
+            _use_live = len(_live_daily) >= 7
+            _md = _live_daily if _use_live else _daily
+            _suffix = (f"live MAE ({len(_live_daily)}d)" if _use_live
+                       else "MAE (incl. backtest seed)")
             _m1, _m2, _m3 = st.columns(3)
-            _m1.metric("HGBR 30-day MAE", f"£{_daily['HGBR'].mean():.1f}/MWh")
-            _m2.metric("LEAR 30-day MAE", f"£{_daily['LEAR'].mean():.1f}/MWh")
-            _m3.metric("Persistence 30-day MAE", f"£{_daily['Persistence'].mean():.1f}/MWh")
+            _m1.metric(f"HGBR {_suffix}", f"£{_md['HGBR'].mean():.1f}/MWh")
+            _m2.metric(f"LEAR {_suffix}", f"£{_md['LEAR'].mean():.1f}/MWh")
+            _m3.metric(f"Persistence {_suffix}", f"£{_md['Persistence'].mean():.1f}/MWh")
+            if not _use_live:
+                st.caption(
+                    "⚠️ Headline numbers still include the seeded walk-forward "
+                    "period, where LEAR is a fresh backtest but HGBR is the "
+                    "as-published (pre-upgrade) forecast — not a like-for-like "
+                    "comparison. Metrics switch to live-only once 7 live days settle; "
+                    "the validated apples-to-apples verdict is the walk-forward "
+                    "(LEAR/HGBR = 1.065 overall)."
+                )
 
             _fig_cmp = go.Figure()
             for _name, _color in [("HGBR", "#e05c00"), ("LEAR", "#2a9d8f"),
@@ -595,6 +616,20 @@ if LEAR_HISTORY.exists():
                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
                             xanchor="right", x=1),
             )
+            if _live_start is not None and _live_start > _daily["date"].min():
+                _fig_cmp.add_vrect(
+                    x0=_daily["date"].min(), x1=_live_start,
+                    fillcolor="rgba(120,120,120,0.08)", layer="below", line_width=0,
+                    annotation_text="walk-forward seed (not like-for-like)",
+                    annotation_position="top left",
+                    annotation_font=dict(size=10, color="grey"),
+                )
+                _fig_cmp.add_vline(
+                    x=_live_start.value / 1e6, line_dash="dot",
+                    line_color="#2a9d8f", line_width=1.5,
+                    annotation_text="live →", annotation_position="top right",
+                    annotation_font=dict(size=10, color="#2a9d8f"),
+                )
             st.plotly_chart(_fig_cmp)
             _src_counts = _lh["source"].value_counts().to_dict() if "source" in _lh.columns else {}
             if _src_counts.get("walkforward"):
