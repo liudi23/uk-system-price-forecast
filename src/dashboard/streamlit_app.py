@@ -9,6 +9,7 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -541,14 +542,17 @@ if LEAR_HISTORY.exists():
         _hg_rows = []
         for _d, _f in sorted(_hg_files.items()):
             try:
-                _g = pd.read_csv(_f, usecols=["settlement_period", "ssp_q50"])
+                _g = pd.read_csv(_f, usecols=["settlement_period", "ssp_q50",
+                                              "ssp_q10", "ssp_q90"])
                 _g["settlement_date"] = _d
                 _hg_rows.append(_g)
             except Exception:
                 continue
         _hg = (pd.concat(_hg_rows, ignore_index=True)
-                 .rename(columns={"ssp_q50": "hgbr"})) if _hg_rows else pd.DataFrame(
-                 columns=["settlement_date", "settlement_period", "hgbr"])
+                 .rename(columns={"ssp_q50": "hgbr", "ssp_q10": "hgbr_q10",
+                                  "ssp_q90": "hgbr_q90"})) if _hg_rows else pd.DataFrame(
+                 columns=["settlement_date", "settlement_period", "hgbr",
+                          "hgbr_q10", "hgbr_q90"])
 
         _cmp = (_lh.merge(_act, on=["settlement_date", "settlement_period"])
                    .merge(_prev, on=["settlement_date", "settlement_period"], how="left")
@@ -557,13 +561,27 @@ if LEAR_HISTORY.exists():
         _cmp = _cmp[_cmp["date"] >= _cmp["date"].max() - pd.Timedelta(days=30)]
 
         if len(_cmp) >= 48:
+            def _pb(y, lo, hi):
+                _d10, _d90 = y - lo, y - hi
+                return float((np.maximum(0.10 * _d10, -0.90 * _d10).mean()
+                              + np.maximum(0.90 * _d90, -0.10 * _d90).mean()) / 2)
+
             _daily = _cmp.groupby("date").apply(
                 lambda g: pd.Series({
                     "LEAR":        (g.actual - g.lear_pred).abs().mean(),
                     "HGBR":        (g.actual - g.hgbr).abs().mean(),
                     "Persistence": (g.actual - g.persistence).abs().mean(),
+                    "LEAR_PB":     _pb(g.actual.values, g.lear_q10.values,
+                                       g.lear_q90.values),
+                    "HGBR_PB":     (_pb(g.actual.values, g.hgbr_q10.values,
+                                        g.hgbr_q90.values)
+                                    if g.hgbr_q10.notna().any() else np.nan),
                     "Actual":      g.actual.mean(),
                 }), include_groups=False).reset_index()
+
+            _metric = st.radio("Metric", ["MAE", "Pinball (P10/P90)"],
+                               horizontal=True, label_visibility="collapsed")
+            _is_pb = _metric.startswith("Pinball")
 
             # Seeded (walk-forward backtest) vs live boundary. Headline metrics
             # switch to live-only rows once ≥7 live days have settled — a seeded
@@ -578,9 +596,16 @@ if LEAR_HISTORY.exists():
             _suffix = (f"live MAE ({len(_live_daily)}d)" if _use_live
                        else "MAE (incl. backtest seed)")
             _m1, _m2, _m3 = st.columns(3)
-            _m1.metric(f"HGBR {_suffix}", f"£{_md['HGBR'].mean():.1f}/MWh")
-            _m2.metric(f"LEAR {_suffix}", f"£{_md['LEAR'].mean():.1f}/MWh")
-            _m3.metric(f"Persistence {_suffix}", f"£{_md['Persistence'].mean():.1f}/MWh")
+            if _is_pb:
+                _suffix = _suffix.replace("MAE", "pinball")
+                _m1.metric(f"HGBR {_suffix}", f"£{_md['HGBR_PB'].mean():.1f}")
+                _m2.metric(f"LEAR {_suffix}", f"£{_md['LEAR_PB'].mean():.1f}")
+                _m3.metric("Persistence", "—",
+                           help="Persistence has no quantile bands")
+            else:
+                _m1.metric(f"HGBR {_suffix}", f"£{_md['HGBR'].mean():.1f}/MWh")
+                _m2.metric(f"LEAR {_suffix}", f"£{_md['LEAR'].mean():.1f}/MWh")
+                _m3.metric(f"Persistence {_suffix}", f"£{_md['Persistence'].mean():.1f}/MWh")
             if not _use_live:
                 st.caption(
                     "⚠️ Headline numbers still include the seeded walk-forward "
@@ -591,11 +616,14 @@ if LEAR_HISTORY.exists():
                     "(LEAR/HGBR = 1.065 overall)."
                 )
 
+            _series = ([("HGBR", "HGBR_PB", "#e05c00"), ("LEAR", "LEAR_PB", "#2a9d8f")]
+                       if _is_pb else
+                       [("HGBR", "HGBR", "#e05c00"), ("LEAR", "LEAR", "#2a9d8f"),
+                        ("Persistence", "Persistence", "#8ab4d4")])
             _fig_cmp = go.Figure()
-            for _name, _color in [("HGBR", "#e05c00"), ("LEAR", "#2a9d8f"),
-                                  ("Persistence", "#8ab4d4")]:
+            for _name, _col, _color in _series:
                 _fig_cmp.add_trace(go.Scatter(
-                    x=_daily["date"], y=_daily[_name], name=_name, mode="lines",
+                    x=_daily["date"], y=_daily[_col], name=_name, mode="lines",
                     line=dict(color=_color, width=2,
                               dash="dash" if _name == "Persistence" else "solid"),
                     hovertemplate=_name + " £%{y:.1f}<extra></extra>",
@@ -609,7 +637,7 @@ if LEAR_HISTORY.exists():
                 hovertemplate="Actual £%{y:.1f}<extra></extra>",
             ))
             _fig_cmp.update_layout(
-                xaxis_title="Day", yaxis_title="Daily MAE £/MWh", height=280,
+                xaxis_title="Day", yaxis_title=("Daily pinball £" if _is_pb else "Daily MAE £/MWh"), height=280,
                 margin=dict(t=30, b=40), hovermode="x unified",
                 yaxis2=dict(title="Actual £/MWh", overlaying="y", side="right",
                             showgrid=False),
