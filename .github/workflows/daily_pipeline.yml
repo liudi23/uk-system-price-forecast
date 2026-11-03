@@ -171,6 +171,10 @@ jobs:
           git add -f data/processed/dataset_5yr.csv \
                      data/processed/features_recent.csv
           git add    model_assets/kalman_state.json \
+                     model_assets/level_feature_cols.json \
+                     model_assets/shape_feature_cols.json \
+                     model_assets/shape_h2_feature_cols.json \
+                     model_assets/neg_day_classifier_feats.json \
                      model_assets/next_day_forecast_phase3.csv \
                      model_assets/day2_forecast_phase3.csv \
                      model_assets/nowcast_bands.json \
