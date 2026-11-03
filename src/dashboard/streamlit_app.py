@@ -562,6 +562,7 @@ if LEAR_HISTORY.exists():
                     "LEAR":        (g.actual - g.lear_pred).abs().mean(),
                     "HGBR":        (g.actual - g.hgbr).abs().mean(),
                     "Persistence": (g.actual - g.persistence).abs().mean(),
+                    "Actual":      g.actual.mean(),
                 }), include_groups=False).reset_index()
 
             _m1, _m2, _m3 = st.columns(3)
@@ -578,9 +579,19 @@ if LEAR_HISTORY.exists():
                               dash="dash" if _name == "Persistence" else "solid"),
                     hovertemplate=_name + " £%{y:.1f}<extra></extra>",
                 ))
+            # Actual daily mean price on a secondary axis — errors in context:
+            # MAE spikes are legible against the price level that caused them.
+            _fig_cmp.add_trace(go.Scatter(
+                x=_daily["date"], y=_daily["Actual"], name="Actual daily mean",
+                mode="lines", yaxis="y2",
+                line=dict(color="#c0392b", width=1.5, dash="dot"), opacity=0.7,
+                hovertemplate="Actual £%{y:.1f}<extra></extra>",
+            ))
             _fig_cmp.update_layout(
                 xaxis_title="Day", yaxis_title="Daily MAE £/MWh", height=280,
                 margin=dict(t=30, b=40), hovermode="x unified",
+                yaxis2=dict(title="Actual £/MWh", overlaying="y", side="right",
+                            showgrid=False),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02,
                             xanchor="right", x=1),
             )
