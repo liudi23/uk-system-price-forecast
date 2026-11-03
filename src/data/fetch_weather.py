@@ -49,9 +49,12 @@ VARIABLES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TIMEOUT      = 60   # seconds per attempt
-MAX_RETRIES  = 3
-BACKOFF_BASE = 5    # seconds; delays are 5, 10, 20
+# 2026-11-03: raised from 60s/3 attempts after archive-api.open-meteo.com
+# timed out 3x in a row and killed a forced retrain run. 5 attempts with
+# delays 10,20,40,80s rides out their typical multi-minute blips.
+TIMEOUT      = 90   # seconds per attempt
+MAX_RETRIES  = 5
+BACKOFF_BASE = 10   # seconds; delays are 10, 20, 40, 80
 
 
 def _request_with_retry(url: str, params: dict) -> requests.Response:

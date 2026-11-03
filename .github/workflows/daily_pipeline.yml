@@ -81,6 +81,12 @@ jobs:
 
       - name: Update recent weather
         if: steps.data-cache.outputs.cache-hit == 'true'
+        # Weather is auxiliary: build_features forward-fills gaps and HGBR handles
+        # NaN natively. An Open-Meteo outage must not block the retrain/forecast
+        # (2026-11-03 incident: 3x archive-API timeouts killed a forced retrain).
+        # Persistent failures still surface via the builder's 'rows unmatched'
+        # warning and stale weather lags in the monitoring report.
+        continue-on-error: true
         run: python src/data/fetch_weather.py --append
 
       - name: Append latest generation mix
