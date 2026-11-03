@@ -555,8 +555,8 @@ with _meth_right:
     st.markdown(
         f"<div style='{_meth_style}'>"
         f"<p style='{_meth_item}'>· <b>Calibrated uncertainty:</b> split-conformal per-SP δ lifts "
-        f"80%-band coverage <b>{_pi_cov_str}</b> (119-day walk-forward)</p>"
-        f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£27.39/MWh</b> (119 days · 4 seasons) · "
+        f"80%-band coverage <b>{_pi_cov_str}</b> (148-day walk-forward)</p>"
+        f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£30.11/MWh</b> (148 days · 5 seasonal folds incl. autumn-2026) · "
         f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}</p>"
         f"</div>",
         unsafe_allow_html=True,
