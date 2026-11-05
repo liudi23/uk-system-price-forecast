@@ -502,7 +502,128 @@ else:
         "No forecast found. Run `python src/models/forecast_phase3.py` to generate one."
     )
 
+# ── Model & methodology reference ─────────────────────────────────────────────
+# Moved below the Day-Ahead panel (2026-10-30) so the live chart is visible on
+# the first screen; content unchanged.
+st.divider()
+st.caption(
+    f"Data: Elexon BMRS · {start_date} → {end_date} · "
+    f"{len(dff):,} settlement periods"
+)
+st.caption(
+    "Settlement period reference: SP *n* starts at (*n*−1)×30 min after 00:00 UK local time "
+    "(GMT in winter, BST in summer) · SP 1 = 00:00 · SP 17 = 08:00 · SP 25 = 12:00 · "
+    "SP 33 = 16:00 · SP 48 = 23:30"
+)
+
+# ── Production model banner ───────────────────────────────────────────────────
+_m = load_p3_metrics()
+_p3 = _m.get("Phase3_P50_two_stage", {})
+_dc = _m.get("decomposition", {})
+_mae_str   = f"£{_p3['MAE']:.2f}/MWh"           if "MAE"             in _p3 else "—"
+_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"       in _dc else "—"
+_corr_str  = f"{_dc['shape_corr_mean']:.3f}"     if "shape_corr_mean" in _dc else "—"
+_pi_cov_str = "—"
+if PI_CAL_JSON.exists():
+    _pi = json.load(open(PI_CAL_JSON))
+    _cov_before = _pi.get("coverage_before", 0)
+    _cov_after  = _pi.get("coverage_after_insample_per_sp", 0)
+    _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
+st.info(
+    "**UK System Sell Price (SSP) forecast** — two-stage level–shape model "
+    "(gradient-boosted HGBR), retrained weekly on a rolling 3-year, CPI-adjusted window · "
+    "zero-leakage (every feature lagged ≥ its forecast horizon)"
+)
+
+# Compact methodology reference (tight line spacing, caption-sized text).
+# Five short items in a balanced 2-col grid; the long nowcast item spans full
+# width underneath so it doesn't force one column to overrun the other.
+_meth_style = "font-size:0.86em; line-height:1.35; margin:0"
+_meth_item  = "margin:0 0 5px 0"
+_meth_left, _meth_right = st.columns(2)
+with _meth_left:
+    st.markdown(
+        f"<div style='{_meth_style}'>"
+        f"<p style='{_meth_item}'>· <b>Stage 1 — level:</b> daily-mean SSP (P10 / P50 / P90)</p>"
+        f"<p style='{_meth_item}'>· <b>Stage 2 — shape:</b> per-settlement-period deviation · "
+        f"H+1 head uses lags ≥ 48 SPs · H+2 head uses lags ≥ 96 SPs</p>"
+        f"<p style='{_meth_item}'>· <b>Intraday correction:</b> hourly scalar Kalman bias correction "
+        f"(horizon decay γ = 0.966) as settled prices arrive</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+with _meth_right:
+    st.markdown(
+        f"<div style='{_meth_style}'>"
+        f"<p style='{_meth_item}'>· <b>Calibrated uncertainty:</b> split-conformal per-SP δ lifts "
+        f"80%-band coverage <b>{_pi_cov_str}</b> (148-day walk-forward)</p>"
+        f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£30.11/MWh</b> (148 days · 5 seasonal folds incl. autumn-2026) · "
+        f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+st.markdown(
+    f"<div style='{_meth_style}'>"
+    f"<p style='{_meth_item}'>· <b>Intraday nowcast</b> (H+1 / H+2 / H+3, ≈30–90 min): "
+    f"persistence point forecast + 80% empirical P10/P90 bands (18-month trailing window, "
+    f"NP/EN regime-aware), updated every 30 min as SPs settle. "
+    f"Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
+    f"under 90 min); the day-ahead model takes over from ~H+4.</p>"
+    f"</div>",
+    unsafe_allow_html=True,
+)
+
+# ── H+2 forecast panel (tomorrow) ────────────────────────────────────────────
+if FORECAST_PATH_H2.exists():
+    fc_h2  = pd.read_csv(FORECAST_PATH_H2, parse_dates=["settlement_datetime"])
+    h2_date = fc_h2["settlement_date"].iloc[0]
+
+    _h1_date = fc["settlement_date"].iloc[0] if _fc_path.exists() else None
+    _h2_is_stale = _h1_date is not None and h2_date <= _h1_date
+    h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
+    h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
+
+    if _h2_is_stale:
+        _tomorrow = (pd.to_datetime(_h1_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        st.subheader(f"Tomorrow Forecast · H+2 · {_tomorrow}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
+        st.warning(
+            "Today's H+2 forecast will be refreshed after the 12:30 UTC daily pipeline run. "
+            "Showing yesterday's two-day-ahead estimate as a preliminary guide."
+        )
+    else:
+        st.subheader(f"Tomorrow Forecast · H+2 · {h2_date}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
+    st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
+
+    h2m1, h2m2, h2m3 = st.columns(3)
+    h2m1.metric("H+2 Date", _tomorrow if _h2_is_stale else h2_date)
+    h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
+    h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
+
+    fig_h2 = go.Figure()
+    if "ssp_q10" in fc_h2.columns:
+        fig_h2.add_trace(go.Scatter(
+            x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
+            y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
+            fill="toself", fillcolor="rgba(42,157,143,0.18)",
+            line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
+        ))
+    fig_h2.add_trace(go.Scatter(
+        x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
+        name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
+        hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
+        customdata=fc_h2["settlement_period"],
+    ))
+    fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
+                     annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
+    fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
+                          height=300, margin=dict(t=10, b=40), hovermode="x unified",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(fig_h2)
+
+st.divider()
+
 # ── Model comparison: HGBR vs LEAR vs persistence (Phase 5c) ─────────────────
+# Moved below the Tomorrow (H+2) panel per user request (2026-11-04); content unchanged.
 LEAR_HISTORY = ROOT / "model_assets" / "lear_forecast_history.csv"
 LEAR_COEFS   = ROOT / "model_assets" / "lear_coefficients.json"
 
@@ -697,125 +818,6 @@ if LEAR_HISTORY.exists():
     except Exception as _e:
         st.warning(f"Model comparison unavailable: {_e}")
 
-# ── Model & methodology reference ─────────────────────────────────────────────
-# Moved below the Day-Ahead panel (2026-10-30) so the live chart is visible on
-# the first screen; content unchanged.
-st.divider()
-st.caption(
-    f"Data: Elexon BMRS · {start_date} → {end_date} · "
-    f"{len(dff):,} settlement periods"
-)
-st.caption(
-    "Settlement period reference: SP *n* starts at (*n*−1)×30 min after 00:00 UK local time "
-    "(GMT in winter, BST in summer) · SP 1 = 00:00 · SP 17 = 08:00 · SP 25 = 12:00 · "
-    "SP 33 = 16:00 · SP 48 = 23:30"
-)
-
-# ── Production model banner ───────────────────────────────────────────────────
-_m = load_p3_metrics()
-_p3 = _m.get("Phase3_P50_two_stage", {})
-_dc = _m.get("decomposition", {})
-_mae_str   = f"£{_p3['MAE']:.2f}/MWh"           if "MAE"             in _p3 else "—"
-_lvl_str   = f"£{_dc['level_mae']:.2f}/MWh/day" if "level_mae"       in _dc else "—"
-_corr_str  = f"{_dc['shape_corr_mean']:.3f}"     if "shape_corr_mean" in _dc else "—"
-_pi_cov_str = "—"
-if PI_CAL_JSON.exists():
-    _pi = json.load(open(PI_CAL_JSON))
-    _cov_before = _pi.get("coverage_before", 0)
-    _cov_after  = _pi.get("coverage_after_insample_per_sp", 0)
-    _pi_cov_str = f"{_cov_before:.0%} → {_cov_after:.1%}"
-st.info(
-    "**UK System Sell Price (SSP) forecast** — two-stage level–shape model "
-    "(gradient-boosted HGBR), retrained weekly on a rolling 3-year, CPI-adjusted window · "
-    "zero-leakage (every feature lagged ≥ its forecast horizon)"
-)
-
-# Compact methodology reference (tight line spacing, caption-sized text).
-# Five short items in a balanced 2-col grid; the long nowcast item spans full
-# width underneath so it doesn't force one column to overrun the other.
-_meth_style = "font-size:0.86em; line-height:1.35; margin:0"
-_meth_item  = "margin:0 0 5px 0"
-_meth_left, _meth_right = st.columns(2)
-with _meth_left:
-    st.markdown(
-        f"<div style='{_meth_style}'>"
-        f"<p style='{_meth_item}'>· <b>Stage 1 — level:</b> daily-mean SSP (P10 / P50 / P90)</p>"
-        f"<p style='{_meth_item}'>· <b>Stage 2 — shape:</b> per-settlement-period deviation · "
-        f"H+1 head uses lags ≥ 48 SPs · H+2 head uses lags ≥ 96 SPs</p>"
-        f"<p style='{_meth_item}'>· <b>Intraday correction:</b> hourly scalar Kalman bias correction "
-        f"(horizon decay γ = 0.966) as settled prices arrive</p>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-with _meth_right:
-    st.markdown(
-        f"<div style='{_meth_style}'>"
-        f"<p style='{_meth_item}'>· <b>Calibrated uncertainty:</b> split-conformal per-SP δ lifts "
-        f"80%-band coverage <b>{_pi_cov_str}</b> (148-day walk-forward)</p>"
-        f"<p style='{_meth_item}'>· <b>Accuracy:</b> WF MAE <b>£30.11/MWh</b> (148 days · 5 seasonal folds incl. autumn-2026) · "
-        f"7-day holdout {_mae_str} · Level MAE {_lvl_str} · Shape corr {_corr_str}</p>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-st.markdown(
-    f"<div style='{_meth_style}'>"
-    f"<p style='{_meth_item}'>· <b>Intraday nowcast</b> (H+1 / H+2 / H+3, ≈30–90 min): "
-    f"persistence point forecast + 80% empirical P10/P90 bands (18-month trailing window, "
-    f"NP/EN regime-aware), updated every 30 min as SPs settle. "
-    f"Persistence is the operative short-horizon forecast (~2× the day-ahead model's accuracy "
-    f"under 90 min); the day-ahead model takes over from ~H+4.</p>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-
-# ── H+2 forecast panel (tomorrow) ────────────────────────────────────────────
-if FORECAST_PATH_H2.exists():
-    fc_h2  = pd.read_csv(FORECAST_PATH_H2, parse_dates=["settlement_datetime"])
-    h2_date = fc_h2["settlement_date"].iloc[0]
-
-    _h1_date = fc["settlement_date"].iloc[0] if _fc_path.exists() else None
-    _h2_is_stale = _h1_date is not None and h2_date <= _h1_date
-    h2_p50  = "ssp_q50" if "ssp_q50" in fc_h2.columns else "ssp_predicted"
-    h2_lvl  = fc_h2["pred_daily_level"].iloc[0] if "pred_daily_level" in fc_h2.columns else fc_h2[h2_p50].mean()
-
-    if _h2_is_stale:
-        _tomorrow = (pd.to_datetime(_h1_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        st.subheader(f"Tomorrow Forecast · H+2 · {_tomorrow}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
-        st.warning(
-            "Today's H+2 forecast will be refreshed after the 12:30 UTC daily pipeline run. "
-            "Showing yesterday's two-day-ahead estimate as a preliminary guide."
-        )
-    else:
-        st.subheader(f"Tomorrow Forecast · H+2 · {h2_date}  (daily level P50 = £{h2_lvl:.1f}/MWh)")
-    st.caption("Two-day-ahead forecast using lag-96+ features only — lag-48 (today's prices) not yet settled.")
-
-    h2m1, h2m2, h2m3 = st.columns(3)
-    h2m1.metric("H+2 Date", _tomorrow if _h2_is_stale else h2_date)
-    h2m2.metric("Level P50", f"£{h2_lvl:.1f}/MWh")
-    h2m3.metric("Peak P50", f"£{fc_h2[h2_p50].max():.1f}  SP{int(fc_h2.loc[fc_h2[h2_p50].idxmax(),'settlement_period'])}")
-
-    fig_h2 = go.Figure()
-    if "ssp_q10" in fc_h2.columns:
-        fig_h2.add_trace(go.Scatter(
-            x=pd.concat([fc_h2["settlement_datetime"], fc_h2["settlement_datetime"].iloc[::-1]]),
-            y=pd.concat([fc_h2["ssp_q90"], fc_h2["ssp_q10"].iloc[::-1]]),
-            fill="toself", fillcolor="rgba(42,157,143,0.18)",
-            line=dict(color="rgba(42,157,143,0)"), hoverinfo="skip", name="P10–P90",
-        ))
-    fig_h2.add_trace(go.Scatter(
-        x=fc_h2["settlement_datetime"], y=fc_h2[h2_p50],
-        name="H+2 P50", line=dict(color="#2a9d8f", width=2.5),
-        hovertemplate="SP %{customdata}<br>£%{y:.2f}<extra></extra>",
-        customdata=fc_h2["settlement_period"],
-    ))
-    fig_h2.add_hline(y=h2_lvl, line_dash="dot", line_color="#e07b39", line_width=1.2,
-                     annotation_text=f"Level P50 £{h2_lvl:.0f}", annotation_position="top left")
-    fig_h2.update_layout(xaxis_title="Datetime", yaxis_title="£/MWh",
-                          height=300, margin=dict(t=10, b=40), hovermode="x unified",
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    st.plotly_chart(fig_h2)
-
-st.divider()
 
 # ── Live Forecast Verification ────────────────────────────────────────────────
 st.subheader("Live Forecast Verification")
