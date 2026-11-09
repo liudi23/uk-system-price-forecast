@@ -1289,8 +1289,8 @@ with col_wk:
 # ── Price Derivation Code ────────────────────────────────────────────────────
 st.subheader("Price Derivation Code (P vs N)")
 st.caption(
-    "**N** — genuine market auction price; **P** — formula fallback when the auction is unreliable (~50% each). "
-    "N is more common overnight (simple dispatch); P dominates evening peaks (complex multi-generator dispatch). "
+    "**P** — system short (net imbalance > 0): NESO buys via offers, so prices are high and spikes cluster here. "
+    "**N** — system long (net imbalance ≤ 0): NESO sells via bids, so prices are low and can go negative (~50% each). "
     "Bar height = count of periods per code per day (max 48). K is a rare special case (9 times in 5 years)."
 )
 

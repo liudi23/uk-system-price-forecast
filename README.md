@@ -108,7 +108,7 @@ The best short-horizon predictor until the crossover with the day-ahead model:
 
 - **Point forecast** = last confirmed settlement price (pure persistence; exploits the near-AR(1) structure: ACF lag-1 = 0.828)
 - **80% empirical bands** = P10/P90 of same-lag residuals from an 18-month trailing window (~26,300 SP pairs)
-- **Regime-aware**: NP bands (N-code, normal auction — right-skewed, upside spike risk: −£12 to +£44 at h+1) vs EN bands (P/K-code, formula price — left-skewed, downside risk: −£44 to +£9 at h+1)
+- **Regime-aware**: NP bands (N-code, system long — low prices, right-skewed, upside risk if the system flips short: −£12 to +£44 at h+1) vs EN bands (P/K-code, system short — high prices, left-skewed, downside risk if it flips long: −£44 to +£9 at h+1)
 - **Day-boundary rollover**: as the trading day approaches midnight, post-midnight settlement periods switch from persistence continuation to the day-ahead forecast
 - **Handoff to day-ahead**: persistence beats the day-ahead + Kalman model through h+4; crossover is at approximately h+4.5 overall (h+3 in evenings, h+7+ overnight). From h+5 onward, the day-ahead + Kalman forecast is used directly.
 - Live h+1 coverage: 79.5% (N=3,215); h+3 coverage: 79.4% (N=3,213)

@@ -1373,7 +1373,7 @@ def write_report(
         lines += [
             f"",
             f"Coverage computed from `data/raw/system_prices.csv` (~60-day window).  ",
-            f"NP regime = N-code (normal auction); EN regime = P/K-code (formula).  ",
+            f"NP regime = N-code (system long, NIV ≤ 0); EN regime = P/K-code (system short, NIV > 0).  ",
             f"Status: 🟢 ≥{NOWCAST_COV_TARGET*100:.0f}% · "
             f"🟡 <{NOWCAST_COV_TARGET*100:.0f}% but 90% CI upper bound ≥{NOWCAST_COV_WARN_LO*100:.0f}% (watch) · "
             f"🔴 90% CI upper bound <{NOWCAST_COV_WARN_LO*100:.0f}% (genuine under-coverage — refresh bands).  ",

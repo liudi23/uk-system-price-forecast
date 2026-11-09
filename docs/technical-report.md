@@ -29,11 +29,13 @@ The 48-SP daily profile (forecasting all 30-minute slots for the next day) is th
 
 The UK SSP is mechanistically derived — it is not set by a transparent exchange auction but by the National Grid Electricity System Operator (NGESO) Balancing Mechanism, which dispatches fast-responding units (gas peakers, batteries, demand response) to maintain system balance in real time. The price-derivation code governs the price mechanism:
 
-- **N-code (NP, normal price)**: price set via the Net Imbalance Volume (NIV) weighted average of bids and offers accepted in the BM. Correlated with imbalance direction and market tightness.
-- **P-code (EN, energy not balanced)**: formula-derived price applied when the BM stack is exhausted or the system enters certain constraint conditions. Typically a function of administered reference prices; prices can go sharply negative during renewable oversupply.
-- **K-code**: default/administered price; similar to P-code.
+- **P-code (EN regime) — system short, NIV > 0**: too little power, so NESO accepts *offers* (pays generators to increase output or demand to reduce). The most expensive accepted offers set SSP, so P periods are high-priced (median ≈ £128/MWh) and carry almost all spikes (3,219 of 3,409 SPs above £300/MWh).
+- **N-code (NP regime) — system long, NIV ≤ 0**: too much power, so NESO accepts *bids* (generators pay to reduce output). The cheapest accepted bids set SSP, so N periods are low-priced (median ≈ £65/MWh) and carry almost all negative prices (4,104 of 4,119 negative SPs).
+- **K-code**: rare edge case (11 SPs in 5 years), treated with P in the EN regime.
 
-This mechanism structure creates two challenges absent from day-ahead market prices: (1) sharp, unpredictable price spikes when BM reserve is exhausted (autumn 2025 saw one SP reaching £487/MWh), and (2) structural negative prices during renewable oversupply events under P/K-code (June 2026 saw midday prices as low as −£70/MWh). Neither of these is forecasted well by standard time-series or gradient-boosted models, because both are triggered by real-time physical conditions that are not yet settled at the day-ahead lag.
+In the 5-year dataset the code maps one-to-one onto the sign of NIV. For a participant, the single cash-out price cuts both ways: a party short of its contracted position buys the gap at SSP, a party long is paid SSP — so being short in a P period is expensive and being long in a P period pays.
+
+This mechanism structure creates two challenges absent from day-ahead market prices: (1) sharp, unpredictable price spikes when the system is short and BM reserve is scarce (autumn 2025 saw one SP reaching £487/MWh), and (2) structural negative prices when the system is long during renewable oversupply (June 2026 saw midday prices as low as −£70/MWh). Neither of these is forecasted well by standard time-series or gradient-boosted models, because both are triggered by real-time physical conditions that are not yet settled at the day-ahead lag.
 
 ### 1.3 Commercial Value of Calibrated Uncertainty Bands
 
@@ -757,7 +759,7 @@ Critically, the calibration is now fenced by a runtime guard that makes shipping
 
 ### 12.3 Regime-Asymmetric Persistence Nowcast Bands
 
-The N-code (NP) and P/K-code (EN) price derivation mechanisms impose fundamentally different residual distributions. Under N-code (normal auction), prices are right-skewed — the BM stack can spike upward when reserve is exhausted, but prices are bounded below by the physical minimum of accepted bids. Under P/K-code (formula), prices are left-skewed — the formula acts as a ceiling reference and severe renewable oversupply drives prices to large negative values, while upward spikes are structurally capped.
+The N-code (NP) and P/K-code (EN) price derivation mechanisms impose fundamentally different residual distributions. Under N-code (system long), the price is already low, so the next-SP residual is right-skewed: the main risk is the system flipping short and the price jumping up to the offer stack. Under P/K-code (system short), the price is already high, so the residual is left-skewed: the main risk is the system flipping long and the price dropping to the bid stack.
 
 By fitting P10/P90 residual bands separately for each regime from 18 months of data (26,298 SP pairs), the nowcast achieves **79.4–79.8% live coverage** across h+1–h+3 without any ML model. This is the intraday nowcast band coverage — distinct from the day-ahead PI coverage of 66.0% reported in §5.5, which applies to the HGBR-generated q10/q90 intervals for the following day's 48 SPs. The bands are interpretable, fast to compute, and updated monthly. This is a deliberate choice of a simple empirical method over a complex model: the signal-to-noise ratio at these horizons (as established by the partial R² analysis) does not justify the complexity of a trained quantile model.
 
