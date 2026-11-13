@@ -66,7 +66,7 @@ st.set_page_config(
 # Stamped by daily_pipeline.yml (sed) on each 12:30 run — its .py edit forces a
 # Streamlit Cloud redeploy. No longer the user-facing date label (the sidebar now
 # shows the forecast file's own date); kept as the redeploy trigger + a fallback.
-_LAST_PIPELINE_RUN = "2026-11-12"
+_LAST_PIPELINE_RUN = "2026-11-13"
 
 
 @st.cache_data(ttl=7200)
