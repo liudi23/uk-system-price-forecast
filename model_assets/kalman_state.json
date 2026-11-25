@@ -1,1 +1,1 @@
-{"x_hat": 1.504358, "P": 38.622252, "forecast_date": "2026-11-25", "last_update": "2026-11-25T06:31", "last_n_settled": 12, "last_settled_sps": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], "last_z": 4.4454}
+{"x_hat": 2.208419, "P": 36.516999, "forecast_date": "2026-11-25", "last_update": "2026-11-25T07:01", "last_n_settled": 13, "last_settled_sps": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "last_z": 3.3212}
